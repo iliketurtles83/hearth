@@ -57,6 +57,7 @@
       display: flex;
       flex-direction: column;
       gap: 1.25rem;
+      align-items: center;
     }
 
     #empty-state {
@@ -76,12 +77,19 @@
     .message {
       display: flex;
       flex-direction: column;
-      max-width: 75%;
+      width: 100%;
+      max-width: 720px;
       gap: 0.4rem;
     }
 
-    .message.user      { align-self: flex-end;  align-items: flex-end; }
+    .message.user      { align-self: flex-end;  align-items: flex-end;   max-width: min(75%, 720px); }
     .message.assistant { align-self: flex-start; align-items: flex-start; }
+
+    @media (max-width: 600px) {
+      .message.user      { max-width: 88%; }
+      .message.assistant { width: 100%; max-width: 100%; }
+      .message.assistant .bubble { border-radius: var(--radius); border-bottom-left-radius: 3px; }
+    }
 
     .bubble {
       padding: 0.7rem 1rem;
@@ -287,8 +295,6 @@
   </div>
 
   <script>
-    const BACKEND = 'http://localhost:8000';
-
     const messagesEl = document.getElementById('messages');
     const input      = document.getElementById('message-input');
     const sendBtn    = document.getElementById('send-btn');
@@ -361,7 +367,7 @@
       let accumulated = '';
 
       try {
-        const resp = await fetch(`${BACKEND}/chat`, {
+        const resp = await fetch('/chat', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
           body:    JSON.stringify({ message: text }),
@@ -548,7 +554,7 @@
 
     async function startVoice() {
       if (location.protocol === 'file:') {
-        alert('Open this page over HTTP (http://localhost:8000) — voice features require a server.');
+        alert('Open this page over HTTP (e.g. http://<host>:8000) — voice features require a server.');
         return;
       }
 

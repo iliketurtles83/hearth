@@ -9,12 +9,36 @@ import httpx
 import anthropic
 import os
 import json
+import logging
 import tempfile
 import numpy as np
 from dotenv import load_dotenv
 from router import should_use_cloud, LOCAL_MODEL, CLOUD_MODEL
 
 load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+log = logging.getLogger("assistant")
+
+# ── Startup validation ─────────────────────────────────────────────────────────
+def _validate_startup() -> None:
+    _models_dir = os.path.join(os.path.dirname(__file__), "models")
+    required_models = ["computer_v2.onnx", "melspectrogram.onnx", "embedding_model.onnx"]
+    missing_models = [m for m in required_models if not os.path.isfile(os.path.join(_models_dir, m))]
+    if missing_models:
+        log.warning("Missing ONNX model files (wake-word will fail): %s", missing_models)
+        log.warning("Run: bash scripts/download-models.sh")
+
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
+
+    ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
+    log.info("Startup OK | local_model=%s | ollama=%s", LOCAL_MODEL, ollama_url)
+
+_validate_startup()
 
 # ── Cross-Origin isolation headers (required for SharedArrayBuffer / vad-web) ──
 class COOPCOEPMiddleware(BaseHTTPMiddleware):
