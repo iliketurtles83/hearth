@@ -1,23 +1,61 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
 from pydantic import BaseModel
 import httpx
 import anthropic
 import os
 import json
+import tempfile
+import numpy as np
 from dotenv import load_dotenv
 from router import should_use_cloud, LOCAL_MODEL, CLOUD_MODEL
 
 load_dotenv()
+
+# ── Cross-Origin isolation headers (required for SharedArrayBuffer / vad-web) ──
+class COOPCOEPMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
+        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+        return response
+
 app = FastAPI()
 
+app.add_middleware(COOPCOEPMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── openWakeWord model (lazy-loaded on first WebSocket connection) ──
+_oww_model = None
+
+def get_oww_model():
+    global _oww_model
+    if _oww_model is None:
+        from openwakeword.model import Model
+        model_path = os.path.join(os.path.dirname(__file__), "models", "computer_v2.onnx")
+        _oww_model = Model(wakeword_models=[model_path], inference_framework="onnx")
+    return _oww_model
+
+# ── faster-whisper model (lazy-loaded on first /transcribe call) ──
+_whisper_model = None
+
+def get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        device = "cuda" if os.path.exists("/dev/nvidia0") else "cpu"
+        compute = "float16" if device == "cuda" else "int8"
+        _whisper_model = WhisperModel("base.en", device=device, compute_type=compute)
+    return _whisper_model
 
 class ChatRequest(BaseModel):
     message: str
@@ -66,3 +104,46 @@ async def chat(request: ChatRequest):
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+# ── Wake-word WebSocket ────────────────────────────────────────────────────────
+# Browser sends raw binary frames: 1280 int16 samples (80ms @ 16kHz).
+# Server replies with {"event": "wake"} when the wake word is detected.
+@app.websocket("/ws/wake")
+async def wake_websocket(ws: WebSocket):
+    await ws.accept()
+    model = get_oww_model()
+    model.reset()  # clear any stale state from a previous session
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            # Convert raw int16 LE bytes → float32 numpy array in [-1, 1]
+            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            prediction = model.predict(samples)
+            score = prediction.get("computer_v2", 0.0)
+            if score > 0.5:
+                await ws.send_json({"event": "wake", "score": round(float(score), 3)})
+                model.reset()
+    except WebSocketDisconnect:
+        pass
+
+
+# ── Transcription endpoint ─────────────────────────────────────────────────────
+@app.post("/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    whisper = get_whisper_model()
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+    try:
+        segments, _ = whisper.transcribe(tmp_path, language="en", vad_filter=True)
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+    finally:
+        os.unlink(tmp_path)
+    return JSONResponse({"text": text})
+
+
+# ── Static frontend — MUST be last ────────────────────────────────────────────
+_frontend_dir = os.path.join(os.path.dirname(__file__), "..", "frontend")
+if os.path.isdir(_frontend_dir):
+    app.mount("/", StaticFiles(directory=_frontend_dir, html=True), name="static")

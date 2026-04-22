@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Assistant</title>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:              #0f1117;
+      --surface:         #1a1d27;
+      --surface-raised:  #232635;
+      --border:          #2e3148;
+      --text:            #e8eaf0;
+      --text-muted:      #7c7f9a;
+      --user-bg:         #3b5bdb;
+      --accent:          #6c8aff;
+      --model-local:     #40c057;
+      --model-cloud:     #7950f2;
+      --radius:          12px;
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      padding: 0.9rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+    }
+
+    /* ── Messages ── */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.25rem;
+    }
+
+    #empty-state {
+      margin: auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.6rem;
+      color: var(--text-muted);
+      font-size: 0.9rem;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #empty-state svg { opacity: 0.25; }
+
+    .message {
+      display: flex;
+      flex-direction: column;
+      max-width: 75%;
+      gap: 0.4rem;
+    }
+
+    .message.user      { align-self: flex-end;  align-items: flex-end; }
+    .message.assistant { align-self: flex-start; align-items: flex-start; }
+
+    .bubble {
+      padding: 0.7rem 1rem;
+      border-radius: var(--radius);
+      line-height: 1.65;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 0.93rem;
+    }
+
+    .message.user .bubble {
+      background: var(--user-bg);
+      color: #fff;
+      border-bottom-right-radius: 3px;
+    }
+
+    .message.assistant .bubble {
+      background: var(--surface-raised);
+      color: var(--text);
+      border-bottom-left-radius: 3px;
+    }
+
+    /* ── Markdown prose ── */
+    .message.assistant .bubble p          { margin: 0 0 0.6em; }
+    .message.assistant .bubble p:last-child { margin-bottom: 0; }
+    .message.assistant .bubble h1,
+    .message.assistant .bubble h2,
+    .message.assistant .bubble h3        { margin: 0.8em 0 0.3em; font-weight: 600; }
+    .message.assistant .bubble ul,
+    .message.assistant .bubble ol        { margin: 0.4em 0; padding-left: 1.4em; }
+    .message.assistant .bubble li        { margin-bottom: 0.2em; }
+    .message.assistant .bubble code      { background: rgba(0,0,0,0.3); border-radius: 4px; padding: 0.1em 0.35em; font-size: 0.87em; font-family: 'SFMono-Regular', Consolas, monospace; }
+    .message.assistant .bubble pre       { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 0.8em 1em; overflow-x: auto; margin: 0.6em 0; }
+    .message.assistant .bubble pre code  { background: none; padding: 0; font-size: 0.85em; }
+    .message.assistant .bubble blockquote{ border-left: 3px solid var(--border); margin: 0.5em 0; padding-left: 0.8em; color: var(--text-muted); }
+    .message.assistant .bubble a         { color: var(--accent); text-decoration: underline; }
+    .message.assistant .bubble hr        { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
+    .message.assistant .bubble table     { border-collapse: collapse; width: 100%; margin: 0.6em 0; }
+    .message.assistant .bubble th,
+    .message.assistant .bubble td        { border: 1px solid var(--border); padding: 0.35em 0.65em; text-align: left; }
+    .message.assistant .bubble th        { background: rgba(0,0,0,0.2); }
+
+    .model-badge {
+      font-size: 0.68rem;
+      padding: 0.18rem 0.55rem;
+      border-radius: 999px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+    }
+
+    .model-badge.local { background: rgba(64,192,87,0.15); color: var(--model-local); }
+    .model-badge.cloud { background: rgba(121,80,242,0.15); color: var(--model-cloud); }
+
+    /* Blinking cursor shown while streaming */
+    .cursor {
+      display: inline-block;
+      width: 2px;
+      height: 0.9em;
+      background: var(--accent);
+      margin-left: 2px;
+      vertical-align: text-bottom;
+      animation: blink 0.75s step-end infinite;
+    }
+
+    @keyframes blink { 50% { opacity: 0; } }
+
+    /* ── Input area ── */
+    #input-area {
+      padding: 1rem 1.5rem;
+      border-top: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-end;
+      flex-shrink: 0;
+    }
+
+    #message-input {
+      flex: 1;
+      background: var(--surface-raised);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.7rem 1rem;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 0.93rem;
+      resize: none;
+      outline: none;
+      line-height: 1.5;
+      max-height: 160px;
+      overflow-y: auto;
+      transition: border-color 0.15s;
+    }
+
+    #message-input:focus       { border-color: var(--accent); }
+    #message-input::placeholder { color: var(--text-muted); }
+
+    #send-btn {
+      background: var(--accent);
+      border: none;
+      border-radius: var(--radius);
+      width: 42px;
+      height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+      color: #fff;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+
+    #send-btn:hover:not(:disabled)  { opacity: 0.85; }
+    #send-btn:active:not(:disabled) { transform: scale(0.93); }
+    #send-btn:disabled              { opacity: 0.35; cursor: not-allowed; }
+    #send-btn svg                   { width: 17px; height: 17px; }
+
+    /* ── Mic button ── */
+    #mic-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      width: 34px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      margin-left: auto;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+
+    #mic-btn:hover                    { color: var(--text); border-color: var(--text-muted); }
+    #mic-btn.active                   { color: #fa5252; border-color: #fa5252; background: rgba(250,82,82,0.1); }
+    #mic-btn svg                      { width: 15px; height: 15px; }
+
+    /* ── Voice status badge ── */
+    #voice-status {
+      font-size: 0.72rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 999px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      display: none;
+    }
+
+    #voice-status.sleeping    { display: inline-block; background: rgba(124,127,154,0.15); color: var(--text-muted); }
+    #voice-status.listening   { display: inline-block; background: rgba(108,138,255,0.15); color: var(--accent); }
+    #voice-status.recording   { display: inline-block; background: rgba(250,82,82,0.15);   color: #fa5252; }
+    #voice-status.transcribing{ display: inline-block; background: rgba(64,192,87,0.15);   color: var(--model-local); }
+  </style>
+</head>
+<body>
+
+  <header>
+    <svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24"
+         fill="none" stroke="var(--accent)" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+    </svg>
+    <h1>Assistant</h1>
+    <span id="voice-status"></span>
+    <button id="mic-btn" title="Toggle voice (say &quot;Computer,&quot; to activate)">
+      <!-- mic icon -->
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+           stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+        <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+        <line x1="12" y1="19" x2="12" y2="23"/>
+        <line x1="8"  y1="23" x2="16" y2="23"/>
+      </svg>
+    </button>
+  </header>
+
+  <div id="messages">
+    <div id="empty-state">
+      <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 24 24"
+           fill="none" stroke="currentColor" stroke-width="1.4"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      </svg>
+      <span>Start a conversation</span>
+    </div>
+  </div>
+
+  <div id="input-area">
+    <textarea
+      id="message-input"
+      placeholder="Message…"
+      rows="1"
+      autofocus
+    ></textarea>
+    <button id="send-btn" title="Send (Enter)">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+           fill="none" stroke="currentColor" stroke-width="2.2"
+           stroke-linecap="round" stroke-linejoin="round">
+        <line x1="22" y1="2" x2="11" y2="13"/>
+        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+    </button>
+  </div>
+
+  <script>
+    const BACKEND = 'http://localhost:8000';
+
+    const messagesEl = document.getElementById('messages');
+    const input      = document.getElementById('message-input');
+    const sendBtn    = document.getElementById('send-btn');
+
+    // Auto-grow textarea
+    input.addEventListener('input', () => {
+      input.style.height = 'auto';
+      input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+    });
+
+    // Enter to send, Shift+Enter for newline
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
+    });
+
+    sendBtn.addEventListener('click', send);
+
+    // ── Helpers ────────────────────────────────────────────────
+
+    function setLocked(locked) {
+      sendBtn.disabled = locked;
+      input.disabled   = locked;
+    }
+
+    function scrollToBottom() {
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function appendMessage(role, text = '') {
+      document.getElementById('empty-state')?.remove();
+
+      const wrapper = document.createElement('div');
+      wrapper.className = `message ${role}`;
+
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+
+      wrapper.appendChild(bubble);
+      messagesEl.appendChild(wrapper);
+      scrollToBottom();
+      return { wrapper, bubble };
+    }
+
+    function appendModelBadge(wrapper, modelName) {
+      const isCloud = modelName.toLowerCase().includes('claude');
+      const badge   = document.createElement('span');
+      badge.className = 'model-badge ' + (isCloud ? 'cloud' : 'local');
+      badge.textContent = modelName;
+      wrapper.appendChild(badge);
+    }
+
+    // ── Main send logic ─────────────────────────────────────────
+
+    async function send() {
+      const text = input.value.trim();
+      if (!text) return;
+
+      appendMessage('user', text);
+      input.value = '';
+      input.style.height = 'auto';
+      setLocked(true);
+
+      const { wrapper, bubble } = appendMessage('assistant');
+
+      const cursor = document.createElement('span');
+      cursor.className = 'cursor';
+      bubble.appendChild(cursor);
+
+      let accumulated = '';
+
+      try {
+        const resp = await fetch(`${BACKEND}/chat`, {
+          method:  'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body:    JSON.stringify({ message: text }),
+        });
+
+        if (!resp.ok) throw new Error(`Server error: HTTP ${resp.status}`);
+
+        const reader  = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer    = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop(); // hold onto any incomplete line
+
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+
+            const raw = line.slice(6).trim();
+            if (raw === '[DONE]') continue;
+
+            let parsed;
+            try { parsed = JSON.parse(raw); } catch { continue; }
+
+            if (parsed.model) {
+              appendModelBadge(wrapper, parsed.model);
+            }
+
+            if (parsed.text) {
+              accumulated += parsed.text;
+              bubble.innerHTML = marked.parse(accumulated);
+              bubble.appendChild(cursor); // keep cursor at end
+              scrollToBottom();
+            }
+          }
+        }
+      } catch (err) {
+        bubble.textContent = `⚠ ${err.message}`;
+      } finally {
+        cursor.remove();
+        setLocked(false);
+        input.focus();
+      }
+    }
+  </script>
+
+  <!-- ─────────────────────────────────────────────────────────────────────
+       Voice pipeline:
+         mic → AudioWorklet (1280-sample Int16 frames)
+         → WebSocket /ws/wake (openWakeWord in backend)
+         → wake event → @ricky0123/vad-web captures utterance
+         → WAV blob → POST /transcribe (faster-whisper in backend)
+         → text → send()
+  ──────────────────────────────────────────────────────────────────────── -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.22.0/dist/ort.wasm.min.js"
+          crossorigin="anonymous"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@ricky0123/vad-web@0.0.29/dist/bundle.min.js"
+          crossorigin="anonymous"></script>
+
+  <script>
+    const micBtn      = document.getElementById('mic-btn');
+    const voiceStatus = document.getElementById('voice-status');
+
+    // ── State machine ───────────────────────────────────────────────────────
+    // States: 'off' | 'sleeping' | 'recording' | 'transcribing'
+    let voiceState = 'off';
+
+    const STATUS_LABELS = {
+      off:          '',
+      sleeping:     'listening for "Computer,"',
+      recording:    'recording…',
+      transcribing: 'transcribing…',
+    };
+
+    function setVoiceState(state) {
+      voiceState = state;
+      voiceStatus.className  = state === 'off' ? '' : state === 'sleeping' ? 'sleeping' :
+                               state === 'recording' ? 'recording' : 'transcribing';
+      voiceStatus.textContent = STATUS_LABELS[state] ?? '';
+      micBtn.classList.toggle('active', state !== 'off');
+    }
+
+    // ── WAV encoder ─────────────────────────────────────────────────────────
+    // Converts a Float32Array @16kHz into a WAV Blob.
+    function encodeWAV(samples) {
+      const sampleRate  = 16000;
+      const numChannels = 1;
+      const bitDepth    = 16;
+      const byteRate    = sampleRate * numChannels * (bitDepth / 8);
+      const blockAlign  = numChannels * (bitDepth / 8);
+      const dataLen     = samples.length * 2;
+      const buf         = new ArrayBuffer(44 + dataLen);
+      const view        = new DataView(buf);
+
+      const writeStr = (offset, str) => { for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i)); };
+      writeStr(0,  'RIFF');                              // ChunkID
+      view.setUint32(4,  36 + dataLen, true);           // ChunkSize
+      writeStr(8,  'WAVE');                              // Format
+      writeStr(12, 'fmt ');                              // Subchunk1ID
+      view.setUint32(16, 16, true);                     // Subchunk1Size
+      view.setUint16(20, 1,  true);                     // AudioFormat (PCM)
+      view.setUint16(22, numChannels, true);            // NumChannels
+      view.setUint32(24, sampleRate,  true);            // SampleRate
+      view.setUint32(28, byteRate,    true);            // ByteRate
+      view.setUint16(32, blockAlign,  true);            // BlockAlign
+      view.setUint16(34, bitDepth,    true);            // BitsPerSample
+      writeStr(36, 'data');                             // Subchunk2ID
+      view.setUint32(40, dataLen, true);                // Subchunk2Size
+
+      // PCM samples
+      let offset = 44;
+      for (let i = 0; i < samples.length; i++) {
+        const s = Math.max(-1, Math.min(1, samples[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        offset += 2;
+      }
+      return new Blob([buf], { type: 'audio/wav' });
+    }
+
+    // ── Transcription ───────────────────────────────────────────────────────
+    async function transcribeAndSend(float32Audio) {
+      setVoiceState('transcribing');
+      try {
+        const wav  = encodeWAV(float32Audio);
+        const form = new FormData();
+        form.append('audio', wav, 'utterance.wav');
+        const resp = await fetch('/transcribe', { method: 'POST', body: form });
+        if (!resp.ok) throw new Error(`Transcription failed: HTTP ${resp.status}`);
+        const { text } = await resp.json();
+        if (text) {
+          input.value = text;
+          input.style.height = 'auto';
+          input.style.height = Math.min(input.scrollHeight, 160) + 'px';
+          send();
+        }
+      } catch (err) {
+        console.error('[voice] transcribe error:', err);
+      } finally {
+        setVoiceState('sleeping'); // return to wake-word listening
+      }
+    }
+
+    // ── VAD (utterance capture) ─────────────────────────────────────────────
+    let _vadInstance = null;
+
+    async function getVAD() {
+      if (_vadInstance) return _vadInstance;
+      _vadInstance = await vad.MicVAD.new({
+        onSpeechStart: () => setVoiceState('recording'),
+        onSpeechEnd:   async (audio) => {
+          // audio is Float32Array @16kHz
+          await transcribeAndSend(audio);
+        },
+        positiveSpeechThreshold: 0.3,
+        negativeSpeechThreshold: 0.25,
+        redemptionFrames:        10,   // ~320ms silence before end-of-speech
+        preSpeechPadFrames:      10,   // prepend 320ms before onset
+        minSpeechFrames:         5,    // ignore spurious sub-160ms detections
+      });
+      return _vadInstance;
+    }
+
+    async function captureUtterance() {
+      const v = await getVAD();
+      v.start();
+      // auto-stop after 15 s if no speech ends
+      setTimeout(() => {
+        v.pause();
+        if (voiceState === 'recording' || voiceState === 'sleeping') {
+          setVoiceState('sleeping');
+        }
+      }, 15000);
+    }
+
+    // ── Wake-word WebSocket ─────────────────────────────────────────────────
+    let _audioCtx   = null;
+    let _workletNode = null;
+    let _ws         = null;
+    let _micStream  = null;
+
+    async function startVoice() {
+      if (location.protocol === 'file:') {
+        alert('Open this page over HTTP (http://localhost:8000) — voice features require a server.');
+        return;
+      }
+
+      try {
+        // 1. Mic stream
+        _micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+
+        // 2. AudioContext @16kHz (all modern browsers support this)
+        _audioCtx = new AudioContext({ sampleRate: 16000 });
+        await _audioCtx.audioWorklet.addModule(`${location.origin}/audio-processor.js`);
+
+        const source = _audioCtx.createMediaStreamSource(_micStream);
+        _workletNode = new AudioWorkletNode(_audioCtx, 'audio-processor');
+        source.connect(_workletNode);
+        // Don't connect worklet to destination — we don't want to hear ourselves
+
+        // 3. Open WebSocket to wake-word server
+        const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
+        _ws = new WebSocket(`${wsProto}://${location.host}/ws/wake`);
+        _ws.binaryType = 'arraybuffer';
+
+        _ws.onmessage = async (evt) => {
+          const msg = JSON.parse(evt.data);
+          if (msg.event === 'wake' && voiceState === 'sleeping') {
+            console.log('[voice] wake word detected, score:', msg.score);
+            await captureUtterance();
+          }
+        };
+
+        _ws.onclose = () => {
+          if (voiceState !== 'off') {
+            console.warn('[voice] WebSocket closed unexpectedly, restarting…');
+            setTimeout(startVoice, 2000);
+          }
+        };
+
+        // 4. Pipe AudioWorklet frames → WebSocket
+        _workletNode.port.onmessage = (evt) => {
+          if (_ws.readyState === WebSocket.OPEN && voiceState === 'sleeping') {
+            _ws.send(evt.data); // transferable ArrayBuffer (Int16)
+          }
+        };
+
+        setVoiceState('sleeping');
+      } catch (err) {
+        console.error('[voice] failed to start:', err);
+        stopVoice();
+        alert(`Could not start voice: ${err.message}`);
+      }
+    }
+
+    function stopVoice() {
+      _ws?.close();
+      _ws = null;
+      _workletNode?.disconnect();
+      _workletNode = null;
+      _audioCtx?.close();
+      _audioCtx = null;
+      _micStream?.getTracks().forEach(t => t.stop());
+      _micStream = null;
+      _vadInstance?.pause();
+      setVoiceState('off');
+    }
+
+    // ── Mic button toggle ───────────────────────────────────────────────────
+    micBtn.addEventListener('click', async () => {
+      if (voiceState === 'off') {
+        await startVoice();
+      } else {
+        stopVoice();
+      }
+    });
+  </script>
+
+</body>
+</html>

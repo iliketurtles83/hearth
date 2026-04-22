@@ -2,7 +2,7 @@ import os
 
 LOCAL_MODEL = os.getenv("MODEL_LOCAL", "llama3.2")
 CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
-CLOUD_THRESHOLD = int(os.getenv("CLOUD_THRESHOLD", "300"))
+CLOUD_THRESHOLD = int(os.getenv("CLOUD_THRESHOLD", "1000"))
 
 def should_use_cloud(prompt: str) -> bool:
     """Simple heuristic for now — grows into LangGraph in Phase 5."""

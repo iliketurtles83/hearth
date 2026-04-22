@@ -3,3 +3,8 @@ uvicorn[standard]
 httpx
 anthropic
 python-dotenv
+python-multipart
+faster-whisper
+openwakeword
+websockets
+numpy

@@ -40,6 +40,7 @@ services:
       - ollama
     volumes:
       - ./backend:/app
+      - ./frontend:/frontend
 
 volumes:
   ollama:
