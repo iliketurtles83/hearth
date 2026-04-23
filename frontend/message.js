@@ -292,14 +292,12 @@
         credentials: 'same-origin',
       });
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
       if (sessionId === currentSessionId) {
-        // Backend already set a new session cookie; sync local state
-        currentSessionId = null;
-        messagesInner.innerHTML = '';
-        await startNewChat();
-      } else {
-        await refreshSessions();
+        currentSessionId = data.active_session_id || null;
+        await loadCurrentSessionMessages();
       }
+      await refreshSessions();
     } catch (err) {
       appendMessage('assistant', `⚠ Unable to delete session: ${err.message}`);
     }

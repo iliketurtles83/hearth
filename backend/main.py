@@ -489,21 +489,35 @@ async def list_chat_sessions(http_request: Request):
 
 @app.delete("/chat/sessions/{session_id}")
 async def delete_chat_session(session_id: str, http_request: Request):
+    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    active_session_id: str | None = None
+
     with _session_store_lock:
         if session_id not in _session_store:
             return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
         del _session_store[session_id]
+
+        # If the deleted session was active, prefer an existing remaining session.
+        if cookie_session_id == session_id and _session_store:
+            active_session_id = max(
+                _session_store.items(),
+                key=lambda item: item[1]["updated_at"],
+            )[0]
     log.info("chat.session.deleted | session_id=%s", session_id)
 
-    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    response = JSONResponse({"ok": True, "session_id": session_id})
+    # If the deleted session was active and nothing remains, create a fresh session.
+    if cookie_session_id == session_id and active_session_id is None:
+        active_session_id, _ = _get_or_create_session(None)
 
-    # If the deleted session was active, assign a fresh one via cookie
-    if cookie_session_id == session_id:
-        new_session_id, _ = _get_or_create_session(None)
+    payload = {"ok": True, "session_id": session_id}
+    if active_session_id:
+        payload["active_session_id"] = active_session_id
+    response = JSONResponse(payload)
+
+    if active_session_id:
         response.set_cookie(
             key=SESSION_COOKIE_NAME,
-            value=new_session_id,
+            value=active_session_id,
             httponly=True,
             samesite="lax",
             secure=False,
