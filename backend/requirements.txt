@@ -8,3 +8,4 @@ faster-whisper
 openwakeword
 websockets
 numpy
+chromadb

@@ -54,6 +54,13 @@ _REASONING_KEYWORDS = [
     "explain in detail", "step by step", "analyze this", "analyse this",
 ]
 
+_EXTERNAL_DATA_KEYWORDS = [
+    "weather", "forecast", "temperature", "rain", "snow", "humidity",
+    "news", "headline", "current events", "latest news",
+    "stock", "share price", "market today", "market now",
+    "what time is it", "what date is it", "live score", "real-time",
+]
+
 _EXTERNAL_DATA_PATTERNS = [
     r"\b(weather|forecast|temperature|rain|snow|sunny|humidity)\b",
     r"\b(news|headlines|current\s+events|latest\s+news)\b",
@@ -68,6 +75,12 @@ _MEMORY_PATTERNS = [
     r"\b(earlier|last\s+time|previously|before)\b.{0,30}\b(said|mentioned|told)\b",
     r"\bmy\s+(name|preference|setting|favorite|favourit|location|city)\b",
     r"\blike\s+i\s+(said|mentioned|told)\b",
+]
+
+_MEMORY_KEYWORDS = [
+    "remember", "recall", "you said", "you mentioned", "you told me",
+    "earlier", "last time", "previously", "before",
+    "my name", "my preference", "my favorite", "my favourite", "my city",
 ]
 
 
@@ -101,15 +114,24 @@ def classify_intent(prompt: str) -> RouteDecision:
 
     # external-data signals
     scores["external-data-needed"] += _score_patterns(p, _EXTERNAL_DATA_PATTERNS)
+    scores["external-data-needed"] += _score_keywords(p, _EXTERNAL_DATA_KEYWORDS)
 
     # memory signals
     scores["memory-needed"] += _score_patterns(p, _MEMORY_PATTERNS)
+    scores["memory-needed"] += _score_keywords(p, _MEMORY_KEYWORDS)
 
     # quick-local baseline — short, conversational prompts
     if len(prompt) < 60:
         scores["quick-local"] += 0.60
     elif len(prompt) < 120:
         scores["quick-local"] += 0.35
+
+    # If we already have strong external-data or memory signals, dampen
+    # quick-local baseline so intent-specific routes win short prompts.
+    if scores["external-data-needed"] >= 0.25:
+        scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
+    if scores["memory-needed"] >= 0.25:
+        scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
 
     # Clamp all scores
     for k in scores:

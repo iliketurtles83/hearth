@@ -4,8 +4,8 @@ This project is a local-first personal AI assistant with voice activation, strea
 tool integrations, and optional cloud model fallback. It runs entirely on-device via Docker
 Compose and is designed to be reachable from all devices on the local network.
 
-Stack: FastAPI backend · Ollama (local LLM + local coder) · Anthropic API (cloud fallback) ·
-OpenWakeWord · faster-whisper · Piper TTS · SQLite · ChromaDB · Browser UI
+Stack: FastAPI backend · Ollama (local LLM) · Anthropic API (cloud fallback) ·
+OpenWakeWord · faster-whisper · Piper TTS · SQLite · Browser UI
 
 ---
 
@@ -20,7 +20,6 @@ Browser / LAN client
         ├── WS   /ws/wake            wake-word detection socket
         ├── POST /weather            weather tool
         ├── POST /music/*            music search + playback control
-        ├── POST /code               code generation / editing tool
         └── GET  /health             uptime check
 
 FastAPI backend
@@ -28,12 +27,9 @@ FastAPI backend
   ├── memory.py                      SQLite memory layer
   ├── tools/weather.py               weather adapter
   ├── tools/music.py                 media indexer + playback
-  ├── tools/code.py                  code generation + file read/write
   └── tts.py                         pluggable TTS engine
 
 Ollama (container)                   local model inference (GPU)
-  ├── <chat model>                   general assistant (e.g. mistral, llama3)
-  └── <coder model>                  code-specialized model (e.g. qwen2.5-coder)
 Anthropic API (external)             cloud fallback for complex queries
 ```
 
@@ -171,7 +167,6 @@ genuinely needed. Failures degrade gracefully.
 Intent categories:
 - `quick-local` — factual, short, conversational
 - `reasoning-heavy` — multi-step planning, analysis, architecture
-- `code` — code generation, debugging, explanation, file editing
 - `external-data-needed` — weather, news, live data (tool path, not cloud)
 - `memory-needed` — references to prior facts or user preferences
 
@@ -181,10 +176,8 @@ Tasks:
   scoring).
 - Add a confidence threshold: if local model confidence is below threshold,
   escalate to cloud.
-- Route `code` intent to the local coder model (see Phase 9) rather than the
-  general chat model or cloud. Code tasks almost never need cloud escalation.
-- Emit structured telemetry per request: route chosen, model used, first-token
-  latency, completion latency, error/fallback count.
+- Emit structured telemetry per request: route chosen, first-token latency,
+  completion latency, error/fallback count.
 - Keep a visible model badge in the UI showing which model handled the response.
 - Fallback policy: if cloud is unavailable, return local response with a
   user-visible notice, never a silent failure.
@@ -192,7 +185,6 @@ Tasks:
 Acceptance:
 - Conversational and short prompts stay local.
 - Complex planning and reasoning prompts route to cloud.
-- Code prompts route to the local coder model.
 - Cloud unavailability degrades gracefully with a local response.
 
 ---
@@ -216,35 +208,18 @@ Tasks:
 - Implement write policy: save only high-value facts — explicit user statements,
   stated preferences, recurring intents. Never store secrets unless explicitly
   approved by the user.
-- Define and enforce a memory sensitivity matrix:
-  - auto-save: clear non-sensitive facts/preferences (e.g. nickname, broad preferences)
-  - confirm-first: borderline personal data (e.g. timeline/location history)
-  - explicit-only/blocked: secrets, credentials, exact address, phone-like identifiers
-- Implement retrieval policy: fetch top-N relevant items per query using SQLite
-  for exact/keyword recall and ChromaDB for semantic recall; inject concise
-  snippets into system/context prompt.
-- Add explicit memory controls (deterministic commands):
-  - "save this" / "remember this"
-  - "do not remember this"
-  - "forget X"
+- Implement retrieval policy: fetch top-N relevant items per query using keyword
+  or embedding match; inject concise snippets into system/context prompt.
 - Add CRUD endpoints:
   - `GET  /memory`         — list stored items
   - `DELETE /memory/{id}`  — remove one item
   - `DELETE /memory`       — clear all
 - Surface basic memory viewer in UI.
-- Surface memory write outcomes in UI and logs (`saved`, `blocked-sensitive`, `needs-confirmation`).
-- Add lightweight chat sessions sidebar (new/switch/reset) before weather-tool work.
-- Keep a strict memory boundary for future persona work: memory extraction and retrieval
-  must be fact/policy-driven and not modified by stylistic "human side" rendering.
 
 Acceptance:
 - Stated preferences survive container restart.
 - User can view, delete individual items, and clear all memory from the UI.
 - Memory snippets appear in context without bloating the prompt.
-- Explicit save/forget commands behave deterministically and return clear status.
-- Sensitive and confirm-first classes follow policy matrix consistently.
-- Sessions sidebar supports starting and switching chat sessions.
-- Persona/tone customization (future phase) cannot alter stored facts or tool-derived values.
 
 ---
 
@@ -321,28 +296,20 @@ Acceptance:
 
 ---
 
-### Phase 9 — LangGraph agent orchestration + local code assistant
-**Estimate: 2–3 weeks**
+### Phase 9 — LangGraph agent orchestration
+**Estimate: 1–2 weeks**
 **Depends on: all prior phases**
 
 Goal: Replace procedural routing with a stateful LangGraph graph. Nodes handle
 intent classification, memory retrieval, tool dispatch, and response generation.
 Enables multi-step reasoning, tool chaining, and durable session continuity.
 
-The code assistant node is built into the graph rather than as a standalone VS Code
-extension. This is the right call: the agent already owns memory, session state,
-tool access, and voice input — a code node gets all of that for free. Voice-triggered
-code generation ("Computer, write a FastAPI endpoint that calls the weather tool")
-with project context injected from memory is substantially more capable than a
-sidebar model with no shared state. The Qwen coder model (or equivalent) runs in
-Ollama alongside the chat model — no new infrastructure required.
-
 Graph nodes:
 ```
 input → intent_classifier → memory_retrieval → tool_router
   ├── weather_tool
   ├── music_tool
-  ├── code_tool              ← local coder model (qwen2.5-coder or equivalent)
+  ├── code_tool
   └── chat_fallback
         └── responder → output
 ```
@@ -356,66 +323,18 @@ class AssistantState(TypedDict):
     tool_result: str
     user_prefs: dict
     session_id: str
-    active_files: list[str]   # files in scope for the current code task
-    code_context: str         # injected project snippets / schemas
-```
-
-#### Code tool node — design decisions
-
-**Model selection:** Pull a code-specialized model into Ollama alongside the chat
-model (e.g. `ollama pull qwen2.5-coder:7b`). Route all `code` intents here; do not
-send code tasks to the cloud model by default.
-
-**File access:** The `code_tool` module in `backend/tools/code.py` can read and
-write files within a configurable workspace root. Never allow paths outside the
-root. Provide the model with file contents as context; write output only when the
-user explicitly confirms ("save that" / "apply it").
-
-**Project context injection:** On code intents, the memory retrieval node fetches
-relevant snippets — file summaries, schema definitions, prior code decisions — and
-injects them into the coder model's system prompt. This is what makes the agent
-approach more powerful than a dumb editor extension.
-
-**Voice ergonomics for code:** Spoken code output is summarized ("I wrote a 40-line
-FastAPI endpoint — want me to read it or save it?"). Full code is shown in chat and
-optionally written to disk.
-
-**Tool interface** (consistent with all other tools):
-```python
-# backend/tools/code.py
-async def run(params: dict) -> dict:
-    # params: { "task": str, "files": list[str], "context": str, "write": bool }
-    # returns: { "code": str, "language": str, "written_to": str | None }
-```
-
-**Endpoints:**
-```
-POST /code               — generate or edit code (streaming)
-GET  /code/files         — list workspace files
-GET  /code/files/{path}  — read a file
-PUT  /code/files/{path}  — write a file (requires confirmation flag)
 ```
 
 Tasks:
 - Introduce LangGraph with SqliteSaver checkpointer for durable session state.
 - Migrate existing router and tool logic into named graph nodes.
-- Expand ChromaDB integration for advanced semantic memory retrieval tuning and
-  migration from Phase 5 baseline.
-- Pull a code-specialized Ollama model; add `OLLAMA_CODER_MODEL` env var.
-- Implement `code_tool` node with file read/write, workspace root enforcement,
-  and confirmation-gated writes.
-- Wire code context (file summaries, schemas) into memory retrieval for code intents.
-- Add voice confirmation flow for file writes.
-- Update UI: code blocks with syntax highlighting, copy button, save-to-disk button.
+- Add ChromaDB for semantic memory retrieval alongside SQLite for exact recall.
+- Implement ToolNode pattern for file read/write in the code assistant node.
 
 Acceptance:
-- "Computer, write a function that does X" generates code using the local coder
-  model with relevant project context injected.
 - "Computer, continue that function from yesterday" resolves via checkpointed state.
-- File writes require explicit confirmation before touching disk.
 - All existing tools work through the graph without regression.
 - Graph state is inspectable for debugging.
-- Code tasks never silently route to cloud unless local coder model is unavailable.
 
 ---
 
@@ -424,19 +343,14 @@ Acceptance:
 ### Security and privacy
 - Local-first default. No data leaves the device unless the user triggers a
   cloud model call or an external tool.
-- Memory writes policy: implicit save is allowed for clear non-sensitive
-  preferences/facts; explicit consent is required for sensitive items.
-- Memory policy matrix is mandatory in implementation (auto-save vs confirm-first
-  vs explicit-only/blocked) and must be user-visible.
-- Explicit user confirmation before writing any file to disk (code tool).
-- Code tool workspace root is enforced — no path traversal outside configured dir.
+- Explicit user consent before writing to persistent memory.
 - Redact API keys, tokens, and personal data from all logs.
 - Never commit `.env` to git.
 
 ### Reliability
 - All services bind to `0.0.0.0` in Docker.
-- Structured logs for: routing decisions, model selected, wake-word scores,
-  transcription results, tool calls, and errors.
+- Structured logs for: routing decisions, wake-word scores, transcription results,
+  tool calls, and errors.
 - Retry with exponential backoff for transient network failures.
 - Standardized error response shape: `{ "error": str, "code": str, "retryable": bool }`.
 - Container restarts must surface errors in logs — never swallow startup failures.
@@ -450,17 +364,11 @@ Acceptance:
   that duplicate `.env` values.
 - Type-annotate all Python function signatures.
 - Keep `requirements.txt` up to date. Pin major versions once a phase is stable.
-- `OLLAMA_CHAT_MODEL` and `OLLAMA_CODER_MODEL` are separate env vars — never
-  hardcode model names in source.
 
 ### Testing priorities
-- Backend: `/chat`, `/transcribe`, `/ws/wake`, `/weather`, `/code`, `/health`.
-- Frontend: streaming markdown render, code block render + copy/save, mic toggle
-  state machine, WebSocket reconnect behavior.
-- Memory-specific: deterministic save/forget commands, sensitivity matrix behavior,
-  and retrieval relevance across new sessions.
-- Persona-boundary safety: style/tone variation tests must preserve factual/tool
-  outputs (no fact drift through rendering).
+- Backend: `/chat`, `/transcribe`, `/ws/wake`, `/weather`, `/health`.
+- Frontend: streaming markdown render, mic toggle state machine, WebSocket
+  reconnect behavior.
 - LAN matrix: verify from desktop browser, mobile browser, and tablet after
   every Phase 1–3 change.
 - Add tests before marking any phase acceptance criteria as done.
@@ -483,11 +391,10 @@ Acceptance:
 | 2 | Replace all `localhost` frontend paths with relative paths | ✅ done | 2–4 hours | 1 |
 | 3 | Harden wake-word pipeline (Phase 2) | ✅ done | 1–2 days | 1, 2 |
 | 4 | Chat context management: bounded session buffer + token-aware context | 🔄 in progress | 1–2 days | 1 |
-| 5 | Upgrade router: intent categories + `code` route, confidence scoring, telemetry | ✅ done | 1–2 days | 1, 4 |
-| 6 | SQLite memory layer: schema, policy matrix, explicit controls, CRUD endpoints | 🔲 | 2–3 days | 5 |
-| 7 | Chat sessions sidebar: create/switch/reset sessions UI | 🔲 | 1 day | 6 |
-| 8 | Weather tool: adapter, memory-backed default location, error handling | 🔲 | 1 day | 6, 7 |
-| 9 | HTTPS on LAN (nginx/Caddy) to unblock Android/mobile voice | 🔲 backlog | 0.5 days | — |
+| 5 | Upgrade router: intent categories, confidence scoring, telemetry | ✅ done | 1–2 days | 1, 4 |
+| 6 | SQLite memory layer: schema, write/read policy, CRUD endpoints | 🔲 | 2–3 days | 5 |
+| 7 | Weather tool: adapter, memory-backed default location, error handling | 🔲 | 1 day | 6 |
+| 8 | HTTPS on LAN (nginx/Caddy) to unblock Android/mobile voice | 🔲 backlog | 0.5 days | — |
 
 Each numbered issue maps to a phase above. Use these as GitHub issue titles and
 reference the phase section for full task and acceptance detail.

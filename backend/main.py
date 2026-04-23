@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -9,6 +9,7 @@ import anthropic
 import os
 import json
 import logging
+import re
 import tempfile
 import time
 from threading import Lock
@@ -16,6 +17,7 @@ from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
 from router import classify_intent, LOCAL_MODEL, CLOUD_MODEL
+from memory import memory_store
 
 load_dotenv()
 
@@ -30,6 +32,7 @@ SESSION_IDLE_TTL_SECONDS = int(os.getenv("CHAT_SESSION_IDLE_TTL_SECONDS", "1800"
 SESSION_MAX_ITEMS = int(os.getenv("CHAT_SESSION_MAX_ITEMS", "200"))
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
 CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 
 _session_store_lock = Lock()
 _session_store: dict[str, dict] = {}
@@ -46,8 +49,7 @@ def _validate_startup() -> None:
     if not os.getenv("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
 
-    ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434")
-    log.info("Startup OK | local_model=%s | ollama=%s", LOCAL_MODEL, ollama_url)
+    log.info("Startup OK | local_model=%s | ollama=%s", LOCAL_MODEL, OLLAMA_URL)
 
 _validate_startup()
 
@@ -105,6 +107,14 @@ def get_whisper_model():
 class ChatRequest(BaseModel):
     message: str
     system: str = "You are a helpful personal assistant. Be concise and accurate."
+
+
+class SessionSelectRequest(BaseModel):
+    session_id: str
+
+
+def _error_response(message: str, code: str, retryable: bool, status_code: int = 400) -> JSONResponse:
+    return JSONResponse({"error": message, "code": code, "retryable": retryable}, status_code=status_code)
 
 
 def _estimate_tokens(text: str) -> int:
@@ -186,6 +196,59 @@ def _build_local_prompt(history: list[dict], current_user_message: str) -> str:
     return "\n".join(lines)
 
 
+def _augment_system_with_memories(system: str, memory_hits: list[dict]) -> str:
+    if not memory_hits:
+        return system
+
+    lines = [
+        system,
+        "",
+        "Relevant user memory (apply only if directly helpful to this request):",
+        "If a memory item is not clearly relevant, ignore it.",
+    ]
+    for hit in memory_hits[:5]:
+        lines.append(f"- {hit['text']}")
+    return "\n".join(lines)
+
+
+def _should_inject_memory(decision_intent: str, memory_hits: list[dict], user_message: str) -> bool:
+    if not memory_hits:
+        return False
+    if decision_intent == "memory-needed":
+        return True
+
+    # For non-memory intents, only inject when there is strong lexical overlap.
+    terms = [t for t in re.findall(r"[a-z0-9]+", user_message.lower()) if len(t) > 2][:10]
+    if not terms:
+        return False
+
+    top_text = " ".join(str(h.get("text", "")).lower() for h in memory_hits[:3])
+    overlap = sum(1 for t in terms if t in top_text)
+    return overlap >= 2
+
+
+def _session_preview_text(messages: list[dict]) -> str:
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            return msg.get("content", "")[:80]
+    return ""
+
+
+def _list_sessions() -> list[dict]:
+    with _session_store_lock:
+        ordered = sorted(_session_store.items(), key=lambda item: item[1]["updated_at"], reverse=True)
+        return [
+            {
+                "session_id": sid,
+                "created_at": data["created_at"],
+                "updated_at": data["updated_at"],
+                "message_count": len(data.get("messages", [])),
+                "preview": _session_preview_text(data.get("messages", [])),
+            }
+            for sid, data in ordered
+        ]
+
+
 def _append_session_message(session_id: str, role: str, content: str) -> None:
     now = time.time()
     with _session_store_lock:
@@ -197,7 +260,7 @@ def _append_session_message(session_id: str, role: str, content: str) -> None:
 
 async def stream_local(request: ChatRequest):
     async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", "http://ollama:11434/api/generate", json={
+        async with client.stream("POST", f"{OLLAMA_URL}/api/generate", json={
             "model": LOCAL_MODEL,
             "prompt": request.message,
             "system": request.system,
@@ -216,7 +279,7 @@ async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[overr
         model=CLOUD_MODEL,
         max_tokens=2048,
         system=system,
-        messages=messages,
+        messages=messages,  # type: ignore[arg-type]
     ) as stream:
         for text in stream.text_stream:
             yield text
@@ -235,7 +298,12 @@ async def chat(request: ChatRequest, http_request: Request):
         current_user_message=request.message,
     )
 
+    memory_hits_all = memory_store.retrieve(request.message)
+
     decision = classify_intent(request.message)
+    inject_memory = _should_inject_memory(decision.intent, memory_hits_all, request.message)
+    memory_hits = memory_hits_all if inject_memory else []
+    augmented_system = _augment_system_with_memories(request.system, memory_hits)
 
     log.info(
         "chat.route | session_id=%s intent=%s confidence=%.3f route=%s model=%s "
@@ -255,7 +323,7 @@ async def chat(request: ChatRequest, http_request: Request):
     # Local: flatten into a single prompt string (Ollama /api/generate).
     # Cloud: pass as a proper messages array (Anthropic messages API).
     local_prompt = _build_local_prompt(selected_history, request.message)
-    local_request = ChatRequest(message=local_prompt, system=request.system)
+    local_request = ChatRequest(message=local_prompt, system=augmented_system)
 
     cloud_messages = [
         {"role": m["role"], "content": m["content"]} for m in selected_history
@@ -273,7 +341,7 @@ async def chat(request: ChatRequest, http_request: Request):
         yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence})}\n\n"
 
         primary = (
-            stream_cloud(request.system, cloud_messages)
+            stream_cloud(augmented_system, cloud_messages)
             if decision.use_cloud
             else stream_local(local_request)
         )
@@ -323,6 +391,51 @@ async def chat(request: ChatRequest, http_request: Request):
         _append_session_message(session_id, "user", request.message)
         _append_session_message(session_id, "assistant", assistant_accumulated.strip())
 
+        previous_user_message = next(
+            (m.get("content", "") for m in reversed(session_messages) if m.get("role") == "user"),
+            None,
+        )
+
+        memory_result = memory_store.ingest_user_message(
+            request.message,
+            source="chat",
+            previous_user_message=previous_user_message,
+        )
+        log.info(
+            "chat.memory | session_id=%s retrieved=%d injected=%d status=%s saved=%d blocked=%d needs_confirmation=%d candidates=%d explicit=%s",
+            session_id,
+            len(memory_hits_all),
+            len(memory_hits),
+            memory_result.get("status", "none"),
+            len(memory_result.get("saved", [])),
+            len(memory_result.get("blocked", [])),
+            len(memory_result.get("needs_confirmation", [])),
+            int(memory_result.get("candidates", 0)),
+            bool(memory_result.get("explicit", False)),
+        )
+
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "memory": {
+                        "status": memory_result.get("status", "none"),
+                        "saved": len(memory_result.get("saved", [])),
+                        "blocked": len(memory_result.get("blocked", [])),
+                        "needs_confirmation": len(memory_result.get("needs_confirmation", [])),
+                        "deleted": int(memory_result.get("deleted", 0) or 0),
+                        "explicit": bool(memory_result.get("explicit", False)),
+                        "hint": (
+                            "Memory needs confirmation. Say 'remember this' to store it."
+                            if memory_result.get("status") == "needs-confirmation"
+                            else ""
+                        ),
+                    }
+                }
+            )
+            + "\n\n"
+        )
+
         yield "data: [DONE]\n\n"
 
     response = StreamingResponse(generate(), media_type="text/event-stream")
@@ -367,6 +480,96 @@ async def reset_chat_session(http_request: Request):
     )
     return response
 
+
+@app.get("/chat/sessions")
+async def list_chat_sessions(http_request: Request):
+    current_session = http_request.cookies.get(SESSION_COOKIE_NAME)
+    return JSONResponse({"sessions": _list_sessions(), "current_session_id": current_session})
+
+
+@app.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str, http_request: Request):
+    with _session_store_lock:
+        if session_id not in _session_store:
+            return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
+        del _session_store[session_id]
+    log.info("chat.session.deleted | session_id=%s", session_id)
+
+    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    response = JSONResponse({"ok": True, "session_id": session_id})
+
+    # If the deleted session was active, assign a fresh one via cookie
+    if cookie_session_id == session_id:
+        new_session_id, _ = _get_or_create_session(None)
+        response.set_cookie(
+            key=SESSION_COOKIE_NAME,
+            value=new_session_id,
+            httponly=True,
+            samesite="lax",
+            secure=False,
+            max_age=SESSION_IDLE_TTL_SECONDS,
+        )
+    return response
+
+
+@app.post("/chat/session/new")
+async def create_chat_session():
+    session_id, _ = _get_or_create_session(None)
+    response = JSONResponse({"ok": True, "session_id": session_id})
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_IDLE_TTL_SECONDS,
+    )
+    return response
+
+
+@app.post("/chat/session/select")
+async def select_chat_session(payload: SessionSelectRequest):
+    with _session_store_lock:
+        if payload.session_id not in _session_store:
+            return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
+    response = JSONResponse({"ok": True, "session_id": payload.session_id})
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=payload.session_id,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_IDLE_TTL_SECONDS,
+    )
+    return response
+
+
+@app.get("/chat/session/messages")
+async def get_chat_session_messages(http_request: Request):
+    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    session_id, _ = _get_or_create_session(cookie_session_id)
+    with _session_store_lock:
+        messages = list(_session_store.get(session_id, {}).get("messages", []))
+    return JSONResponse({"session_id": session_id, "messages": messages})
+
+
+@app.get("/memory")
+async def list_memory(limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0)):
+    return JSONResponse(memory_store.list_items(limit=limit, offset=offset))
+
+
+@app.delete("/memory/{memory_id}")
+async def delete_memory(memory_id: str):
+    if not memory_store.delete_item(memory_id):
+        return _error_response("Memory item not found", "MEMORY_NOT_FOUND", False, status_code=404)
+    return JSONResponse({"ok": True, "id": memory_id})
+
+
+@app.delete("/memory")
+async def clear_memory():
+    counts = memory_store.clear_all()
+    return JSONResponse({"ok": True, "cleared": counts})
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -388,8 +591,15 @@ async def wake_websocket(ws: WebSocket):
             # Converting to float32 here would silently zero-out all samples when the
             # library casts back to int16, causing the model to see only silence.
             samples = np.frombuffer(data, dtype=np.int16)
-            prediction = model.predict(samples)
-            score = prediction.get("computer_v2", 0.0)
+            raw_prediction = model.predict(samples)
+            # openWakeWord can return either a dict or a tuple where index 0 is the dict.
+            if isinstance(raw_prediction, tuple):
+                prediction = raw_prediction[0] if raw_prediction else {}
+            else:
+                prediction = raw_prediction
+            if not isinstance(prediction, dict):
+                prediction = {}
+            score = float(prediction.get("computer_v2", 0.0) or 0.0)
             log.debug("Wake score: %.3f (threshold: 0.5)", score)
             if score > 0.5:
                 log.info("Wake word detected — score: %.3f", score)
