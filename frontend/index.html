@@ -4,6 +4,9 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -20,7 +23,7 @@
       --model-local:     #40c057;
       --model-cloud:     #7950f2;
       --radius:          12px;
-      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      --font: Roboto, "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
     }
 
     body {
@@ -44,7 +47,7 @@
     }
 
     header h1 {
-      font-size: 0.95rem;
+      font-size: 1.22rem;
       font-weight: 600;
       letter-spacing: 0.03em;
     }
@@ -53,11 +56,19 @@
     #messages {
       flex: 1;
       overflow-y: auto;
-      padding: 1.5rem;
+      padding: 1.5rem 1rem;
       display: flex;
       flex-direction: column;
-      gap: 1.25rem;
       align-items: center;
+    }
+
+    #messages-inner {
+      width: 100%;
+      max-width: 760px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      padding: 0 0.5rem;
     }
 
     #empty-state {
@@ -67,7 +78,7 @@
       align-items: center;
       gap: 0.6rem;
       color: var(--text-muted);
-      font-size: 0.9rem;
+      font-size: 1.16rem;
       pointer-events: none;
       user-select: none;
     }
@@ -79,7 +90,7 @@
       flex-direction: column;
       width: 100%;
       max-width: 720px;
-      gap: 0.4rem;
+      gap: 0.25rem;
     }
 
     .message.user      { align-self: flex-end;  align-items: flex-end;   max-width: min(75%, 720px); }
@@ -92,12 +103,12 @@
     }
 
     .bubble {
-      padding: 0.7rem 1rem;
-      border-radius: var(--radius);
-      line-height: 1.65;
+      padding: 0.8rem 0.95rem;
+      border-radius: 10px;
+      line-height: 1.58;
       white-space: pre-wrap;
       word-break: break-word;
-      font-size: 0.93rem;
+      font-size: 1.25rem;
     }
 
     .message.user .bubble {
@@ -113,31 +124,33 @@
     }
 
     /* ── Markdown prose ── */
-    .message.assistant .bubble p          { margin: 0 0 0.6em; }
+    .message.assistant .bubble p          { margin: 0 0 0.45em; }
     .message.assistant .bubble p:last-child { margin-bottom: 0; }
     .message.assistant .bubble h1,
     .message.assistant .bubble h2,
     .message.assistant .bubble h3        { margin: 0.8em 0 0.3em; font-weight: 600; }
     .message.assistant .bubble ul,
-    .message.assistant .bubble ol        { margin: 0.4em 0; padding-left: 1.4em; }
-    .message.assistant .bubble li        { margin-bottom: 0.2em; }
+    .message.assistant .bubble ol        { margin: 0 0 0.12em; padding-left: 0.95em; }
+    .message.assistant .bubble li        { margin: 0.02em 0; padding-left: 0.06em; }
+    .message.assistant .bubble li > p    { margin: 0; }
     .message.assistant .bubble code      { background: rgba(0,0,0,0.3); border-radius: 4px; padding: 0.1em 0.35em; font-size: 0.87em; font-family: 'SFMono-Regular', Consolas, monospace; }
-    .message.assistant .bubble pre       { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 0.8em 1em; overflow-x: auto; margin: 0.6em 0; }
+    .message.assistant .bubble pre       { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 0.8em 1em; overflow-x: auto; margin: 0 0 0.45em; }
     .message.assistant .bubble pre code  { background: none; padding: 0; font-size: 0.85em; }
-    .message.assistant .bubble blockquote{ border-left: 3px solid var(--border); margin: 0.5em 0; padding-left: 0.8em; color: var(--text-muted); }
+    .message.assistant .bubble blockquote{ border-left: 3px solid var(--border); margin: 0 0 0.45em; padding-left: 0.8em; color: var(--text-muted); }
     .message.assistant .bubble a         { color: var(--accent); text-decoration: underline; }
-    .message.assistant .bubble hr        { border: none; border-top: 1px solid var(--border); margin: 0.8em 0; }
-    .message.assistant .bubble table     { border-collapse: collapse; width: 100%; margin: 0.6em 0; }
+    .message.assistant .bubble hr        { border: none; border-top: 1px solid var(--border); margin: 0.7em 0; }
+    .message.assistant .bubble table     { border-collapse: collapse; width: 100%; margin: 0 0 0.45em; }
     .message.assistant .bubble th,
     .message.assistant .bubble td        { border: 1px solid var(--border); padding: 0.35em 0.65em; text-align: left; }
     .message.assistant .bubble th        { background: rgba(0,0,0,0.2); }
 
     .model-badge {
-      font-size: 0.68rem;
+      font-size: 0.76rem;
       padding: 0.18rem 0.55rem;
       border-radius: 999px;
       font-weight: 500;
       letter-spacing: 0.04em;
+      opacity: 0.8;
     }
 
     .model-badge.local { background: rgba(64,192,87,0.15); color: var(--model-local); }
@@ -158,34 +171,44 @@
 
     /* ── Input area ── */
     #input-area {
-      padding: 1rem 1.5rem;
-      border-top: 1px solid var(--border);
-      background: var(--surface);
+      padding: 1rem 1rem 1.25rem;
+      display: flex;
+      justify-content: center;
+      flex-shrink: 0;
+      background: var(--bg);
+    }
+
+    #input-inner {
+      width: 100%;
+      max-width: 760px;
       display: flex;
       gap: 0.75rem;
       align-items: flex-end;
-      flex-shrink: 0;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.5rem 0.75rem;
     }
 
     #message-input {
       flex: 1;
-      background: var(--surface-raised);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 0.7rem 1rem;
+      background: transparent;
+      border: none;
+      border-radius: 0;
+      padding: 0.45rem 0.25rem;
       color: var(--text);
       font-family: var(--font);
-      font-size: 0.93rem;
+      font-size: 1.25rem;
       resize: none;
       outline: none;
       line-height: 1.5;
       max-height: 160px;
       overflow-y: auto;
-      transition: border-color 0.15s;
     }
 
-    #message-input:focus       { border-color: var(--accent); }
-    #message-input::placeholder { color: var(--text-muted); }
+    #input-inner:focus-within {
+      border-color: var(--accent);
+    }
 
     #send-btn {
       background: var(--accent);
@@ -230,7 +253,7 @@
 
     /* ── Voice status badge ── */
     #voice-status {
-      font-size: 0.72rem;
+      font-size: 0.86rem;
       padding: 0.2rem 0.6rem;
       border-radius: 999px;
       font-weight: 500;
@@ -267,35 +290,40 @@
   </header>
 
   <div id="messages">
-    <div id="empty-state">
-      <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 24 24"
-           fill="none" stroke="currentColor" stroke-width="1.4"
-           stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-      </svg>
-      <span>Start a conversation</span>
+    <div id="messages-inner">
+      <div id="empty-state">
+        <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="1.4"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span>Start a conversation</span>
+      </div>
     </div>
   </div>
 
   <div id="input-area">
-    <textarea
-      id="message-input"
-      placeholder="Message…"
-      rows="1"
-      autofocus
-    ></textarea>
-    <button id="send-btn" title="Send (Enter)">
-      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-           fill="none" stroke="currentColor" stroke-width="2.2"
-           stroke-linecap="round" stroke-linejoin="round">
-        <line x1="22" y1="2" x2="11" y2="13"/>
-        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-      </svg>
-    </button>
+    <div id="input-inner">
+      <textarea
+        id="message-input"
+        placeholder="Message…"
+        rows="1"
+        autofocus
+      ></textarea>
+      <button id="send-btn" title="Send (Enter)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="2.2"
+             stroke-linecap="round" stroke-linejoin="round">
+          <line x1="22" y1="2" x2="11" y2="13"/>
+          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+        </svg>
+      </button>
+    </div>
   </div>
 
   <script>
-    const messagesEl = document.getElementById('messages');
+    const messagesEl   = document.getElementById('messages');
+    const messagesInner = document.getElementById('messages-inner');
     const input      = document.getElementById('message-input');
     const sendBtn    = document.getElementById('send-btn');
 
@@ -334,7 +362,7 @@
       bubble.textContent = text;
 
       wrapper.appendChild(bubble);
-      messagesEl.appendChild(wrapper);
+      messagesInner.appendChild(wrapper);
       scrollToBottom();
       return { wrapper, bubble };
     }
@@ -345,6 +373,19 @@
       badge.className = 'model-badge ' + (isCloud ? 'cloud' : 'local');
       badge.textContent = modelName;
       wrapper.appendChild(badge);
+    }
+
+    function showVoiceError(msg) {
+      document.getElementById('empty-state')?.remove();
+      const wrapper = document.createElement('div');
+      wrapper.className = 'message assistant';
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.style.color = '#fa5252';
+      bubble.textContent = `⚠ ${msg}`;
+      wrapper.appendChild(bubble);
+      messagesInner.appendChild(wrapper);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
     }
 
     // ── Main send logic ─────────────────────────────────────────
@@ -551,6 +592,9 @@
     let _workletNode = null;
     let _ws         = null;
     let _micStream  = null;
+    let _wakeGuardUntil  = 0;        // timestamp: ignore wake + frame send until this time
+    let _reconnectDelay  = 1000;     // ms; doubled on each failed reconnect
+    const _MAX_RECONNECT = 30000;    // backoff cap (30 s)
 
     async function startVoice() {
       if (location.protocol === 'file:') {
@@ -576,24 +620,32 @@
         _ws = new WebSocket(`${wsProto}://${location.host}/ws/wake`);
         _ws.binaryType = 'arraybuffer';
 
+        _ws.onopen = () => {
+          _reconnectDelay = 1000; // reset backoff on successful connection
+        };
+
         _ws.onmessage = async (evt) => {
           const msg = JSON.parse(evt.data);
-          if (msg.event === 'wake' && voiceState === 'sleeping') {
+          if (msg.event === 'wake' && voiceState === 'sleeping' && Date.now() > _wakeGuardUntil) {
             console.log('[voice] wake word detected, score:', msg.score);
+            _wakeGuardUntil = Date.now() + 1500; // 1.5 s post-wake guard window
             await captureUtterance();
           }
         };
 
-        _ws.onclose = () => {
+        _ws.onclose = (evt) => {
+          console.warn('[voice] WebSocket closed — code:', evt.code, 'reason:', evt.reason || '(none)');
           if (voiceState !== 'off') {
-            console.warn('[voice] WebSocket closed unexpectedly, restarting…');
-            setTimeout(startVoice, 2000);
+            const delay = _reconnectDelay;
+            _reconnectDelay = Math.min(_reconnectDelay * 2, _MAX_RECONNECT);
+            console.log(`[voice] reconnecting in ${delay}ms…`);
+            setTimeout(startVoice, delay);
           }
         };
 
         // 4. Pipe AudioWorklet frames → WebSocket
         _workletNode.port.onmessage = (evt) => {
-          if (_ws.readyState === WebSocket.OPEN && voiceState === 'sleeping') {
+          if (_ws.readyState === WebSocket.OPEN && voiceState === 'sleeping' && Date.now() > _wakeGuardUntil) {
             _ws.send(evt.data); // transferable ArrayBuffer (Int16)
           }
         };
@@ -602,7 +654,10 @@
       } catch (err) {
         console.error('[voice] failed to start:', err);
         stopVoice();
-        alert(`Could not start voice: ${err.message}`);
+        const isPermission = err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError';
+        showVoiceError(isPermission
+          ? 'Microphone access was denied. Please allow microphone access and try again.'
+          : `Could not start voice input: ${err.message}`);
       }
     }
 

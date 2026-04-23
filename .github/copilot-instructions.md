@@ -104,10 +104,38 @@ Acceptance:
 
 ---
 
-### Phase 3 — Smarter model routing with intent classification
-**Status: in progress**
+### Phase 3 — Chat context management
+**Status: next**
 **Estimate: 1–2 days**
 **Depends on: Phase 1**
+
+Goal: Keep each active chat session coherent by passing recent conversational
+context with every new user message, without introducing durable memory yet.
+
+Tasks:
+- Maintain a message history buffer for the current chat session.
+- Pass the last N messages (or messages up to a token budget) to Ollama on
+  each `/chat` request.
+- Add bounded-context controls: max turns, token cap, and truncation strategy.
+- Optionally summarize older in-session messages once history grows beyond
+  thresholds, and include that summary in context.
+- Store session context in memory or a lightweight session store (no SQLite
+  requirement in this phase).
+- Emit lightweight telemetry: context length, estimated token usage,
+  truncation/summarization events.
+
+Acceptance:
+- Multi-turn follow-up questions resolve correctly within the same chat session.
+- Context size remains bounded under long conversations.
+- Session context is isolated per client/session and resettable.
+- No dependency on persistent SQLite memory for this phase.
+
+---
+
+### Phase 4 — Smarter model routing with intent classification
+**Status: in progress**
+**Estimate: 1–2 days**
+**Depends on: Phases 1, 3**
 
 Goal: Local model handles all routine queries. Cloud model is invoked only when
 genuinely needed. Failures degrade gracefully.
@@ -137,9 +165,9 @@ Acceptance:
 
 ---
 
-### Phase 4 — SQLite memory layer
+### Phase 5 — SQLite memory layer
 **Estimate: 2–3 days**
-**Depends on: Phase 3**
+**Depends on: Phase 4**
 
 Goal: Assistant remembers user preferences and relevant facts across restarts.
 This is the foundation for personalization, weather defaults, music preferences,
@@ -171,9 +199,9 @@ Acceptance:
 
 ---
 
-### Phase 5 — Weather tool
+### Phase 6 — Weather tool
 **Estimate: 1 day**
-**Depends on: Phase 4**
+**Depends on: Phase 5**
 
 Goal: First external tool integration. Validates the tool-routing architecture
 cleanly before adding more complex tools.
@@ -195,9 +223,9 @@ Acceptance:
 
 ---
 
-### Phase 6 — Local music library playback
+### Phase 7 — Local music library playback
 **Estimate: 3–5 days**
-**Depends on: Phases 2, 4**
+**Depends on: Phases 2, 5**
 
 Goal: Search and play music from a local collection by voice or text.
 
@@ -218,9 +246,9 @@ Acceptance:
 
 ---
 
-### Phase 7 — TNG-style voice output (TTS)
+### Phase 8 — TNG-style voice output (TTS)
 **Estimate: 2–4 days**
-**Depends on: Phases 2, 3 (and ideally Phase 5 for tool response parity)**
+**Depends on: Phases 2, 4 (and ideally Phase 6 for tool response parity)**
 
 Goal: Assistant responds with spoken audio in a clear, consistent female voice
 aligned to TNG computer style.
@@ -244,7 +272,7 @@ Acceptance:
 
 ---
 
-### Phase 8 — LangGraph agent orchestration
+### Phase 9 — LangGraph agent orchestration
 **Estimate: 1–2 weeks**
 **Depends on: all prior phases**
 
@@ -323,16 +351,17 @@ Acceptance:
 
 ---
 
-## Immediate next sprint (Issues 1–6 in order)
+## Immediate next sprint (Issues 1–7 in order)
 
 | # | Issue | Estimate | Depends on |
 |---|-------|----------|------------|
 | 1 | Finish LAN-safe single-origin serving and health checks | 1–2 days | — | ✅ done |
 | 2 | Replace all `localhost` frontend paths with relative paths | 2–4 hours | 1 | ✅ done |
 | 3 | Harden wake-word pipeline: startup validation, guard window, WS logging | 1–2 days | 1, 2 |
-| 4 | Upgrade router: intent categories, confidence scoring, telemetry | 1–2 days | 1 |
-| 5 | SQLite memory layer: schema, write/read policy, CRUD endpoints | 2–3 days | 4 |
-| 6 | Weather tool: adapter, memory-backed default location, error handling | 1 day | 5 |
+| 4 | Add chat context management: bounded session buffer + token-aware context | 1–2 days | 1 |
+| 5 | Upgrade router: intent categories, confidence scoring, telemetry | 1–2 days | 1, 4 |
+| 6 | SQLite memory layer: schema, write/read policy, CRUD endpoints | 2–3 days | 5 |
+| 7 | Weather tool: adapter, memory-backed default location, error handling | 1 day | 6 |
 
 Each issue maps directly to a phase above. Use these as GitHub issue titles and
 reference the phase section for full task and acceptance detail.

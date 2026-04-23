@@ -136,6 +136,7 @@ async def health():
 @app.websocket("/ws/wake")
 async def wake_websocket(ws: WebSocket):
     await ws.accept()
+    log.info("Wake WebSocket connected from %s", ws.client)
     model = get_oww_model()
     model.reset()  # clear any stale state from a previous session
     try:
@@ -145,11 +146,13 @@ async def wake_websocket(ws: WebSocket):
             samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
             prediction = model.predict(samples)
             score = prediction.get("computer_v2", 0.0)
+            log.debug("Wake score: %.3f (threshold: 0.5)", score)
             if score > 0.5:
+                log.info("Wake word detected — score: %.3f", score)
                 await ws.send_json({"event": "wake", "score": round(float(score), 3)})
                 model.reset()
-    except WebSocketDisconnect:
-        pass
+    except WebSocketDisconnect as exc:
+        log.info("Wake WebSocket disconnected — code: %d, reason: %s", exc.code, exc.reason or "(none)")
 
 
 # ── Transcription endpoint ─────────────────────────────────────────────────────
