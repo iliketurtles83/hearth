@@ -45,7 +45,10 @@ class COOPCOEPMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         response = await call_next(request)
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
-        response.headers["Cross-Origin-Embedder-Policy"] = "require-corp"
+        # 'credentialless' (vs 'require-corp') still enables SharedArrayBuffer
+        # (needed by vad-web's threaded WASM) while allowing cross-origin CDN
+        # resources that don't set Cross-Origin-Resource-Policy headers.
+        response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
         return response
 
 app = FastAPI()
@@ -65,8 +68,15 @@ def get_oww_model():
     global _oww_model
     if _oww_model is None:
         from openwakeword.model import Model
-        model_path = os.path.join(os.path.dirname(__file__), "models", "computer_v2.onnx")
-        _oww_model = Model(wakeword_models=[model_path], inference_framework="onnx")
+        _models_dir = os.path.join(os.path.dirname(__file__), "models")
+        # v0.6.0 removed bundled backbone models — pass explicit paths so AudioFeatures
+        # doesn't look in the (empty) library resources directory.
+        _oww_model = Model(
+            wakeword_models=[os.path.join(_models_dir, "computer_v2.onnx")],
+            inference_framework="onnx",
+            melspec_model_path=os.path.join(_models_dir, "melspectrogram.onnx"),
+            embedding_model_path=os.path.join(_models_dir, "embedding_model.onnx"),
+        )
     return _oww_model
 
 # ── faster-whisper model (lazy-loaded on first /transcribe call) ──
@@ -142,8 +152,10 @@ async def wake_websocket(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_bytes()
-            # Convert raw int16 LE bytes → float32 numpy array in [-1, 1]
-            samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            # Keep as int16 — the library's melspectrogram model requires int16 PCM input.
+            # Converting to float32 here would silently zero-out all samples when the
+            # library casts back to int16, causing the model to see only silence.
+            samples = np.frombuffer(data, dtype=np.int16)
             prediction = model.predict(samples)
             score = prediction.get("computer_v2", 0.0)
             log.debug("Wake score: %.3f (threshold: 0.5)", score)
