@@ -251,6 +251,30 @@
     #mic-btn.active                   { color: #fa5252; border-color: #fa5252; background: rgba(250,82,82,0.1); }
     #mic-btn svg                      { width: 15px; height: 15px; }
 
+    #new-chat-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      height: 34px;
+      padding: 0 0.75rem;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 0.86rem;
+      letter-spacing: 0.02em;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+
+    #new-chat-btn:hover {
+      color: var(--text);
+      border-color: var(--text-muted);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    #new-chat-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
     /* ── Voice status badge ── */
     #voice-status {
       font-size: 0.86rem;
@@ -277,6 +301,7 @@
     </svg>
     <h1>Assistant</h1>
     <span id="voice-status"></span>
+    <button id="new-chat-btn" title="Start a fresh chat session">New Chat</button>
     <button id="mic-btn" title="Toggle voice (say &quot;Computer,&quot; to activate)">
       <!-- mic icon -->
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
@@ -326,6 +351,7 @@
     const messagesInner = document.getElementById('messages-inner');
     const input      = document.getElementById('message-input');
     const sendBtn    = document.getElementById('send-btn');
+    const newChatBtn = document.getElementById('new-chat-btn');
 
     // Auto-grow textarea
     input.addEventListener('input', () => {
@@ -339,12 +365,14 @@
     });
 
     sendBtn.addEventListener('click', send);
+    newChatBtn.addEventListener('click', startNewChat);
 
     // ── Helpers ────────────────────────────────────────────────
 
     function setLocked(locked) {
       sendBtn.disabled = locked;
       input.disabled   = locked;
+      newChatBtn.disabled = locked;
     }
 
     function scrollToBottom() {
@@ -367,11 +395,36 @@
       return { wrapper, bubble };
     }
 
-    function appendModelBadge(wrapper, modelName) {
+    function renderEmptyState() {
+      const empty = document.createElement('div');
+      empty.id = 'empty-state';
+      empty.innerHTML = `
+        <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 24 24"
+             fill="none" stroke="currentColor" stroke-width="1.4"
+             stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+        </svg>
+        <span>Start a conversation</span>
+      `;
+      return empty;
+    }
+
+    function resetMessagesView() {
+      messagesInner.innerHTML = '';
+      messagesInner.appendChild(renderEmptyState());
+      scrollToBottom();
+    }
+
+    function appendModelBadge(wrapper, modelName, intent, fallback) {
       const isCloud = modelName.toLowerCase().includes('claude');
+      // Remove existing badge if present (e.g. on fallback update)
+      wrapper.querySelector('.model-badge')?.remove();
       const badge   = document.createElement('span');
       badge.className = 'model-badge ' + (isCloud ? 'cloud' : 'local');
-      badge.textContent = modelName;
+      const intentLabel = intent ? ` · ${intent}` : '';
+      const fallbackLabel = fallback ? ' · fallback' : '';
+      badge.textContent = modelName + intentLabel + fallbackLabel;
+      badge.title = `Model: ${modelName}\nIntent: ${intent || 'unknown'}\nRoute: ${isCloud ? 'cloud' : 'local'}${fallback ? ' (fallback)' : ''}`;
       wrapper.appendChild(badge);
     }
 
@@ -411,6 +464,7 @@
         const resp = await fetch('/chat', {
           method:  'POST',
           headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
           body:    JSON.stringify({ message: text }),
         });
 
@@ -438,7 +492,15 @@
             try { parsed = JSON.parse(raw); } catch { continue; }
 
             if (parsed.model) {
-              appendModelBadge(wrapper, parsed.model);
+              appendModelBadge(wrapper, parsed.model, parsed.intent, parsed.fallback);
+            }
+
+            if (parsed.notice) {
+              const notice = document.createElement('span');
+              notice.className = 'model-badge local';
+              notice.style.opacity = '0.65';
+              notice.textContent = `⚠ ${parsed.notice}`;
+              wrapper.appendChild(notice);
             }
 
             if (parsed.text) {
@@ -453,6 +515,23 @@
         bubble.textContent = `⚠ ${err.message}`;
       } finally {
         cursor.remove();
+        setLocked(false);
+        input.focus();
+      }
+    }
+
+    async function startNewChat() {
+      setLocked(true);
+      try {
+        const resp = await fetch('/chat/session', {
+          method: 'DELETE',
+          credentials: 'same-origin',
+        });
+        if (!resp.ok) throw new Error(`Server error: HTTP ${resp.status}`);
+        resetMessagesView();
+      } catch (err) {
+        appendMessage('assistant', `⚠ Unable to reset chat session: ${err.message}`);
+      } finally {
         setLocked(false);
         input.focus();
       }

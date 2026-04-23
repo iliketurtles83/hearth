@@ -1,0 +1,280 @@
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:              #0f1117;
+      --surface:         #1a1d27;
+      --surface-raised:  #232635;
+      --border:          #2e3148;
+      --text:            #e8eaf0;
+      --text-muted:      #7c7f9a;
+      --user-bg:         #3b5bdb;
+      --accent:          #6c8aff;
+      --model-local:     #40c057;
+      --model-cloud:     #7950f2;
+      --radius:          12px;
+      --font: Roboto, "Inter", system-ui, -apple-system, "Segoe UI", sans-serif;
+    }
+
+    body {
+      font-family: var(--font);
+      background: var(--bg);
+      color: var(--text);
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ── Header ── */
+    header {
+      padding: 0.9rem 1.5rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface);
+      display: flex;
+      align-items: center;
+      gap: 0.6rem;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 1.22rem;
+      font-weight: 600;
+      letter-spacing: 0.03em;
+    }
+
+    /* ── Messages ── */
+    #messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 1.5rem 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    #messages-inner {
+      width: 100%;
+      max-width: 760px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      padding: 0 0.5rem;
+    }
+
+    #empty-state {
+      margin: auto;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.6rem;
+      color: var(--text-muted);
+      font-size: 1.16rem;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #empty-state svg { opacity: 0.25; }
+
+    .message {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      max-width: 720px;
+      gap: 0.25rem;
+    }
+
+    .message.user      { align-self: flex-end;  align-items: flex-end;   max-width: min(75%, 720px); }
+    .message.assistant { align-self: flex-start; align-items: flex-start; }
+
+    @media (max-width: 600px) {
+      .message.user      { max-width: 88%; }
+      .message.assistant { width: 100%; max-width: 100%; }
+      .message.assistant .bubble { border-radius: var(--radius); border-bottom-left-radius: 3px; }
+    }
+
+    .bubble {
+      padding: 0.8rem 0.95rem;
+      border-radius: 10px;
+      line-height: 1.58;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-size: 1.25rem;
+    }
+
+    .message.user .bubble {
+      background: var(--user-bg);
+      color: #fff;
+      border-bottom-right-radius: 3px;
+    }
+
+    .message.assistant .bubble {
+      background: var(--surface-raised);
+      color: var(--text);
+      border-bottom-left-radius: 3px;
+    }
+
+    /* ── Markdown prose ── */
+    .message.assistant .bubble p          { margin: 0 0 0.45em; }
+    .message.assistant .bubble p:last-child { margin-bottom: 0; }
+    .message.assistant .bubble h1,
+    .message.assistant .bubble h2,
+    .message.assistant .bubble h3        { margin: 0.8em 0 0.3em; font-weight: 600; }
+    .message.assistant .bubble ul,
+    .message.assistant .bubble ol        { margin: 0 0 0.12em; padding-left: 0.95em; }
+    .message.assistant .bubble li        { margin: 0.02em 0; padding-left: 0.06em; }
+    .message.assistant .bubble li > p    { margin: 0; }
+    .message.assistant .bubble code      { background: rgba(0,0,0,0.3); border-radius: 4px; padding: 0.1em 0.35em; font-size: 0.87em; font-family: 'SFMono-Regular', Consolas, monospace; }
+    .message.assistant .bubble pre       { background: rgba(0,0,0,0.3); border-radius: 8px; padding: 0.8em 1em; overflow-x: auto; margin: 0 0 0.45em; }
+    .message.assistant .bubble pre code  { background: none; padding: 0; font-size: 0.85em; }
+    .message.assistant .bubble blockquote{ border-left: 3px solid var(--border); margin: 0 0 0.45em; padding-left: 0.8em; color: var(--text-muted); }
+    .message.assistant .bubble a         { color: var(--accent); text-decoration: underline; }
+    .message.assistant .bubble hr        { border: none; border-top: 1px solid var(--border); margin: 0.7em 0; }
+    .message.assistant .bubble table     { border-collapse: collapse; width: 100%; margin: 0 0 0.45em; }
+    .message.assistant .bubble th,
+    .message.assistant .bubble td        { border: 1px solid var(--border); padding: 0.35em 0.65em; text-align: left; }
+    .message.assistant .bubble th        { background: rgba(0,0,0,0.2); }
+
+    .model-badge {
+      font-size: 0.76rem;
+      padding: 0.18rem 0.55rem;
+      border-radius: 999px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      opacity: 0.8;
+    }
+
+    .model-badge.local { background: rgba(64,192,87,0.15); color: var(--model-local); }
+    .model-badge.cloud { background: rgba(121,80,242,0.15); color: var(--model-cloud); }
+
+    /* Blinking cursor shown while streaming */
+    .cursor {
+      display: inline-block;
+      width: 2px;
+      height: 0.9em;
+      background: var(--accent);
+      margin-left: 2px;
+      vertical-align: text-bottom;
+      animation: blink 0.75s step-end infinite;
+    }
+
+    @keyframes blink { 50% { opacity: 0; } }
+
+    /* ── Input area ── */
+    #input-area {
+      padding: 1rem 1rem 1.25rem;
+      display: flex;
+      justify-content: center;
+      flex-shrink: 0;
+      background: var(--bg);
+    }
+
+    #input-inner {
+      width: 100%;
+      max-width: 760px;
+      display: flex;
+      gap: 0.75rem;
+      align-items: flex-end;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.5rem 0.75rem;
+    }
+
+    #message-input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      border-radius: 0;
+      padding: 0.45rem 0.25rem;
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 1.25rem;
+      resize: none;
+      outline: none;
+      line-height: 1.5;
+      max-height: 160px;
+      overflow-y: auto;
+    }
+
+    #input-inner:focus-within {
+      border-color: var(--accent);
+    }
+
+    #send-btn {
+      background: var(--accent);
+      border: none;
+      border-radius: var(--radius);
+      width: 42px;
+      height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      flex-shrink: 0;
+      color: #fff;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+
+    #send-btn:hover:not(:disabled)  { opacity: 0.85; }
+    #send-btn:active:not(:disabled) { transform: scale(0.93); }
+    #send-btn:disabled              { opacity: 0.35; cursor: not-allowed; }
+    #send-btn svg                   { width: 17px; height: 17px; }
+
+    /* ── Mic button ── */
+    #mic-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      width: 34px;
+      height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      margin-left: auto;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+
+    #mic-btn:hover                    { color: var(--text); border-color: var(--text-muted); }
+    #mic-btn.active                   { color: #fa5252; border-color: #fa5252; background: rgba(250,82,82,0.1); }
+    #mic-btn svg                      { width: 15px; height: 15px; }
+
+    #new-chat-btn {
+      background: none;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      height: 34px;
+      padding: 0 0.75rem;
+      color: var(--text-muted);
+      cursor: pointer;
+      font-size: 0.86rem;
+      letter-spacing: 0.02em;
+      transition: color 0.15s, border-color 0.15s, background 0.15s;
+    }
+
+    #new-chat-btn:hover {
+      color: var(--text);
+      border-color: var(--text-muted);
+      background: rgba(255, 255, 255, 0.03);
+    }
+
+    #new-chat-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+
+    /* ── Voice status badge ── */
+    #voice-status {
+      font-size: 0.86rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 999px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      display: none;
+    }
+
+    #voice-status.sleeping    { display: inline-block; background: rgba(124,127,154,0.15); color: var(--text-muted); }
+    #voice-status.listening   { display: inline-block; background: rgba(108,138,255,0.15); color: var(--accent); }
+    #voice-status.recording   { display: inline-block; background: rgba(250,82,82,0.15);   color: #fa5252; }
+    #voice-status.transcribing{ display: inline-block; background: rgba(64,192,87,0.15);   color: var(--model-local); }

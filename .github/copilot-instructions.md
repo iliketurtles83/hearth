@@ -71,7 +71,7 @@ Acceptance:
 ---
 
 ### Phase 2 — Harden wake-word voice input pipeline
-**Status: in progress**
+**Status: complete (desktop/Linux/LAN browsers)**
 **Estimate: 1–2 days**
 **Depends on: Phase 1**
 
@@ -83,29 +83,53 @@ Frontend state machine — enforce these transitions only, no others:
 off → sleeping → recording → transcribing → sleeping
 ```
 
-Tasks:
-- On backend startup, validate that required ONNX model files exist and log
-  clearly if any are missing — do not silently swallow import errors.
-- Keep wake model filename and prediction key in sync with downloaded model assets.
-- Add a short post-wake guard window (recommended: 1.5 s) to prevent retrigger
-  while the user is still speaking.
-- Log WebSocket close codes and reasons on every disconnect.
-- Log wake score and threshold decisions at DEBUG level.
-- Make microphone permission errors user-friendly and non-fatal — show a clear
-  in-UI message rather than a console-only error.
-- Add reconnect backoff on the frontend WebSocket (do not reconnect in a tight loop).
+Implementation notes (decisions made during build):
+- **openWakeWord v0.6.0**: backbone models (`melspectrogram.onnx`, `embedding_model.onnx`)
+  are no longer bundled in the PyPI package. Pass explicit `melspec_model_path` and
+  `embedding_model_path` to `Model()`, pointing at `backend/models/`. Do not rely on
+  the package's `resources/models/` directory — it is empty after v0.6.0.
+- **Audio dtype**: pass raw `int16` numpy arrays to `model.predict()`. The library's
+  melspectrogram step requires int16 PCM. Converting to float32 beforehand silently
+  zeros all samples and the model sees only silence.
+- **Utterance capture**: `@ricky0123/vad-web` was removed. It requires ORT/WASM assets
+  that fail to load under `Cross-Origin-Embedder-Policy` headers. Utterance capture is
+  now done entirely from the existing AudioWorklet frame stream using an RMS energy
+  threshold (no additional CDN dependencies). Silence is detected after ~640 ms of
+  sub-threshold energy following speech onset; max capture is 15 s.
+- **COEP header**: set to `credentialless` (not `require-corp`) so cross-origin CDN
+  resources load while SharedArrayBuffer remains enabled for the worklet.
+- **Linux dual-mic fix**: pass explicit audio constraints (`sampleRate: 16000`,
+  `channelCount: 1`, processing disabled) to `getUserMedia` to prevent PipeWire/ALSA
+  from opening the device twice.
+- **Android / mobile HTTPS**: `navigator.mediaDevices` is `undefined` on plain HTTP in
+  mobile browsers. The UI shows a clear in-UI error. Deferred — fix requires HTTPS
+  termination (nginx/Caddy with self-signed cert, or LAN reverse proxy). See backlog.
+
+Tasks — all complete:
+- ✅ Startup validation: log clearly if ONNX model files are missing.
+- ✅ Pass explicit backbone model paths to openWakeWord `Model()` constructor.
+- ✅ Keep wake model filename and prediction key in sync (`computer_v2`).
+- ✅ Pass raw int16 to `model.predict()`; do not normalize to float32 beforehand.
+- ✅ Post-wake guard window (1.5 s) to prevent retrigger.
+- ✅ WebSocket close code/reason logged on every disconnect.
+- ✅ Wake score logged at DEBUG level.
+- ✅ Mic permission errors shown in-UI, non-fatal.
+- ✅ Secure-context check with user-friendly message on non-HTTPS clients.
+- ✅ Reconnect backoff on frontend WebSocket.
+- ✅ Utterance capture via RMS threshold on existing worklet frames (no vad-web).
 
 Acceptance:
-- Clicking mic enters stable sleeping state.
-- Saying wake phrase triggers exactly one capture/transcribe cycle then returns
+- ✅ Clicking mic enters stable sleeping state.
+- ✅ Saying "Computer," triggers exactly one capture/transcribe cycle then returns
   to sleeping.
-- Transcribed text is sent to `/chat` automatically.
-- No retrigger occurs while the user is speaking after the wake event.
+- ✅ Transcribed text is sent to `/chat` automatically.
+- ✅ No retrigger occurs while the user is speaking after the wake event.
+- ⏳ Android voice — deferred pending HTTPS on LAN (see backlog).
 
 ---
 
 ### Phase 3 — Chat context management
-**Status: next**
+**Status: in progress**
 **Estimate: 1–2 days**
 **Depends on: Phase 1**
 
@@ -133,7 +157,7 @@ Acceptance:
 ---
 
 ### Phase 4 — Smarter model routing with intent classification
-**Status: in progress**
+**Status: complete**
 **Estimate: 1–2 days**
 **Depends on: Phases 1, 3**
 
@@ -351,17 +375,26 @@ Acceptance:
 
 ---
 
-## Immediate next sprint (Issues 1–7 in order)
+## Backlog
 
-| # | Issue | Estimate | Depends on |
-|---|-------|----------|------------|
-| 1 | Finish LAN-safe single-origin serving and health checks | 1–2 days | — | ✅ done |
-| 2 | Replace all `localhost` frontend paths with relative paths | 2–4 hours | 1 | ✅ done |
-| 3 | Harden wake-word pipeline: startup validation, guard window, WS logging | 1–2 days | 1, 2 |
-| 4 | Add chat context management: bounded session buffer + token-aware context | 1–2 days | 1 |
-| 5 | Upgrade router: intent categories, confidence scoring, telemetry | 1–2 days | 1, 4 |
-| 6 | SQLite memory layer: schema, write/read policy, CRUD endpoints | 2–3 days | 5 |
-| 7 | Weather tool: adapter, memory-backed default location, error handling | 1 day | 6 |
+- **Android / mobile voice**: `navigator.mediaDevices` requires a secure context
+  (HTTPS). Options: nginx/Caddy reverse proxy with self-signed cert on LAN;
+  or a native Android companion app. Do not attempt on plain HTTP.
 
-Each issue maps directly to a phase above. Use these as GitHub issue titles and
+---
+
+## Immediate next sprint
+
+| # | Issue | Status | Estimate | Depends on |
+|---|-------|--------|----------|------------|
+| 1 | LAN-safe single-origin serving and health checks | ✅ done | 1–2 days | — |
+| 2 | Replace all `localhost` frontend paths with relative paths | ✅ done | 2–4 hours | 1 |
+| 3 | Harden wake-word pipeline (Phase 2) | ✅ done | 1–2 days | 1, 2 |
+| 4 | Chat context management: bounded session buffer + token-aware context | 🔄 in progress | 1–2 days | 1 |
+| 5 | Upgrade router: intent categories, confidence scoring, telemetry | ✅ done | 1–2 days | 1, 4 |
+| 6 | SQLite memory layer: schema, write/read policy, CRUD endpoints | 🔲 | 2–3 days | 5 |
+| 7 | Weather tool: adapter, memory-backed default location, error handling | 🔲 | 1 day | 6 |
+| 8 | HTTPS on LAN (nginx/Caddy) to unblock Android/mobile voice | 🔲 backlog | 0.5 days | — |
+
+Each numbered issue maps to a phase above. Use these as GitHub issue titles and
 reference the phase section for full task and acceptance detail.

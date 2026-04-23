@@ -1,9 +1,8 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.requests import Request
 from pydantic import BaseModel
 import httpx
 import anthropic
@@ -11,9 +10,12 @@ import os
 import json
 import logging
 import tempfile
+import time
+from threading import Lock
+from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
-from router import should_use_cloud, LOCAL_MODEL, CLOUD_MODEL
+from router import classify_intent, LOCAL_MODEL, CLOUD_MODEL
 
 load_dotenv()
 
@@ -22,6 +24,15 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 log = logging.getLogger("assistant")
+
+SESSION_COOKIE_NAME = os.getenv("CHAT_SESSION_COOKIE", "assistant_session")
+SESSION_IDLE_TTL_SECONDS = int(os.getenv("CHAT_SESSION_IDLE_TTL_SECONDS", "1800"))
+SESSION_MAX_ITEMS = int(os.getenv("CHAT_SESSION_MAX_ITEMS", "200"))
+CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
+CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
+
+_session_store_lock = Lock()
+_session_store: dict[str, dict] = {}
 
 # ── Startup validation ─────────────────────────────────────────────────────────
 def _validate_startup() -> None:
@@ -95,6 +106,95 @@ class ChatRequest(BaseModel):
     message: str
     system: str = "You are a helpful personal assistant. Be concise and accurate."
 
+
+def _estimate_tokens(text: str) -> int:
+    # Lightweight token estimate for bounded context decisions.
+    return max(1, len(text) // 4)
+
+
+def _cleanup_expired_sessions(now: float) -> None:
+    expired = [
+        session_id
+        for session_id, session in _session_store.items()
+        if now - session["updated_at"] > SESSION_IDLE_TTL_SECONDS
+    ]
+    for session_id in expired:
+        del _session_store[session_id]
+    if expired:
+        log.info("chat.session.evicted_expired | count=%d", len(expired))
+
+
+def _evict_oldest_sessions_if_needed() -> None:
+    if len(_session_store) <= SESSION_MAX_ITEMS:
+        return
+    overflow = len(_session_store) - SESSION_MAX_ITEMS
+    oldest_first = sorted(_session_store.items(), key=lambda item: item[1]["updated_at"])
+    for session_id, _ in oldest_first[:overflow]:
+        del _session_store[session_id]
+    log.info("chat.session.evicted_capacity | count=%d", overflow)
+
+
+def _get_or_create_session(session_id: str | None) -> tuple[str, bool]:
+    now = time.time()
+    with _session_store_lock:
+        _cleanup_expired_sessions(now)
+        effective_id = session_id if session_id and session_id in _session_store else str(uuid4())
+        created = effective_id not in _session_store
+        if created:
+            _session_store[effective_id] = {"messages": [], "created_at": now, "updated_at": now}
+            log.info("chat.session.created | session_id=%s", effective_id)
+        else:
+            _session_store[effective_id]["updated_at"] = now
+        _evict_oldest_sessions_if_needed()
+        return effective_id, created
+
+
+def _select_history_for_budget(messages: list[dict], system: str, current_user_message: str) -> tuple[list[dict], int, bool]:
+    history_budget = max(0, CHAT_TOKEN_BUDGET - _estimate_tokens(system) - _estimate_tokens(current_user_message) - 32)
+    selected_reversed: list[dict] = []
+    used_tokens = 0
+    truncated = False
+    max_messages = max(1, CHAT_MAX_TURNS * 2)
+    candidates = messages[-max_messages:]
+
+    for message in reversed(candidates):
+        cost = _estimate_tokens(message["content"]) + 4
+        if used_tokens + cost > history_budget:
+            truncated = True
+            continue
+        selected_reversed.append(message)
+        used_tokens += cost
+
+    selected = list(reversed(selected_reversed))
+    if len(messages) > len(selected):
+        truncated = True
+    return selected, used_tokens, truncated
+
+
+def _build_local_prompt(history: list[dict], current_user_message: str) -> str:
+    if not history:
+        return current_user_message
+
+    role_map = {"user": "User", "assistant": "Assistant"}
+    lines = ["Conversation so far:"]
+    for message in history:
+        role = role_map.get(message.get("role", ""), "User")
+        lines.append(f"{role}: {message['content']}")
+    lines.append("")
+    lines.append(f"User: {current_user_message}")
+    lines.append("Assistant:")
+    return "\n".join(lines)
+
+
+def _append_session_message(session_id: str, role: str, content: str) -> None:
+    now = time.time()
+    with _session_store_lock:
+        session = _session_store.get(session_id)
+        if not session:
+            return
+        session["messages"].append({"role": role, "content": content, "ts": now})
+        session["updated_at"] = now
+
 async def stream_local(request: ChatRequest):
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", "http://ollama:11434/api/generate", json={
@@ -110,30 +210,162 @@ async def stream_local(request: ChatRequest):
                     if data.get("done"):
                         break
 
-async def stream_cloud(request: ChatRequest):
+async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[override]
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     with client.messages.stream(
         model=CLOUD_MODEL,
         max_tokens=2048,
-        system=request.system,
-        messages=[{"role": "user", "content": request.message}],
+        system=system,
+        messages=messages,
     ) as stream:
         for text in stream.text_stream:
             yield text
 
 @app.post("/chat")
-async def chat(request: ChatRequest):
-    use_cloud = should_use_cloud(request.message)
-    streamer = stream_cloud(request) if use_cloud else stream_local(request)
-    model_used = CLOUD_MODEL if use_cloud else LOCAL_MODEL
+async def chat(request: ChatRequest, http_request: Request):
+    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    session_id, session_created = _get_or_create_session(cookie_session_id)
+
+    with _session_store_lock:
+        session_messages = list(_session_store[session_id]["messages"])
+
+    selected_history, history_tokens, truncated = _select_history_for_budget(
+        messages=session_messages,
+        system=request.system,
+        current_user_message=request.message,
+    )
+
+    decision = classify_intent(request.message)
+
+    log.info(
+        "chat.route | session_id=%s intent=%s confidence=%.3f route=%s model=%s "
+        "total_messages=%d included_messages=%d estimated_history_tokens=%d truncated=%s",
+        session_id,
+        decision.intent,
+        decision.confidence,
+        "cloud" if decision.use_cloud else "local",
+        decision.model,
+        len(session_messages),
+        len(selected_history),
+        history_tokens,
+        truncated,
+    )
+
+    # Build history for each backend.
+    # Local: flatten into a single prompt string (Ollama /api/generate).
+    # Cloud: pass as a proper messages array (Anthropic messages API).
+    local_prompt = _build_local_prompt(selected_history, request.message)
+    local_request = ChatRequest(message=local_prompt, system=request.system)
+
+    cloud_messages = [
+        {"role": m["role"], "content": m["content"]} for m in selected_history
+    ]
+    cloud_messages.append({"role": "user", "content": request.message})
 
     async def generate():
-        yield f"data: {json.dumps({'model': model_used})}\n\n"
-        async for chunk in streamer:
-            yield f"data: {json.dumps({'text': chunk})}\n\n"
+        nonlocal decision
+        assistant_accumulated = ""
+        start_time = time.monotonic()
+        first_token_time: float | None = None
+        active_model = decision.model
+        fallback_used = False
+
+        yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence})}\n\n"
+
+        primary = (
+            stream_cloud(request.system, cloud_messages)
+            if decision.use_cloud
+            else stream_local(local_request)
+        )
+
+        try:
+            async for chunk in primary:
+                if first_token_time is None:
+                    first_token_time = time.monotonic()
+                assistant_accumulated += chunk
+                yield f"data: {json.dumps({'text': chunk})}\n\n"
+
+        except Exception as exc:
+            if decision.use_cloud:
+                # Graceful degradation: fall back to local with a visible notice.
+                log.warning("chat.cloud_fallback | session_id=%s error=%s", session_id, exc)
+                fallback_used = True
+                active_model = LOCAL_MODEL
+                yield f"data: {json.dumps({'notice': 'Cloud unavailable — responding with local model'})}\n\n"
+                yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence, 'fallback': True})}\n\n"
+                async for chunk in stream_local(local_request):
+                    if first_token_time is None:
+                        first_token_time = time.monotonic()
+                    assistant_accumulated += chunk
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+            else:
+                log.error("chat.local_error | session_id=%s error=%s", session_id, exc)
+                yield f"data: {json.dumps({'text': f'⚠ Error: {exc}'})}\n\n"
+
+        completion_time = time.monotonic()
+        first_token_ms = (first_token_time - start_time) * 1000 if first_token_time else -1
+        completion_ms = (completion_time - start_time) * 1000
+
+        log.info(
+            "chat.telemetry | session_id=%s intent=%s confidence=%.3f route=%s "
+            "model=%s fallback=%s first_token_ms=%.0f completion_ms=%.0f response_tokens_approx=%d",
+            session_id,
+            decision.intent,
+            decision.confidence,
+            "cloud" if decision.use_cloud else "local",
+            active_model,
+            fallback_used,
+            first_token_ms,
+            completion_ms,
+            _estimate_tokens(assistant_accumulated),
+        )
+
+        _append_session_message(session_id, "user", request.message)
+        _append_session_message(session_id, "assistant", assistant_accumulated.strip())
+
         yield "data: [DONE]\n\n"
 
-    return StreamingResponse(generate(), media_type="text/event-stream")
+    response = StreamingResponse(generate(), media_type="text/event-stream")
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_IDLE_TTL_SECONDS,
+    )
+    if session_created:
+        log.info("chat.session.cookie_set | session_id=%s", session_id)
+    return response
+
+
+@app.delete("/chat/session")
+async def reset_chat_session(http_request: Request):
+    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    session_id, created = _get_or_create_session(cookie_session_id)
+    with _session_store_lock:
+        session = _session_store.get(session_id, {"messages": []})
+        cleared_messages = len(session["messages"])
+        session["messages"] = []
+        session["updated_at"] = time.time()
+        _session_store[session_id] = session
+
+    log.info(
+        "chat.session.reset | session_id=%s cleared_messages=%d was_new=%s",
+        session_id,
+        cleared_messages,
+        created,
+    )
+    response = JSONResponse({"ok": True, "session_id": session_id, "cleared_messages": cleared_messages})
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=SESSION_IDLE_TTL_SECONDS,
+    )
+    return response
 
 @app.get("/health")
 async def health():
