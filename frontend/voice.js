@@ -221,7 +221,7 @@
 
   async function startVoice() {
     if (location.protocol === 'file:') {
-      alert('Open this page over HTTP (e.g. http://<host>:8000) - voice features require a server.');
+      alert('Open this page via HTTPS (e.g. https://<host>) — voice features require a secure connection.');
       return;
     }
 

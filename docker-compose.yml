@@ -21,6 +21,7 @@ services:
               count: all
               capabilities: [gpu]
 
+  # open-webui is out of Phase 0b scope — it remains on :3000 (plain HTTP).
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: open-webui
@@ -38,8 +39,10 @@ services:
     build: ./backend
     container_name: assistant-backend
     restart: unless-stopped
-    ports:
-      - "8000:8000"
+    # Port 8000 is NOT published to the host — all browser traffic enters via
+    # Caddy (HTTPS). The backend is reachable inside the Docker network only.
+    expose:
+      - "8000"
     env_file:
       - .env
     depends_on:
@@ -53,6 +56,28 @@ services:
       timeout: 10s
       retries: 3
       start_period: 30s
+
+  # Caddy terminates TLS on the LAN edge and reverse-proxies to the backend.
+  # Certificates are generated with mkcert and mounted read-only.
+  # See README — HTTPS Setup section for cert generation steps.
+  caddy:
+    image: caddy:2-alpine
+    container_name: assistant-caddy
+    restart: unless-stopped
+    ports:
+      - "443:443"
+      - "80:80"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./caddy/certs:/certs:ro
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--no-check-certificate", "https://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
 
 volumes:
   ollama:

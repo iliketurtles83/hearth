@@ -1,0 +1,23 @@
+{
+	# Disable Caddy's automatic HTTPS/ACME and admin API.
+	# We supply our own mkcert certificate via volume mount.
+	auto_https off
+	admin off
+}
+
+# HTTPS — all traffic to the assistant is proxied to the FastAPI backend.
+:443 {
+	tls /certs/cert.pem /certs/key.pem
+
+	reverse_proxy backend:8000 {
+		# Pass standard proxy headers so the backend can log the real client IP.
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto https
+	}
+}
+
+# HTTP — redirect everything to HTTPS.
+:80 {
+	redir https://{host}{uri} permanent
+}

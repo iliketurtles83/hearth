@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response
 from pydantic import BaseModel
 import httpx
 import anthropic
@@ -34,6 +35,21 @@ CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
 CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 
+# ── HTTPS / CORS / cookie policy (Phase 0b) ───────────────────────────────────
+# CORS_ORIGINS: comma-separated list of allowed origins, e.g.
+#   CORS_ORIGINS=https://192.168.1.42,https://assistant.lan
+# Default '*' preserves the Phase 1 permissive behaviour for plain-HTTP dev.
+# Set to the exact Caddy origin(s) once HTTPS is in use.
+_cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
+_CORS_ORIGINS: list[str] = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
+# allow_credentials requires a non-wildcard origin per the CORS spec.
+_CORS_CREDENTIALS: bool = _CORS_ORIGINS != ["*"]
+
+# SESSION_COOKIE_SECURE: set to 'true' when the browser-facing edge is HTTPS
+# (i.e. when Caddy is in use). Tells the browser to send the cookie only over
+# HTTPS connections. The backend itself may still run plain HTTP internally.
+SESSION_COOKIE_SECURE: bool = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+
 _session_store_lock = Lock()
 _session_store: dict[str, dict] = {}
 
@@ -49,7 +65,10 @@ def _validate_startup() -> None:
     if not os.getenv("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
 
-    log.info("Startup OK | local_model=%s | ollama=%s", LOCAL_MODEL, OLLAMA_URL)
+    log.info(
+        "Startup OK | local_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",
+        LOCAL_MODEL, OLLAMA_URL, _CORS_ORIGINS, SESSION_COOKIE_SECURE,
+    )
 
 _validate_startup()
 
@@ -69,7 +88,8 @@ app = FastAPI()
 app.add_middleware(COOPCOEPMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_CORS_ORIGINS,
+    allow_credentials=_CORS_CREDENTIALS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -115,6 +135,18 @@ class SessionSelectRequest(BaseModel):
 
 def _error_response(message: str, code: str, retryable: bool, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"error": message, "code": code, "retryable": retryable}, status_code=status_code)
+
+
+def _set_session_cookie(response: Response, session_id: str) -> None:
+    """Apply consistent session-cookie attributes across all endpoints."""
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite="lax",
+        secure=SESSION_COOKIE_SECURE,
+        max_age=SESSION_IDLE_TTL_SECONDS,
+    )
 
 
 def _estimate_tokens(text: str) -> int:
@@ -439,14 +471,7 @@ async def chat(request: ChatRequest, http_request: Request):
         yield "data: [DONE]\n\n"
 
     response = StreamingResponse(generate(), media_type="text/event-stream")
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=SESSION_IDLE_TTL_SECONDS,
-    )
+    _set_session_cookie(response, session_id)
     if session_created:
         log.info("chat.session.cookie_set | session_id=%s", session_id)
     return response
@@ -470,14 +495,7 @@ async def reset_chat_session(http_request: Request):
         created,
     )
     response = JSONResponse({"ok": True, "session_id": session_id, "cleared_messages": cleared_messages})
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=SESSION_IDLE_TTL_SECONDS,
-    )
+    _set_session_cookie(response, session_id)
     return response
 
 
@@ -515,14 +533,7 @@ async def delete_chat_session(session_id: str, http_request: Request):
     response = JSONResponse(payload)
 
     if active_session_id:
-        response.set_cookie(
-            key=SESSION_COOKIE_NAME,
-            value=active_session_id,
-            httponly=True,
-            samesite="lax",
-            secure=False,
-            max_age=SESSION_IDLE_TTL_SECONDS,
-        )
+        _set_session_cookie(response, active_session_id)
     return response
 
 
@@ -530,14 +541,7 @@ async def delete_chat_session(session_id: str, http_request: Request):
 async def create_chat_session():
     session_id, _ = _get_or_create_session(None)
     response = JSONResponse({"ok": True, "session_id": session_id})
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=session_id,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=SESSION_IDLE_TTL_SECONDS,
-    )
+    _set_session_cookie(response, session_id)
     return response
 
 
@@ -547,14 +551,7 @@ async def select_chat_session(payload: SessionSelectRequest):
         if payload.session_id not in _session_store:
             return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
     response = JSONResponse({"ok": True, "session_id": payload.session_id})
-    response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=payload.session_id,
-        httponly=True,
-        samesite="lax",
-        secure=False,
-        max_age=SESSION_IDLE_TTL_SECONDS,
-    )
+    _set_session_cookie(response, payload.session_id)
     return response
 
 

@@ -4,4 +4,7 @@ __pycache__/
 .venv/
 *.onnx
 *.bin
+*.db
 backend/chroma/
+# mkcert-generated certificates — never commit private keys
+caddy/certs/
