@@ -93,6 +93,26 @@ class TestExtractLocation:
         result = w.extract_location("weather in New York")
         assert result == "New York"
 
+    def test_like_in_preposition(self):
+        result = w.extract_location("what is the weather like in Tallinn, Estonia today?")
+        assert result == "Tallinn, Estonia"
+
+    def test_trailing_right_now_stripped(self):
+        result = w.extract_location("weather in Zurich, Switzerland right now")
+        assert result == "Zurich, Switzerland"
+
+    def test_trailing_today_stripped(self):
+        result = w.extract_location("weather in Berlin, Germany today")
+        assert result == "Berlin, Germany"
+
+    def test_trailing_tonight_stripped(self):
+        result = w.extract_location("weather in Tokyo tonight?")
+        assert result == "Tokyo"
+
+    def test_trailing_currently_stripped(self):
+        result = w.extract_location("weather in London currently")
+        assert result == "London"
+
 
 # ── wmo_condition tests ───────────────────────────────────────────────────────
 

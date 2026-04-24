@@ -20,12 +20,11 @@ Inner-monologue planner (Phase 4b):
   On any failure (timeout / network / bad JSON), falls back to heuristic classifier.
 """
 
-import asyncio
 import json
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import httpx
 
@@ -64,6 +63,7 @@ _VALID_INTENTS = frozenset(
     ["quick-local", "reasoning-heavy", "code", "external-data-needed", "memory-needed"]
 )
 _VALID_ROUTES = frozenset(["local", "cloud", "tool"])
+_VALID_TOOL_NAMES = frozenset(["weather", "music"])
 
 
 @dataclass
@@ -122,6 +122,37 @@ _EXTERNAL_DATA_PATTERNS = [
     r"\bwhat\s+(time|date)\s+is\s+it\b",
     r"\b(live|real.?time)\b.{0,20}\b(data|score|result)\b",
 ]
+
+_WEATHER_PATTERNS = [
+    r"\b(weather|forecast|temperature|rain|snow|sunny|humidity)\b",
+]
+
+
+def _looks_like_weather_request(text: str) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in _WEATHER_PATTERNS)
+
+
+def _normalize_external_tool(intent: str, prompt: str, tool_name: str | None) -> str | None:
+    """Return a safe tool name for external-data intents, else None.
+
+    - Only external-data intents may dispatch to tools.
+    - Unknown planner tool names are ignored.
+    - Weather requests infer the weather tool when planner omits a tool.
+    """
+    if intent != "external-data-needed":
+        return None
+
+    normalized_tool = (tool_name or "").strip().lower() or None
+    if normalized_tool and normalized_tool not in _VALID_TOOL_NAMES:
+        normalized_tool = None
+
+    if normalized_tool:
+        return normalized_tool
+
+    if _looks_like_weather_request(prompt):
+        return "weather"
+
+    return None
 
 _MEMORY_PATTERNS = [
     r"\b(remember|recall)\b.{0,30}\b(i|my|me)\b",
@@ -229,11 +260,14 @@ def classify_intent(prompt: str) -> RouteDecision:
     use_cloud = (intent == "reasoning-heavy" and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
     model = CLOUD_MODEL if use_cloud else _pick_local_model(intent)
 
+    tool = _normalize_external_tool(intent, prompt, None)
+
     return RouteDecision(
         intent=intent,
         confidence=round(confidence, 3),
         use_cloud=use_cloud,
         model=model,
+        tool=tool,
         planner_status="heuristic",
     )
 
@@ -330,7 +364,7 @@ async def _call_planner(prompt: str) -> dict:
     return _parse_planner_output(raw)
 
 
-def _decision_from_planner(parsed: dict) -> RouteDecision:
+def _decision_from_planner(parsed: dict, prompt: str = "") -> RouteDecision:
     """Convert parsed planner dict → RouteDecision."""
     intent = parsed["intent"]
     route = parsed["route"]
@@ -340,12 +374,14 @@ def _decision_from_planner(parsed: dict) -> RouteDecision:
                  and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
     model = CLOUD_MODEL if use_cloud else _pick_local_model(intent)
 
+    tool = _normalize_external_tool(intent, prompt, parsed["tool"])
+
     return RouteDecision(
         intent=intent,
         confidence=confidence,
         use_cloud=use_cloud,
         model=model,
-        tool=parsed["tool"],
+        tool=tool,
         needs_memory=parsed["needs_memory"],
         planner_status="planner",
         reasoning_summary=parsed["reasoning"],
@@ -363,7 +399,7 @@ async def route(prompt: str) -> RouteDecision:
     if PLANNER_ENABLED:
         try:
             parsed = await _call_planner(prompt)
-            decision = _decision_from_planner(parsed)
+            decision = _decision_from_planner(parsed, prompt)
             log.debug(
                 "router.planner | intent=%s route=%s tool=%s needs_memory=%s "
                 "confidence=%.3f reasoning=%s",

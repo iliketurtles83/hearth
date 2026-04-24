@@ -574,7 +574,8 @@ async def chat(request: ChatRequest, http_request: Request):
                 log.warning("chat.cloud_fallback | session_id=%s error=%s", session_id, exc)
                 fallback_used = True
                 active_model = CHAT_MODEL
-                yield f"data: {json.dumps({'notice': 'Cloud unavailable \u2014 responding with local model'})}\n\n"
+                notice_msg = 'Cloud unavailable — responding with local model'
+                yield f"data: {json.dumps({'notice': notice_msg})}\n\n"
                 yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence, 'fallback': True})}\n\n"
                 async for chunk in stream_local(local_request, model_name=CHAT_MODEL):
                     if first_token_time is None:
@@ -746,7 +747,12 @@ async def get_chat_session_messages(http_request: Request):
     session_id, _ = _get_or_create_session(cookie_session_id)
     with _session_store_lock:
         messages = list(_session_store.get(session_id, {}).get("messages", []))
-    return JSONResponse({"session_id": session_id, "messages": messages})
+    # Set the session cookie so the browser anchors to this session after every
+    # page load. Without this, POST /chat could pick up a stale/missing cookie
+    # and silently create a new session, losing context on refresh.
+    response = JSONResponse({"session_id": session_id, "messages": messages})
+    _set_session_cookie(response, session_id)
+    return response
 
 
 @app.get("/memory")

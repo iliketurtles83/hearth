@@ -78,8 +78,17 @@ _WMO_CODES: dict[int, str] = {
 }
 
 # Regex for inline location override.
+# Allows up to 3 optional words between "weather" and the preposition, so
+# "what is the weather like in Tallinn" works ("like" is the intervening word).
 _LOCATION_RE = re.compile(
-    r"\bweather\s+(?:in|for|at|near|around)\s+([A-Za-z][A-Za-z\s,.\-]{1,60}?)(?:\?|$|\.)",
+    r"\bweather\b(?:\s+\w+){0,3}?\s+(?:in|for|at|near|around)\s+"
+    r"([A-Za-z][A-Za-z\s,.\-]{1,60}?)(?:\?|$|\.)",
+    re.IGNORECASE,
+)
+
+# Trailing time/context words that are not part of a city name.
+_LOCATION_TRAILING_RE = re.compile(
+    r"\s+(?:right\s+now|at\s+the\s+moment|this\s+\w+|today|tonight|tomorrow|now|currently)\s*$",
     re.IGNORECASE,
 )
 
@@ -93,7 +102,9 @@ def extract_location(prompt: str) -> str | None:
     """Extract an inline location from a user prompt, or return None."""
     match = _LOCATION_RE.search(prompt.strip())
     if match:
-        return match.group(1).strip().rstrip(",. ")
+        location = match.group(1).strip().rstrip(",. ")
+        location = _LOCATION_TRAILING_RE.sub("", location).strip().rstrip(",. ")
+        return location if location else None
     return None
 
 

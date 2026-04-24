@@ -54,6 +54,7 @@ class TestHeuristicClassifier:
         d = r.classify_intent("What is the weather like today?")
         assert d.intent == "external-data-needed"
         assert not d.use_cloud
+        assert d.tool == "weather"
 
     def test_memory_intent(self):
         d = r.classify_intent("What is my name? You mentioned it earlier.")
@@ -180,6 +181,20 @@ class TestDecisionFromPlanner:
 
     def test_tool_forwarded(self):
         d = r._decision_from_planner(self._parsed(tool="weather", route="tool", intent="external-data-needed"))
+        assert d.tool == "weather"
+
+    def test_unknown_tool_is_dropped(self):
+        d = r._decision_from_planner(
+            self._parsed(tool="python", route="tool", intent="external-data-needed"),
+            "help me code a script",
+        )
+        assert d.tool is None
+
+    def test_weather_tool_inferred_when_missing(self):
+        d = r._decision_from_planner(
+            self._parsed(tool=None, route="tool", intent="external-data-needed"),
+            "What is the weather in Tallinn today?",
+        )
         assert d.tool == "weather"
 
 

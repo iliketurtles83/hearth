@@ -415,6 +415,7 @@
             const notice = document.createElement('span');
             notice.className = 'model-badge local';
             notice.style.opacity = '0.65';
+            notice.style.marginRight = '0.4rem';
             notice.textContent = `⚠ ${parsed.notice}`;
             wrapper.appendChild(notice);
           }
