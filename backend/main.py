@@ -17,7 +17,7 @@ from threading import Lock
 from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
-from router import classify_intent, LOCAL_MODEL, CLOUD_MODEL
+from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
 from memory import memory_store
 
 load_dotenv()
@@ -34,6 +34,9 @@ SESSION_MAX_ITEMS = int(os.getenv("CHAT_SESSION_MAX_ITEMS", "200"))
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
 CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+CHAT_SUMMARY_TRIGGER_MESSAGES = int(os.getenv("CHAT_SUMMARY_TRIGGER_MESSAGES", "18"))
+CHAT_SUMMARY_KEEP_RECENT_MESSAGES = int(os.getenv("CHAT_SUMMARY_KEEP_RECENT_MESSAGES", "8"))
+CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
 
 # ── HTTPS / CORS / cookie policy (Phase 0b) ───────────────────────────────────
 # CORS_ORIGINS: comma-separated list of allowed origins, e.g.
@@ -66,8 +69,8 @@ def _validate_startup() -> None:
         log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
 
     log.info(
-        "Startup OK | local_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",
-        LOCAL_MODEL, OLLAMA_URL, _CORS_ORIGINS, SESSION_COOKIE_SECURE,
+        "Startup OK | chat_model=%s | coder_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",
+        CHAT_MODEL, CODER_MODEL, OLLAMA_URL, _CORS_ORIGINS, SESSION_COOKIE_SECURE,
     )
 
 _validate_startup()
@@ -183,7 +186,13 @@ def _get_or_create_session(session_id: str | None) -> tuple[str, bool]:
         effective_id = session_id if session_id and session_id in _session_store else str(uuid4())
         created = effective_id not in _session_store
         if created:
-            _session_store[effective_id] = {"messages": [], "created_at": now, "updated_at": now}
+            _session_store[effective_id] = {
+                "messages": [],
+                "summary": "",
+                "summary_message_count": 0,
+                "created_at": now,
+                "updated_at": now,
+            }
             log.info("chat.session.created | session_id=%s", effective_id)
         else:
             _session_store[effective_id]["updated_at"] = now
@@ -191,8 +200,21 @@ def _get_or_create_session(session_id: str | None) -> tuple[str, bool]:
         return effective_id, created
 
 
-def _select_history_for_budget(messages: list[dict], system: str, current_user_message: str) -> tuple[list[dict], int, bool]:
-    history_budget = max(0, CHAT_TOKEN_BUDGET - _estimate_tokens(system) - _estimate_tokens(current_user_message) - 32)
+def _select_history_for_budget(
+    messages: list[dict],
+    system: str,
+    current_user_message: str,
+    summary_text: str,
+) -> tuple[list[dict], int, bool, int]:
+    summary_tokens = _estimate_tokens(summary_text) if summary_text else 0
+    history_budget = max(
+        0,
+        CHAT_TOKEN_BUDGET
+        - _estimate_tokens(system)
+        - _estimate_tokens(current_user_message)
+        - summary_tokens
+        - 32,
+    )
     selected_reversed: list[dict] = []
     used_tokens = 0
     truncated = False
@@ -210,7 +232,81 @@ def _select_history_for_budget(messages: list[dict], system: str, current_user_m
     selected = list(reversed(selected_reversed))
     if len(messages) > len(selected):
         truncated = True
-    return selected, used_tokens, truncated
+    return selected, used_tokens, truncated, summary_tokens
+
+
+def _normalize_summary_line(text: str, max_len: int = 200) -> str:
+    compact = re.sub(r"\s+", " ", text or "").strip()
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 1].rstrip() + "…"
+
+
+def _summarize_messages_chunk(messages: list[dict]) -> str:
+    lines: list[str] = []
+    for message in messages:
+        role = message.get("role")
+        content = _normalize_summary_line(str(message.get("content", "")))
+        if not content:
+            continue
+        if role == "user":
+            lines.append(f"- User: {content}")
+        elif role == "assistant":
+            lines.append(f"- Assistant: {content}")
+        if len(lines) >= 14:
+            break
+    return "\n".join(lines)
+
+
+def _truncate_summary(summary: str) -> str:
+    if len(summary) <= CHAT_SUMMARY_MAX_CHARS:
+        return summary
+    tail = summary[-CHAT_SUMMARY_MAX_CHARS :]
+    first_newline = tail.find("\n")
+    if first_newline > 0:
+        return tail[first_newline + 1 :]
+    return tail
+
+
+def _update_session_summary_if_needed(session_id: str) -> tuple[bool, int, int]:
+    now = time.time()
+    with _session_store_lock:
+        session = _session_store.get(session_id)
+        if not session:
+            return False, 0, 0
+
+        messages = list(session.get("messages", []))
+        keep_recent = max(2, CHAT_SUMMARY_KEEP_RECENT_MESSAGES)
+        trigger = max(keep_recent + 2, CHAT_SUMMARY_TRIGGER_MESSAGES)
+        if len(messages) <= trigger:
+            return False, int(session.get("summary_message_count", 0) or 0), len(session.get("summary", ""))
+
+        older = messages[:-keep_recent]
+        if not older:
+            return False, int(session.get("summary_message_count", 0) or 0), len(session.get("summary", ""))
+
+        already_summarized = int(session.get("summary_message_count", 0) or 0)
+        if already_summarized >= len(older):
+            return False, already_summarized, len(session.get("summary", ""))
+
+        new_slice = older[already_summarized:]
+        chunk_summary = _summarize_messages_chunk(new_slice)
+        if not chunk_summary:
+            return False, already_summarized, len(session.get("summary", ""))
+
+        existing_summary = str(session.get("summary", "") or "")
+        combined = (
+            f"{existing_summary}\n{chunk_summary}".strip()
+            if existing_summary
+            else chunk_summary
+        )
+        combined = _truncate_summary(combined)
+
+        session["summary"] = combined
+        session["summary_message_count"] = len(older)
+        session["updated_at"] = now
+        _session_store[session_id] = session
+        return True, len(older), len(combined)
 
 
 def _build_local_prompt(history: list[dict], current_user_message: str) -> str:
@@ -226,6 +322,19 @@ def _build_local_prompt(history: list[dict], current_user_message: str) -> str:
     lines.append(f"User: {current_user_message}")
     lines.append("Assistant:")
     return "\n".join(lines)
+
+
+def _augment_system_with_session_summary(system: str, summary_text: str) -> str:
+    if not summary_text:
+        return system
+    return "\n".join(
+        [
+            system,
+            "",
+            "Session summary of older messages (use as context for continuity):",
+            summary_text,
+        ]
+    )
 
 
 def _augment_system_with_memories(system: str, memory_hits: list[dict]) -> str:
@@ -290,10 +399,10 @@ def _append_session_message(session_id: str, role: str, content: str) -> None:
         session["messages"].append({"role": role, "content": content, "ts": now})
         session["updated_at"] = now
 
-async def stream_local(request: ChatRequest):
+async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/generate", json={
-            "model": LOCAL_MODEL,
+            "model": model_name,
             "prompt": request.message,
             "system": request.system,
             "stream": True,
@@ -321,35 +430,52 @@ async def chat(request: ChatRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, session_created = _get_or_create_session(cookie_session_id)
 
-    with _session_store_lock:
-        session_messages = list(_session_store[session_id]["messages"])
+    summary_updated, summary_message_count, summary_char_count = _update_session_summary_if_needed(session_id)
 
-    selected_history, history_tokens, truncated = _select_history_for_budget(
+    with _session_store_lock:
+        session = _session_store[session_id]
+        session_messages = list(session["messages"])
+        session_summary = str(session.get("summary", "") or "")
+
+    selected_history, history_tokens, truncated, summary_tokens = _select_history_for_budget(
         messages=session_messages,
         system=request.system,
         current_user_message=request.message,
+        summary_text=session_summary,
     )
 
     memory_hits_all = memory_store.retrieve(request.message)
 
-    decision = classify_intent(request.message)
+    decision = await router_route(request.message)
     inject_memory = _should_inject_memory(decision.intent, memory_hits_all, request.message)
     memory_hits = memory_hits_all if inject_memory else []
-    augmented_system = _augment_system_with_memories(request.system, memory_hits)
+    system_with_summary = _augment_system_with_session_summary(request.system, session_summary)
+    augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
 
     log.info(
         "chat.route | session_id=%s intent=%s confidence=%.3f route=%s model=%s "
-        "total_messages=%d included_messages=%d estimated_history_tokens=%d truncated=%s",
+        "planner_status=%s needs_memory=%s tool=%s "
+        "total_messages=%d included_messages=%d estimated_history_tokens=%d summary_tokens=%d "
+        "summary_updated=%s summary_message_count=%d summary_chars=%d truncated=%s",
         session_id,
         decision.intent,
         decision.confidence,
         "cloud" if decision.use_cloud else "local",
         decision.model,
+        decision.planner_status,
+        decision.needs_memory,
+        decision.tool,
         len(session_messages),
         len(selected_history),
         history_tokens,
+        summary_tokens,
+        summary_updated,
+        summary_message_count,
+        summary_char_count,
         truncated,
     )
+    if decision.reasoning_summary:
+        log.debug("chat.planner_reasoning | session_id=%s reasoning=%s", session_id, decision.reasoning_summary)
 
     # Build history for each backend.
     # Local: flatten into a single prompt string (Ollama /api/generate).
@@ -375,7 +501,7 @@ async def chat(request: ChatRequest, http_request: Request):
         primary = (
             stream_cloud(augmented_system, cloud_messages)
             if decision.use_cloud
-            else stream_local(local_request)
+            else stream_local(local_request, model_name=decision.model)
         )
 
         try:
@@ -390,10 +516,10 @@ async def chat(request: ChatRequest, http_request: Request):
                 # Graceful degradation: fall back to local with a visible notice.
                 log.warning("chat.cloud_fallback | session_id=%s error=%s", session_id, exc)
                 fallback_used = True
-                active_model = LOCAL_MODEL
-                yield f"data: {json.dumps({'notice': 'Cloud unavailable — responding with local model'})}\n\n"
+                active_model = CHAT_MODEL
+                yield f"data: {json.dumps({'notice': 'Cloud unavailable \u2014 responding with local model'})}\n\n"
                 yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence, 'fallback': True})}\n\n"
-                async for chunk in stream_local(local_request):
+                async for chunk in stream_local(local_request, model_name=CHAT_MODEL):
                     if first_token_time is None:
                         first_token_time = time.monotonic()
                     assistant_accumulated += chunk
@@ -482,9 +608,11 @@ async def reset_chat_session(http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, created = _get_or_create_session(cookie_session_id)
     with _session_store_lock:
-        session = _session_store.get(session_id, {"messages": []})
+        session = _session_store.get(session_id, {"messages": [], "summary": "", "summary_message_count": 0})
         cleared_messages = len(session["messages"])
         session["messages"] = []
+        session["summary"] = ""
+        session["summary_message_count"] = 0
         session["updated_at"] = time.time()
         _session_store[session_id] = session
 

@@ -57,7 +57,7 @@ from the phase before it.
 ---
 
 ### Phase 0b — HTTPS on LAN (Caddy)
-**Status: next priority**
+**Status: complete**
 **Estimate: 0.5 days**
 **Depends on: Phase 1**
 
@@ -66,23 +66,23 @@ can access microphone and other secure-context browser APIs. This also unblocks
 several tightening browser API restrictions (AudioWorklet, WebAuthn, etc.) and
 should be done before any further mobile work.
 
-Tasks:
-- Add a `caddy` service to `docker-compose.yml` that reverse-proxies to FastAPI on
+Tasks — all complete:
+- ✅ Add a `caddy` service to `docker-compose.yml` that reverse-proxies to FastAPI on
   port 8000 and terminates TLS.
-- Use a self-signed certificate for LAN use, or mkcert for a locally-trusted CA.
+- ✅ Use a self-signed certificate for LAN use, or mkcert for a locally-trusted CA.
   Document the one-time mkcert install step clearly in the README.
-- All internal services continue to communicate over plain HTTP inside Docker.
+- ✅ All internal services continue to communicate over plain HTTP inside Docker.
   Only the edge (Caddy → LAN client) is HTTPS.
-- Update all documentation, README, and example URLs from `http://` to `https://`.
-- CORS policy: restrict to the Caddy origin once HTTPS is stable; remove the
+- ✅ Update all documentation, README, and example URLs from `http://` to `https://`.
+- ✅ CORS policy: restrict to the Caddy origin once HTTPS is stable; remove the
   permissive dev-time CORS rule.
 
 Acceptance:
-- `https://<LAN-IP>` loads the UI from a phone or tablet without certificate errors
+- ✅ `https://<LAN-IP>` loads the UI from a phone or tablet without certificate errors
   (after mkcert CA install on client devices).
-- `navigator.mediaDevices` is defined and microphone permission works on Android/iOS.
-- Wake-word WebSocket connects over `wss://` without issues.
-- Phase 2 Android voice item is unblocked and can be closed.
+- ✅ `navigator.mediaDevices` is defined and microphone permission works on Android/iOS.
+- ✅ Wake-word WebSocket connects over `wss://` without issues.
+- ✅ Phase 2 Android voice item is unblocked and closed.
 
 ---
 
@@ -93,23 +93,23 @@ Acceptance:
 Goal: The assistant is reachable from every device on the local network and
 remains stable under normal use. Every subsequent feature depends on this.
 
-Tasks:
-- Serve frontend from FastAPI static mount — no separate origin.
-- Replace every `http://localhost:*` in runtime JS with relative paths.
-- Bind all services to `0.0.0.0` and verify Docker port mappings.
-- Add `/health` endpoint and container health checks in `docker-compose.yml`.
-- Add startup validation that emits clear logs on misconfiguration.
-- Keep CORS permissive during development; restrict to LAN hosts when stable.
+Tasks — all complete:
+- ✅ Serve frontend from FastAPI static mount — no separate origin.
+- ✅ Replace every `http://localhost:*` in runtime JS with relative paths.
+- ✅ Bind all services to `0.0.0.0` and verify Docker port mappings.
+- ✅ Add `/health` endpoint and container health checks in `docker-compose.yml`.
+- ✅ Add startup validation that emits clear logs on misconfiguration.
+- ✅ Keep CORS permissive during development; restrict to LAN hosts when stable.
 
 Acceptance:
-- `http://<LAN-IP>:8000` loads the UI and chat works from a phone or tablet.
-- Voice WebSocket connects and stays open without looped reconnect.
-- A container restart surfaces import/runtime errors in logs rather than silently failing.
+- ✅ `https://<LAN-IP>` loads the UI and chat works from a phone or tablet.
+- ✅ Voice WebSocket connects and stays open without looped reconnect.
+- ✅ A container restart surfaces import/runtime errors in logs rather than silently failing.
 
 ---
 
 ### Phase 2 — Harden wake-word voice input pipeline
-**Status: complete (desktop/Linux/LAN browsers)**
+**Status: complete (desktop + Android/Linux/LAN browsers)**
 **Estimate: 1–2 days**
 **Depends on: Phase 1**
 
@@ -154,7 +154,7 @@ Tasks — all complete:
 - ✅ Secure-context check with user-friendly message on non-HTTPS clients.
 - ✅ Reconnect backoff on frontend WebSocket.
 - ✅ Utterance capture via RMS threshold on existing worklet frames (no vad-web).
-- ⏳ Android voice — unblocked after Phase 0b (Caddy HTTPS).
+- ✅ Android voice — validated after Phase 0b (Caddy HTTPS).
 
 Acceptance:
 - ✅ Clicking mic enters stable sleeping state.
@@ -162,24 +162,24 @@ Acceptance:
   to sleeping.
 - ✅ Transcribed text is sent to `/chat` automatically.
 - ✅ No retrigger occurs while the user is speaking after the wake event.
-- ⏳ Android voice — pending Phase 0b.
+- ✅ Android voice works on HTTPS clients.
 
 ---
 
 ### Phase 3 — Chat context management
-**Status: in progress**
+**Status: complete**
 **Estimate: 1–2 days**
 **Depends on: Phase 1**
 
 Goal: Keep each active chat session coherent by passing recent conversational
 context with every new user message, without introducing durable memory yet.
 
-Tasks:
+Tasks — all complete:
 - ✅ Maintain a message history buffer for the current chat session.
 - ✅ Pass the last N messages (or messages up to a token budget) to Ollama on
   each `/chat` request.
 - ✅ Add bounded-context controls: max turns, token cap, and truncation strategy.
-- ⏳ Summarize older in-session messages once history grows beyond thresholds,
+- ✅ Summarize older in-session messages once history grows beyond thresholds,
   and include that summary in context. This is the seed of the episodic memory
   tier introduced formally in Phase 9.5.
 - ✅ Store session context in memory or a lightweight session store (no SQLite
@@ -196,7 +196,7 @@ Acceptance:
 ---
 
 ### Phase 4 — Inner-monologue routing (replaces keyword intent classifier)
-**Status: in progress**
+**Status: complete**
 **Estimate: 1–2 days**
 **Depends on: Phases 1, 3**
 
@@ -240,9 +240,9 @@ Tasks:
   (prompt-based using the local model itself).
 - ✅ Add a confidence threshold: if local model confidence is below threshold,
   escalate to cloud.
-- ⏳ Upgrade classifier to a full inner-monologue reasoning pass that outputs a
+- ✅ Upgrade classifier to a full inner-monologue reasoning pass that outputs a
   structured routing JSON rather than a single intent label.
-- ⏳ Route `code` intent to the local coder model (see Phase 10) rather than the
+- ✅ Route `code` intent to the local coder model (see Phase 10) rather than the
   general chat model or cloud. Code tasks almost never need cloud escalation.
 - ✅ Emit structured telemetry per request: route chosen, model used, first-token
   latency, completion latency, error/fallback count.
@@ -253,8 +253,8 @@ Tasks:
 Acceptance:
 - ✅ Conversational and short prompts stay local.
 - ✅ Complex planning and reasoning prompts route to cloud.
-- ⏳ Inner monologue reasoning pass replaces single-step classification.
-- ⏳ Code prompts route to the local coder model.
+- ✅ Inner monologue reasoning pass replaces single-step classification.
+- ✅ Code prompts route to the local coder model.
 - ✅ Cloud unavailability degrades gracefully with a local response.
 
 ---
@@ -774,12 +774,12 @@ Acceptance:
 
 | # | Issue | Status | Estimate | Depends on |
 |---|-------|--------|----------|------------|
-| 0b | HTTPS on LAN: Caddy reverse proxy, mkcert, wss:// | 🔲 **next** | 0.5 days | 1 |
+| 0b | HTTPS on LAN: Caddy reverse proxy, mkcert, wss:// | ✅ done | 0.5 days | 1 |
 | 1 | LAN-safe single-origin serving and health checks | ✅ done | 1–2 days | — |
 | 2 | Replace all `localhost` frontend paths with relative paths | ✅ done | 2–4 hours | 1 |
 | 3 | Harden wake-word pipeline (Phase 2) | ✅ done | 1–2 days | 1, 2 |
 | 4 | Chat context management: bounded session buffer + token-aware context | 🔄 in progress | 1–2 days | 1 |
-| 4b | Upgrade router to inner-monologue reasoning pass (structured JSON output) | 🔲 | 1–2 days | 4 |
+| 4b | Upgrade router to inner-monologue reasoning pass (structured JSON output) | ✅ done | 1–2 days | 4 |
 | 5 | Upgrade router: intent categories + `code` route, confidence scoring, telemetry | ✅ done | 1–2 days | 1, 4 |
 | 6 | SQLite memory layer: schema, policy matrix, explicit controls, CRUD endpoints | ✅ done | 2–3 days | 5 |
 | 7 | Chat sessions sidebar: create/switch/reset sessions UI | ✅ done | 1 day | 6 |

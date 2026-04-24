@@ -140,6 +140,20 @@ MODEL_LOCAL=llama3.2
 MODEL_CLOUD=claude-sonnet-4-20250514
 ROUTE_CONFIDENCE_THRESHOLD=0.55
 
+# Chat / coder model split (Phase 4b)
+# OLLAMA_CHAT_MODEL overrides MODEL_LOCAL for general chat.
+# OLLAMA_CODER_MODEL selects a code-specialized model for code intents.
+# If unset, both fall back through the chain: OLLAMA_CHAT_MODEL → MODEL_LOCAL → llama3.2
+#OLLAMA_CHAT_MODEL=llama3.2
+#OLLAMA_CODER_MODEL=qwen2.5-coder:7b
+
+# Inner-monologue planner (Phase 4b)
+# Set ROUTER_PLANNER_ENABLED=false to revert to heuristic-only routing.
+ROUTER_PLANNER_ENABLED=true
+ROUTER_PLANNER_TIMEOUT_MS=4000
+ROUTER_PLANNER_MAX_TOKENS=200
+ROUTER_PLANNER_TEMPERATURE=0.0
+
 # Optional cloud fallback
 ANTHROPIC_API_KEY=
 

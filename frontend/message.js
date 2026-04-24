@@ -8,9 +8,43 @@
   const sessionNewBtn = document.getElementById('session-new-btn');
   const memoryListEl = document.getElementById('memory-list');
   const memoryClearBtn = document.getElementById('memory-clear-btn');
+  const sidebar = document.getElementById('sidebar');
+  const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
 
   window.appUi = { messagesEl, messagesInner, input, sendBtn, newChatBtn };
   let currentSessionId = null;
+
+  function isMobileLayout() {
+    return window.matchMedia('(max-width: 900px)').matches;
+  }
+
+  function closeSidebar() {
+    document.body.classList.remove('sidebar-open');
+    sidebarToggleBtn?.setAttribute('aria-expanded', 'false');
+  }
+
+  function toggleSidebar() {
+    if (!isMobileLayout()) return;
+    const isOpen = document.body.classList.toggle('sidebar-open');
+    sidebarToggleBtn?.setAttribute('aria-expanded', String(isOpen));
+  }
+
+  sidebarToggleBtn?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    toggleSidebar();
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!isMobileLayout()) return;
+    if (!document.body.classList.contains('sidebar-open')) return;
+    const target = e.target;
+    if (sidebar?.contains(target) || sidebarToggleBtn?.contains(target)) return;
+    closeSidebar();
+  });
+
+  window.addEventListener('resize', () => {
+    if (!isMobileLayout()) closeSidebar();
+  });
 
   input.addEventListener('input', () => {
     input.style.height = 'auto';
@@ -253,6 +287,7 @@
 
   async function selectSession(sessionId) {
     setLocked(true);
+    closeSidebar();
     try {
       const resp = await fetch('/chat/session/select', {
         method: 'POST',
@@ -287,6 +322,7 @@
 
   async function deleteSession(sessionId) {
     try {
+      closeSidebar();
       const resp = await fetch(`/chat/sessions/${encodeURIComponent(sessionId)}`, {
         method: 'DELETE',
         credentials: 'same-origin',
@@ -305,6 +341,7 @@
 
   async function clearAllMemory() {
     if (!confirm('Clear all saved memory?')) return;
+    closeSidebar();
     try {
       const resp = await fetch('/memory', {
         method: 'DELETE',
@@ -321,6 +358,7 @@
   async function send() {
     const text = input.value.trim();
     if (!text) return;
+    closeSidebar();
 
     appendMessage('user', text);
     input.value = '';
@@ -406,6 +444,7 @@
 
   async function startNewChat() {
     setLocked(true);
+    closeSidebar();
     try {
       const resp = await fetch('/chat/session/new', {
         method: 'POST',

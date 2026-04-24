@@ -9,3 +9,6 @@ openwakeword
 websockets
 numpy
 chromadb
+pytest
+pytest-asyncio
+respx
