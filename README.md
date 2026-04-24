@@ -154,6 +154,12 @@ ROUTER_PLANNER_TIMEOUT_MS=4000
 ROUTER_PLANNER_MAX_TOKENS=200
 ROUTER_PLANNER_TEMPERATURE=0.0
 
+# Weather tool (Phase 6) — Open-Meteo, no API key required
+# WEATHER_UNITS: celsius | fahrenheit
+WEATHER_UNITS=celsius
+# WEATHER_TIMEOUT_MS: HTTP timeout for geocoding + forecast requests
+WEATHER_TIMEOUT_MS=5000
+
 # Optional cloud fallback
 ANTHROPIC_API_KEY=
 

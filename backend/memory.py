@@ -109,7 +109,7 @@ class MemoryStore:
                 """
                 CREATE TABLE IF NOT EXISTS preferences (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key TEXT NOT NULL,
+                    key TEXT NOT NULL UNIQUE,
                     value TEXT NOT NULL,
                     updated_at REAL NOT NULL,
                     sensitive INTEGER NOT NULL DEFAULT 0
@@ -125,6 +125,11 @@ class MemoryStore:
                     created_at REAL NOT NULL
                 )
                 """
+            )
+            self._conn.commit()
+            # Migration: add unique index on preferences.key if not already present.
+            cur.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_preferences_key ON preferences(key)"
             )
             self._conn.commit()
 
@@ -365,6 +370,28 @@ class MemoryStore:
             "explicit": explicit_requested,
             "source_message": source_message,
         }
+
+    def get_preference(self, key: str) -> str | None:
+        """Return the stored preference value for *key*, or None if not set."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT value FROM preferences WHERE key = ? LIMIT 1", (key,)
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_preference(self, key: str, value: str) -> None:
+        """Upsert a preference by key.  Overwrites any existing value."""
+        now = __import__("time").time()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO preferences (key, value, updated_at, sensitive)
+                VALUES (?, ?, ?, 0)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (key, value, now),
+            )
+            self._conn.commit()
 
     def list_items(self, limit: int = 200, offset: int = 0) -> dict[str, Any]:
         with self._lock:

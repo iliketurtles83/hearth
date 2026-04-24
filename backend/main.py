@@ -19,6 +19,8 @@ import numpy as np
 from dotenv import load_dotenv
 from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
 from memory import memory_store
+import tools
+from tools.base import ToolResult
 
 load_dotenv()
 
@@ -498,6 +500,61 @@ async def chat(request: ChatRequest, http_request: Request):
 
         yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence})}\n\n"
 
+        # ── Tool dispatch ─────────────────────────────────────────────────────
+        # When the router sets decision.tool, call the registered tool module
+        # and summarize its normalized output through the local chat model.
+        # Raw API data is never sent directly to the client.
+        if decision.tool:
+            tool_result: ToolResult = await tools.dispatch(
+                decision.tool,
+                {"prompt": request.message, "memory": memory_store},
+            )
+            log.info(
+                "chat.tool | session_id=%s tool=%s ok=%s retryable=%s",
+                session_id, decision.tool, tool_result.ok, tool_result.retryable,
+            )
+            if tool_result.ok:
+                # Build a summarization prompt: ask the local model to turn the
+                # normalized data dict into a natural-language response.
+                tool_data_str = json.dumps(tool_result.data, ensure_ascii=False)
+                summary_prompt = (
+                    f"You are a helpful assistant. Based on the following structured data, "
+                    f"write a concise, natural-language response to the user's request.\n"
+                    f"User request: {request.message}\n"
+                    f"Data: {tool_data_str}\n"
+                    f"Keep your response brief and include all relevant values with units."
+                )
+                summary_request = ChatRequest(message=summary_prompt, system=augmented_system)
+                try:
+                    async for chunk in stream_local(summary_request, model_name=CHAT_MODEL):
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                        assistant_accumulated += chunk
+                        yield f"data: {json.dumps({'text': chunk})}\n\n"
+                except Exception as exc:
+                    log.error("chat.tool_summary_error | session_id=%s error=%s", session_id, exc)
+                    yield f"data: {json.dumps({'text': f'⚠ Could not summarize tool response: {exc}'})}\n\n"
+            else:
+                error_msg = tool_result.error or "The tool returned no data."
+                assistant_accumulated = error_msg
+                yield f"data: {json.dumps({'text': error_msg})}\n\n"
+
+            # Skip stream_local / stream_cloud for tool responses — we are done.
+            completion_time = time.monotonic()
+            first_token_ms = (first_token_time - start_time) * 1000 if first_token_time else -1
+            completion_ms = (completion_time - start_time) * 1000
+            log.info(
+                "chat.telemetry | session_id=%s intent=%s confidence=%.3f route=tool "
+                "model=%s fallback=False first_token_ms=%.0f completion_ms=%.0f response_tokens_approx=%d",
+                session_id, decision.intent, decision.confidence, active_model,
+                first_token_ms, completion_ms, _estimate_tokens(assistant_accumulated),
+            )
+            _append_session_message(session_id, "user", request.message)
+            _append_session_message(session_id, "assistant", assistant_accumulated.strip())
+            memory_store.ingest_user_message(request.message, source="chat")
+            return
+        # ── End tool dispatch ─────────────────────────────────────────────────
+
         primary = (
             stream_cloud(augmented_system, cloud_messages)
             if decision.use_cloud
@@ -708,6 +765,30 @@ async def delete_memory(memory_id: str):
 async def clear_memory():
     counts = memory_store.clear_all()
     return JSONResponse({"ok": True, "cleared": counts})
+
+
+class WeatherRequest(BaseModel):
+    location: str | None = None
+
+
+@app.post("/weather")
+async def weather(request: WeatherRequest):
+    """Direct weather endpoint.
+
+    Returns the normalized weather data dict for the given location (or stored default).
+    Suitable for frontend calls and future LangGraph tool nodes.
+    """
+    from tools import weather as weather_tool  # type: ignore[attr-defined]
+    result = await weather_tool.run({
+        "prompt": f"weather in {request.location}" if request.location else "",
+        "memory": memory_store,
+        "location": request.location,
+    })
+    if not result.ok:
+        status = 503 if result.retryable else 422
+        return _error_response(result.error, "WEATHER_ERROR", result.retryable, status_code=status)
+    return JSONResponse(result.data)
+
 
 @app.get("/health")
 async def health():

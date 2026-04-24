@@ -5,6 +5,10 @@ __pycache__/
 *.onnx
 *.bin
 *.db
+*.sqlite
+*.sqlite3
+
+# Chroma persistence (all generated files/subdirs)
 backend/chroma/
 # mkcert-generated certificates — never commit private keys
 caddy/certs/

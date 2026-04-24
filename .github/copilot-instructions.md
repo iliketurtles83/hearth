@@ -312,6 +312,7 @@ Acceptance:
 ---
 
 ### Phase 6 — Weather tool
+**Status: complete**
 **Estimate: 1 day**
 **Depends on: Phase 5**
 
@@ -319,19 +320,29 @@ Goal: First external tool integration. Validates the tool-routing architecture
 cleanly before adding more complex tools.
 
 Tasks:
-- Build a weather provider adapter with a normalized response schema (do not
+- ✅ Build a weather provider adapter with a normalized response schema (do not
   leak provider-specific field names into the rest of the codebase).
-- Route weather intents directly to the tool endpoint, then summarize through
+- ✅ Route weather intents directly to the tool endpoint, then summarize through
   the model — do not pass raw API JSON to the user.
-- Use the remembered default location from memory; support inline override
+- ✅ Use the remembered default location from memory; support inline override
   ("weather in Tallinn").
-- Return graceful error responses for API failures and offline conditions.
+- ✅ Return graceful error responses for API failures and offline conditions.
+
+Implementation notes:
+- **Open-Meteo** (no API key required) — two-step: geocode city → fetch forecast.
+- Tool module system: `backend/tools/base.py` (`ToolResult`), `backend/tools/__init__.py`
+  (registry + dispatch). Adding future tools: create module, call `register()`. No
+  other files change.
+- `memory.get_preference("default_location")` / `memory.set_preference()` added to
+  `MemoryStore` for keyed preference lookup.
+- `WEATHER_UNITS` (celsius/fahrenheit) and `WEATHER_TIMEOUT_MS` env vars.
+- `POST /weather` direct endpoint for frontend + future LangGraph nodes.
 
 Acceptance:
-- "What is the weather?" uses stored default location.
-- "Weather in <city>" overrides default correctly.
-- Output is concise and includes units.
-- API failure returns a clear user-facing message, not a stack trace.
+- ✅ "What is the weather?" uses stored default location.
+- ✅ "Weather in <city>" overrides default correctly.
+- ✅ Output is concise and includes units.
+- ✅ API failure returns a clear user-facing message, not a stack trace.
 
 ---
 
@@ -783,7 +794,7 @@ Acceptance:
 | 5 | Upgrade router: intent categories + `code` route, confidence scoring, telemetry | ✅ done | 1–2 days | 1, 4 |
 | 6 | SQLite memory layer: schema, policy matrix, explicit controls, CRUD endpoints | ✅ done | 2–3 days | 5 |
 | 7 | Chat sessions sidebar: create/switch/reset sessions UI | ✅ done | 1 day | 6 |
-| 8 | Weather tool: adapter, memory-backed default location, error handling | 🔲 | 1 day | 6, 7 |
+| 8 | Weather tool: adapter, memory-backed default location, error handling | ✅ done | 1 day | 6, 7 |
 | 9 | Local music library tool: media indexer, search/playback endpoints, voice controls | 🔲 | 3–5 days | 2, 5 |
 | 10 | TTS voice output: benchmark Piper vs Kokoro, pluggable engine, barge-in | 🔲 | 2–4 days | 2, 4 |
 | 11 | LangGraph migration: graph orchestration with tone + persona stubs | 🔲 | 1–2 weeks | all prior |
