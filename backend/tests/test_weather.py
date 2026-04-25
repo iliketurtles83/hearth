@@ -252,6 +252,8 @@ class TestWeatherRun:
         assert d["condition"] == "Partly cloudy"
         assert "°C" in d["units"]["temperature"]
         assert "km/h" in d["units"]["wind_speed"]
+        assert "clothing" in d
+        assert isinstance(d["clothing"], str) and d["clothing"].strip() != ""
 
     @pytest.mark.asyncio
     async def test_fahrenheit_units(self):
@@ -272,6 +274,8 @@ class TestWeatherRun:
         assert result.ok
         assert "°F" in result.data["units"]["temperature"]
         assert "mph" in result.data["units"]["wind_speed"]
+        assert "clothing" in result.data
+        assert isinstance(result.data["clothing"], str) and result.data["clothing"].strip() != ""
 
     @pytest.mark.asyncio
     async def test_result_contains_no_provider_field_names(self):

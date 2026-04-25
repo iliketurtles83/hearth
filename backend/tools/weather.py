@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys as _sys
 from typing import Any
 
 import httpx
@@ -240,16 +241,53 @@ async def run(params: dict[str, Any]) -> ToolResult:
         )
 
     data = {"location": display_name, **weather_data}
+
+    # Compute a simple clothing recommendation based on temperature (normalized to °C).
+    temp = data.get("temperature")
+    feels_like = data.get("feels_like")
+    temp_unit_symbol = data.get("units", {}).get("temperature", "°C")
+
+    def _to_celsius(value: float | None) -> float | None:
+        if value is None:
+            return None
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        if temp_unit_symbol == "°F":
+            return (v - 32.0) * 5.0 / 9.0
+        return v
+
+    temp_c = _to_celsius(temp) or _to_celsius(feels_like)
+
+    if temp_c is None:
+        clothing = "Wear something comfortable."
+    elif temp_c <= 0:
+        clothing = "Heavy winter coat, gloves, and a hat."
+    elif temp_c <= 10:
+        clothing = "Warm jacket and layers."
+    elif temp_c <= 20:
+        clothing = "Light jacket or sweater."
+    elif temp_c <= 25:
+        clothing = "T-shirt and light pants."
+    else:
+        clothing = "Shorts and a t-shirt."
+
+    data["clothing"] = clothing
+
     log.info(
-        "weather.run | result location=%s temp=%s%s condition=%s",
+        "weather.run | result location=%s temp=%s%s condition=%s clothing=%s",
         display_name,
         data.get("temperature"),
         data.get("units", {}).get("temperature", ""),
         data.get("condition"),
+        clothing,
     )
+
     return ToolResult(ok=True, data=data)
 
 
 # Self-register when the module is imported.
 import sys as _sys
+# Self-register when the module is imported.
 _registry.register("weather", _sys.modules[__name__])
