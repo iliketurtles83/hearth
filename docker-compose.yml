@@ -35,6 +35,42 @@ services:
     depends_on:
       - ollama
 
+  # MPD — music playback daemon (Phase 8).
+  # Audio output: PulseAudio socket mounted from the host (PipeWire-PA compatible).
+  # Music files: ${MUSIC_PATH} (set in .env) mounted read-only at /music.
+  # If your UID is not 1000, update mpd/mpd.conf and the socket path below.
+  mpd:
+    image: vimagick/mpd
+    container_name: assistant-mpd
+    restart: unless-stopped
+    # Keep MPD's control port internal to the compose network (use `expose`) to
+    # avoid conflicts with any host MPD instance. Expose the web/HTTP port if
+    # you want web access on the host.
+    expose:
+      - "6600"
+    ports:
+      - "8800:8800"
+    volumes:
+      - ./mpd:/config
+      - ${MUSIC_PATH:-/media/jack/buffer/audio}:/music:ro
+      - ./mpd/playlists:/config/playlists
+      # PulseAudio socket for host user (PipeWire-pulse compatibility)
+      - /run/user/1000/pulse/native:/run/user/1000/pulse/native:ro
+    devices:
+      - /dev/snd
+    environment:
+      - TZ=UTC
+      - PUID=1000
+      - PGID=1000
+      - XDG_RUNTIME_DIR=/run/user/1000
+      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 2 sh -c 'echo > /dev/tcp/localhost/6600' 2>/dev/null && exit 0 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
   backend:
     build: ./backend
     container_name: assistant-backend
@@ -45,11 +81,20 @@ services:
       - "8000"
     env_file:
       - .env
+    environment:
+      # Strawberry DB mounted from host (read-only). Override STRAWBERRY_DB_PATH in
+      # .env if the DB filename differs. Host directory set via STRAWBERRY_DB_DIR.
+      - STRAWBERRY_DB_PATH=/strawberry/strawberry.db
+      - MPD_HOST=mpd
     depends_on:
       - ollama
+      - mpd
     volumes:
       - ./backend:/app
       - ./frontend:/frontend
+      # Strawberry music library DB — mounted read-only so the backend can search it.
+      # Set STRAWBERRY_DB_DIR in .env to the directory containing strawberry.db.
+      - ${STRAWBERRY_DB_DIR:-/home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry}:/strawberry:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
       interval: 30s
