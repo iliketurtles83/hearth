@@ -67,7 +67,7 @@ def _auto_register() -> None:
     drive import here so that tools are available from first request without
     a lazy-import race condition.
     """
-    _builtin_tools = ["weather"]  # extend as phases add new tools
+    _builtin_tools = ["weather", "music"]  # extend as phases add new tools
     for tool_name in _builtin_tools:
         try:
             importlib.import_module(f"tools.{tool_name}")

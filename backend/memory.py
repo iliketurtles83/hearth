@@ -49,12 +49,12 @@ class HashEmbeddingFunction(EmbeddingFunction):
 
 
 class MemoryStore:
-    def __init__(self) -> None:
+    def __init__(self, db_path: str | None = None, chroma_path: str | None = None) -> None:
         root = os.path.dirname(__file__)
         db_default = os.path.join(root, "memory.db")
         chroma_default = os.path.join(root, "chroma")
-        self.db_path = os.getenv("MEMORY_DB_PATH", db_default)
-        self.chroma_path = os.getenv("CHROMA_PATH", chroma_default)
+        self.db_path = db_path or os.getenv("MEMORY_DB_PATH", db_default)
+        self.chroma_path = chroma_path or os.getenv("CHROMA_PATH", chroma_default)
         self.top_n = int(os.getenv("MEMORY_TOP_N", "5"))
         self.min_relevance_score = float(os.getenv("MEMORY_MIN_RELEVANCE_SCORE", "0.28"))
 
@@ -92,44 +92,45 @@ class MemoryStore:
     def _init_db(self) -> None:
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute(
+            cur.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS facts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key TEXT NOT NULL,
-                    value TEXT NOT NULL,
-                    source TEXT NOT NULL,
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    TEXT NOT NULL,
+                    key        TEXT NOT NULL,
+                    value      TEXT NOT NULL,
+                    source     TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     expires_at REAL,
-                    sensitive INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            cur.execute(
-                """
+                    sensitive  INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS preferences (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    key TEXT NOT NULL UNIQUE,
-                    value TEXT NOT NULL,
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    TEXT NOT NULL,
+                    key        TEXT NOT NULL,
+                    value      TEXT NOT NULL,
                     updated_at REAL NOT NULL,
-                    sensitive INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            cur.execute(
-                """
+                    sensitive  INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS summaries (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    TEXT NOT NULL,
                     session_id TEXT NOT NULL,
-                    summary TEXT NOT NULL,
+                    summary    TEXT NOT NULL,
                     created_at REAL NOT NULL
-                )
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_facts_user_id
+                    ON facts(user_id);
+                CREATE INDEX IF NOT EXISTS idx_preferences_user_id
+                    ON preferences(user_id);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_preferences_user_key
+                    ON preferences(user_id, key);
+                CREATE INDEX IF NOT EXISTS idx_summaries_user_id
+                    ON summaries(user_id);
                 """
-            )
-            self._conn.commit()
-            # Migration: add unique index on preferences.key if not already present.
-            cur.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS idx_preferences_key ON preferences(key)"
             )
             self._conn.commit()
 
@@ -211,7 +212,7 @@ class MemoryStore:
     def _upsert_chroma(self, memory_id: str, text: str, metadata: dict[str, Any]) -> None:
         self._collection.upsert(ids=[memory_id], documents=[text], metadatas=[metadata])
 
-    def _forget_by_query(self, query: str) -> int:
+    def _forget_by_query(self, user_id: str, query: str) -> int:
         q = query.strip().lower()
         if not q:
             return 0
@@ -222,18 +223,18 @@ class MemoryStore:
             rows = cur.execute(
                 """
                 SELECT id, 'facts' AS table_name FROM facts
-                WHERE lower(key) LIKE ? OR lower(value) LIKE ?
+                WHERE user_id = ? AND (lower(key) LIKE ? OR lower(value) LIKE ?)
                 UNION ALL
                 SELECT id, 'preferences' AS table_name FROM preferences
-                WHERE lower(key) LIKE ? OR lower(value) LIKE ?
+                WHERE user_id = ? AND (lower(key) LIKE ? OR lower(value) LIKE ?)
                 """,
-                (f"%{q}%", f"%{q}%", f"%{q}%", f"%{q}%"),
+                (user_id, f"%{q}%", f"%{q}%", user_id, f"%{q}%", f"%{q}%"),
             ).fetchall()
 
             for row in rows:
                 table = row["table_name"]
                 row_id = int(row["id"])
-                cur.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
+                cur.execute(f"DELETE FROM {table} WHERE id = ? AND user_id = ?", (row_id, user_id))
                 if table in {"facts", "preferences"}:
                     ids.append(f"{table}:{row_id}")
             self._conn.commit()
@@ -245,7 +246,7 @@ class MemoryStore:
                 pass
         return len(rows)
 
-    def ingest_user_message(self, message: str, source: str = "chat", previous_user_message: str | None = None) -> dict[str, Any]:
+    def ingest_user_message(self, user_id: str, message: str, source: str = "chat", previous_user_message: str | None = None) -> dict[str, Any]:
         command = self._parse_memory_command(message)
 
         if command and command.action == "skip":
@@ -259,7 +260,7 @@ class MemoryStore:
             }
 
         if command and command.action == "forget":
-            deleted = self._forget_by_query(command.query or "")
+            deleted = self._forget_by_query(user_id, command.query or "")
             return {
                 "status": "forgot",
                 "deleted": deleted,
@@ -318,20 +319,22 @@ class MemoryStore:
                 if c.table == "preferences":
                     cur.execute(
                         """
-                        INSERT INTO preferences (key, value, updated_at, sensitive)
-                        VALUES (?, ?, ?, 0)
+                        INSERT INTO preferences (user_id, key, value, updated_at, sensitive)
+                        VALUES (?, ?, ?, ?, 0)
+                        ON CONFLICT(user_id, key) DO UPDATE
+                            SET value = excluded.value, updated_at = excluded.updated_at
                         """,
-                        (c.key, c.value, now),
+                        (user_id, c.key, c.value, now),
                     )
                     row_id = cur.lastrowid
                     memory_id = f"preferences:{row_id}"
                 else:
                     cur.execute(
                         """
-                        INSERT INTO facts (key, value, source, created_at, expires_at, sensitive)
-                        VALUES (?, ?, ?, ?, NULL, 0)
+                        INSERT INTO facts (user_id, key, value, source, created_at, expires_at, sensitive)
+                        VALUES (?, ?, ?, ?, ?, NULL, 0)
                         """,
-                        (c.key, c.value, c.source, now),
+                        (user_id, c.key, c.value, c.source, now),
                     )
                     row_id = cur.lastrowid
                     memory_id = f"facts:{row_id}"
@@ -344,6 +347,7 @@ class MemoryStore:
                         "table": c.table,
                         "key": c.key,
                         "source": c.source,
+                        "user_id": user_id,
                         "created_at": now,
                         "consent_status": "explicit" if explicit_requested else "implicit",
                     },
@@ -371,55 +375,58 @@ class MemoryStore:
             "source_message": source_message,
         }
 
-    def get_preference(self, key: str) -> str | None:
-        """Return the stored preference value for *key*, or None if not set."""
+    def get_preference(self, user_id: str, key: str) -> str | None:
+        """Return the stored preference value for *key* scoped to *user_id*, or None."""
         with self._lock:
             row = self._conn.execute(
-                "SELECT value FROM preferences WHERE key = ? LIMIT 1", (key,)
+                "SELECT value FROM preferences WHERE user_id = ? AND key = ? LIMIT 1",
+                (user_id, key),
             ).fetchone()
         return str(row["value"]) if row else None
 
-    def set_preference(self, key: str, value: str) -> None:
-        """Upsert a preference by key.  Overwrites any existing value."""
-        now = __import__("time").time()
+    def set_preference(self, user_id: str, key: str, value: str) -> None:
+        """Upsert a preference by (user_id, key).  Overwrites any existing value."""
+        now = time.time()
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO preferences (key, value, updated_at, sensitive)
-                VALUES (?, ?, ?, 0)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                INSERT INTO preferences (user_id, key, value, updated_at, sensitive)
+                VALUES (?, ?, ?, ?, 0)
+                ON CONFLICT(user_id, key)
+                    DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
                 """,
-                (key, value, now),
+                (user_id, key, value, now),
             )
             self._conn.commit()
 
-    def list_items(self, limit: int = 200, offset: int = 0) -> dict[str, Any]:
+    def list_items(self, user_id: str, limit: int = 200, offset: int = 0) -> dict[str, Any]:
         with self._lock:
             cur = self._conn.cursor()
             rows = cur.execute(
                 """
                 SELECT id, 'facts' AS table_name, key, value, source, created_at AS ts
-                FROM facts
+                FROM facts WHERE user_id = ?
                 UNION ALL
                 SELECT id, 'preferences' AS table_name, key, value, '' AS source, updated_at AS ts
-                FROM preferences
+                FROM preferences WHERE user_id = ?
                 UNION ALL
                 SELECT id, 'summaries' AS table_name, session_id AS key, summary AS value, '' AS source, created_at AS ts
-                FROM summaries
+                FROM summaries WHERE user_id = ?
                 ORDER BY ts DESC
                 LIMIT ? OFFSET ?
                 """,
-                (limit, offset),
+                (user_id, user_id, user_id, limit, offset),
             ).fetchall()
 
             total = cur.execute(
                 """
                 SELECT (
-                    (SELECT COUNT(*) FROM facts) +
-                    (SELECT COUNT(*) FROM preferences) +
-                    (SELECT COUNT(*) FROM summaries)
+                    (SELECT COUNT(*) FROM facts WHERE user_id = ?) +
+                    (SELECT COUNT(*) FROM preferences WHERE user_id = ?) +
+                    (SELECT COUNT(*) FROM summaries WHERE user_id = ?)
                 ) AS total
-                """
+                """,
+                (user_id, user_id, user_id),
             ).fetchone()["total"]
 
         items = [
@@ -435,7 +442,7 @@ class MemoryStore:
         ]
         return {"items": items, "total": int(total), "limit": limit, "offset": offset}
 
-    def delete_item(self, memory_id: str) -> bool:
+    def delete_item(self, user_id: str, memory_id: str) -> bool:
         if ":" not in memory_id:
             return False
         table, raw_id = memory_id.split(":", 1)
@@ -447,7 +454,8 @@ class MemoryStore:
         deleted = False
         with self._lock:
             cur = self._conn.cursor()
-            cur.execute(f"DELETE FROM {table} WHERE id = ?", (int(raw_id),))
+            # user_id guard prevents cross-user deletion.
+            cur.execute(f"DELETE FROM {table} WHERE id = ? AND user_id = ?", (int(raw_id), user_id))
             deleted = cur.rowcount > 0
             self._conn.commit()
 
@@ -458,27 +466,25 @@ class MemoryStore:
                 pass
         return deleted
 
-    def clear_all(self) -> dict[str, int]:
+    def clear_all(self, user_id: str) -> dict[str, int]:
+        """Delete all memory for *user_id* only."""
         with self._lock:
             cur = self._conn.cursor()
             counts = {
-                "facts": cur.execute("SELECT COUNT(*) AS c FROM facts").fetchone()["c"],
-                "preferences": cur.execute("SELECT COUNT(*) AS c FROM preferences").fetchone()["c"],
-                "summaries": cur.execute("SELECT COUNT(*) AS c FROM summaries").fetchone()["c"],
+                "facts": cur.execute("SELECT COUNT(*) AS c FROM facts WHERE user_id = ?", (user_id,)).fetchone()["c"],
+                "preferences": cur.execute("SELECT COUNT(*) AS c FROM preferences WHERE user_id = ?", (user_id,)).fetchone()["c"],
+                "summaries": cur.execute("SELECT COUNT(*) AS c FROM summaries WHERE user_id = ?", (user_id,)).fetchone()["c"],
             }
-            cur.execute("DELETE FROM facts")
-            cur.execute("DELETE FROM preferences")
-            cur.execute("DELETE FROM summaries")
+            cur.execute("DELETE FROM facts WHERE user_id = ?", (user_id,))
+            cur.execute("DELETE FROM preferences WHERE user_id = ?", (user_id,))
+            cur.execute("DELETE FROM summaries WHERE user_id = ?", (user_id,))
             self._conn.commit()
 
+        # Remove this user's vectors from Chroma (post-filter by metadata).
         try:
-            self._chroma.delete_collection("assistant_memories")
+            self._collection.delete(where={"user_id": user_id})
         except Exception:
             pass
-        self._collection = self._chroma.get_or_create_collection(
-            name="assistant_memories",
-            embedding_function=self._embedder,
-        )
         return {k: int(v) for k, v in counts.items()}
 
     def _query_terms(self, query: str) -> list[str]:
@@ -522,7 +528,7 @@ class MemoryStore:
         ranked.sort(key=lambda r: r["score"], reverse=True)
         return ranked[:top_n]
 
-    def retrieve(self, query: str, top_n: int | None = None) -> list[dict[str, Any]]:
+    def retrieve(self, user_id: str, query: str, top_n: int | None = None) -> list[dict[str, Any]]:
         raw_query = query.strip()
         if len(raw_query) < 2:
             return []
@@ -531,14 +537,18 @@ class MemoryStore:
         query_terms = self._query_terms(raw_query)
         listed = [
             item
-            for item in self.list_items(limit=300, offset=0)["items"]
+            for item in self.list_items(user_id, limit=300, offset=0)["items"]
             if item.get("table") in {"facts", "preferences"}
         ]
         sqlite_hits = self._keyword_rank(raw_query, listed, limit * 2)
 
         chroma_hits: list[dict[str, Any]] = []
         try:
-            result = self._collection.query(query_texts=[raw_query], n_results=limit * 2)
+            result = self._collection.query(
+                query_texts=[raw_query],
+                n_results=limit * 2,
+                where={"user_id": user_id},
+            )
             ids = (result.get("ids") or [[]])[0]
             docs = (result.get("documents") or [[]])[0]
             distances = (result.get("distances") or [[]])[0]
@@ -562,6 +572,3 @@ class MemoryStore:
 
         merged_list = sorted(merged.values(), key=lambda h: h["score"], reverse=True)[:limit]
         return merged_list
-
-
-memory_store = MemoryStore()

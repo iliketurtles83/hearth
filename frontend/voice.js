@@ -64,7 +64,7 @@
       const form = new FormData();
       form.append('audio', wav, 'utterance.wav');
 
-      const resp = await fetch('/transcribe', { method: 'POST', body: form });
+      const resp = await (window.apiFetch || fetch)('/transcribe', { method: 'POST', body: form });
       if (!resp.ok) throw new Error(`Transcription failed: HTTP ${resp.status}`);
 
       const { text } = await resp.json();

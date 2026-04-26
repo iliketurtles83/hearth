@@ -354,25 +354,93 @@ Goal: Provide backend music search and playback integration using MPD and the
 Strawberry music database, exposing HTTP endpoints and voice and text commands
 so users can search, queue, and control playback from the UI or via voice.
 
+Implementation notes (decisions made during review):
+- **Strawberry DB schema**: no `id` column; use `rowid` as integer primary key.
+  File paths are stored in the `url` column as `file://` URIs with URL encoding.
+  No `songs_fts` FTS table in production databases — use LIKE queries only.
+- **Path rewrite**: Strawberry stores host-side absolute file:// URIs
+  (e.g. `file:///media/jack/buffer/audio/artist/song.mp3`). The backend URL-decodes
+  and strips the `MUSIC_PATH_HOST` prefix to produce MPD-relative paths
+  (e.g. `artist/song.mp3`) which MPD resolves against its `music_directory`.
+- **Ambiguity**: auto-pick the top-ranked LIKE result and log the confidence score
+  server-side. Ranked candidate list is preserved in API response for future UX.
+- **MPD resilience**: per-request fresh MPD connection with one reconnect attempt.
+  On second failure, return retryable ToolResult — never crash or silently drop.
+- **Strawberry lock handling**: open with `timeout=5, check_same_thread=False, uri=True`
+  (read-only URI mode). Wrap all reads in `try/except sqlite3.OperationalError`
+  and return `retryable=True` when locked (Strawberry holds write lock during scans).
+- **Artist radio**: implemented in Phase 8 core as weighted-random by `playcount`,
+  seeded for determinism. This is the Phase 8b fallback entry point — 8b calls
+  `artist_radio()` directly when the rec engine is unavailable.
+
 Tasks:
-- Add MPD as a Docker Compose service with your music folder mounted.
-- Open Strawberry DB as read-only SQLite in the backend (STRAWBERRY_DB_PATH env var).
-- Implement search against Strawberry songs table — full-text on title/artist/album, with fallback to songs_fts (Strawberry already maintains an FTS index).
-- Implement python-musicpd client wrapper in backend/tools/music.py — play(url), pause(), resume(), stop(), next(), queue(url), now_playing().
-- Queue model: single song, multi-song, named playlist
-- Add path rewrite config for Docker path differences.
-- Wire ambiguity resolution (multiple matches → ask to clarify) through the existing confirmation pattern.
+- Add MPD as a Docker Compose service with music folder mounted.
+- Mount Strawberry DB directory read-only into backend container; set `STRAWBERRY_DB_PATH`.
+- Implement Strawberry search in `backend/tools/music.py` using LIKE on title/artist/album,
+  ranked by playcount. No FTS — use rowid as track ID.
+- Implement MPD client in `backend/tools/music.py` with per-request connections and
+  reconnect-once resilience: play(url), pause(), resume(), stop(), next(), queue(url),
+  now_playing(), queue_view().
+- Queue model: single song, multi-song (artist radio).
+- Add path rewrite: URL-decode Strawberry `file://` URIs → strip `MUSIC_PATH_HOST`
+  prefix → pass relative path to MPD.
+- Implement `artist_radio(artist, n)` using weighted-random by playcount (Phase 8b dep).
+- Wrap all Strawberry reads in `OperationalError` handling; return retryable errors.
+- Add `GET /music/now_playing` endpoint (required by acceptance — add to tasks explicitly).
+- Add `GET /music/queue` endpoint for queue visibility.
+
+Environment variables:
+  `STRAWBERRY_DB_PATH`      path to Strawberry sqlite db inside backend container
+  `MPD_HOST`                default: mpd
+  `MPD_PORT`                default: 6600
+  `MPD_TIMEOUT`             seconds (default: 5)
+  `MUSIC_PATH`              host music folder path (mounted into MPD container as /music)
+  `MUSIC_PATH_HOST`         Strawberry URL prefix on host (e.g. /media/jack/buffer/audio)
+  `MUSIC_PATH_CONTAINER`    MPD music_directory (default: /music — unused in backend)
+  `MUSIC_SEARCH_LIMIT`      max search results (default: 20)
+  `MUSIC_ARTIST_RADIO_N`    tracks for artist radio (default: 10)
 
 Acceptance:
-- **Endpoints:** `POST /music/search`, `POST /music/play`, `POST /music/queue`, and `POST /music/control` are implemented and return standardized responses.
-- **Search quality:** `/music/search` returns ranked results from Strawberry's `songs` table (FTS fallback to `songs_fts`) for title/artist/album queries.
-- **Queue model:** Supports single song, multi-song, and named playlists.
-- **Playback controls:** `/music/play` starts playback via MPD; `/music/queue` appends tracks; `/music/control` supports `pause`, `resume`, `next`, and `stop`; `/music/now_playing` returns current track.
-- **Voice & UI:** "Play <song or artist>" works end-to-end via voice or text and updates the frontend player state.
-- **Ambiguity resolution:** Multiple matches trigger the existing confirmation flow (clarify before playing).
-- **Docker & config:** MPD runs as a Docker Compose service with the music folder mounted, and `STRAWBERRY_DB_PATH` is respected by the backend.
-- **Path rewrite:** Container/host path rewrite is handled so stored track paths play correctly from the container.
-- **Errors:** All music endpoints return the standardized error shape (`error`, `code`, `retryable`) on failures.
+- **Endpoints:** `POST /music/search`, `POST /music/play`, `POST /music/queue`,
+  `POST /music/control`, `GET /music/now_playing`, and `GET /music/queue` are all
+  implemented and return standardized responses.
+- **Search quality:** `/music/search` returns ranked results from Strawberry's `songs`
+  table (LIKE on title/artist/album, ordered by playcount) for title/artist/album queries.
+- **Queue model:** Supports single song and artist radio (multi-song by artist).
+- **Playback controls:** `/music/play` starts playback via MPD; `/music/queue` appends
+  tracks; `/music/control` supports `pause`, `resume`, `next`, and `stop`;
+  `GET /music/now_playing` returns current track; `GET /music/queue` returns queued tracks.
+- **Voice & UI:** "Play <song or artist>" works end-to-end via voice or text and updates
+  the frontend player state including now-playing bar and queue panel.
+- **Auto-pick:** Multiple search matches auto-pick the top-ranked result; confidence is
+  logged server-side and included in the API response.
+- **Artist radio:** "Play <artist>" with no exact match queues N songs by that artist,
+  weighted-randomly by playcount. This is the concrete foundation for Phase 8b fallback.
+- **Docker & config:** MPD runs as a Docker Compose service with the music folder mounted;
+  `STRAWBERRY_DB_PATH`, `MUSIC_PATH_HOST`, and `MPD_HOST` are respected by the backend.
+- **Path rewrite:** file:// URIs from Strawberry are decoded and the host prefix stripped
+  to produce MPD-relative paths before any MPD add/play call.
+- **MPD resilience:** ConnectionError on any command attempts one reconnect; if that fails,
+  returns `retryable=True`. Container restart does not cause silent failure.
+- **Strawberry lock:** OperationalError during a scan returns `retryable=True`, never crashes.
+- **Errors:** All music endpoints return the standardized error shape
+  (`error`, `code`, `retryable`) on failures.
+
+---
+
+### Phase 8b (1–2 days, do it when rec engine MVP is ready)
+**Estimate: 1–2 days**
+**Depends on: Phase 8, recommendation engine MVP**
+
+Goal: Add a music recommendation tool that integrates with the recommendation engine
+
+Tasks:
+- Recommend intent route: "play something like X" or "play songs similar to X"
+- Thin adapter: call rec engine HTTP endpoint → resolve results against Strawberry DB → queue in MPD
+- Graceful fallback if rec engine is unavailable (queue artist radio from Strawberry instead)
+
+Acceptance:
+- "Play something like <song/artist>" returns relevant recommendations and queues them in MPD.
 
 ---
 

@@ -9,6 +9,7 @@ openwakeword
 websockets
 numpy
 chromadb
+python-musicpd
 pytest
 pytest-asyncio
 respx

@@ -113,6 +113,9 @@ _EXTERNAL_DATA_KEYWORDS = [
     "news", "headline", "current events", "latest news",
     "stock", "share price", "market today", "market now",
     "what time is it", "what date is it", "live score", "real-time",
+    # music
+    "play", "pause", "stop", "resume", "next song", "next track",
+    "skip", "queue", "now playing", "what's playing", "what is playing",
 ]
 
 _EXTERNAL_DATA_PATTERNS = [
@@ -121,15 +124,53 @@ _EXTERNAL_DATA_PATTERNS = [
     r"\b(stock|share\s+price|market)\b.{0,20}\b(today|now|current)\b",
     r"\bwhat\s+(time|date)\s+is\s+it\b",
     r"\b(live|real.?time)\b.{0,20}\b(data|score|result)\b",
+    # music
+    r"\b(play|queue|put\s+on)\b.{0,60}\b(song|track|music|album|artist|band)\b",
+    r"\b(pause|stop|resume|skip|next)\b.{0,30}\b(music|song|track|playback)?\b",
+    r"\b(what'?s|what\s+is)\s+(playing|in\s+the\s+queue)\b",
 ]
 
 _WEATHER_PATTERNS = [
     r"\b(weather|forecast|temperature|rain|snow|sunny|humidity)\b",
 ]
 
+_MUSIC_PATTERNS = [
+    r"\b(play|queue|put\s+on)\b.{0,60}\b(song|track|music|album|artist|band)\b",
+    r"\b(play|queue)\b.{1,80}",  # broad — refine with keyword gate below
+    r"\b(pause|resume|unpause)\b.{0,30}\b(music|song|track|playback)?\b",
+    r"\b(next|skip)\b.{0,20}\b(track|song)?\b",
+    r"\bstop\s+(the\s+)?(music|playback|song)\b",
+    r"\b(now\s+playing|what'?s\s+playing|what\s+is\s+playing)\b",
+    r"\b(what'?s|what\s+is)\s+in\s+the\s+queue\b",
+]
+
+_MUSIC_KEYWORDS = [
+    "play", "queue", "pause", "stop", "resume", "next track", "next song",
+    "skip", "now playing", "what's playing", "what is playing",
+    "artist radio", "put on", "shuffle",
+]
+
 
 def _looks_like_weather_request(text: str) -> bool:
     return any(re.search(p, text, re.IGNORECASE) for p in _WEATHER_PATTERNS)
+
+
+def _looks_like_music_request(text: str) -> bool:
+    """Return True when the prompt is almost certainly a music command.
+
+    Uses keyword gate first (fast path), then regex patterns for structural matches.
+    Intentionally conservative — broad "play" alone is not sufficient; it must
+    be accompanied by a music-related keyword or structural pattern.
+    """
+    p = text.lower()
+    # Fast keyword gate
+    music_kw = ("play ", "queue ", "pause", "resume", "unpause", "skip",
+                "now playing", "what's playing", "what is playing",
+                "put on", "next track", "next song", "artist radio")
+    if not any(kw in p for kw in music_kw):
+        return False
+    # Require at least one structural pattern
+    return any(re.search(pat, text, re.IGNORECASE) for pat in _MUSIC_PATTERNS)
 
 
 def _normalize_external_tool(intent: str, prompt: str, tool_name: str | None) -> str | None:
@@ -138,6 +179,7 @@ def _normalize_external_tool(intent: str, prompt: str, tool_name: str | None) ->
     - Only external-data intents may dispatch to tools.
     - Unknown planner tool names are ignored.
     - Weather requests infer the weather tool when planner omits a tool.
+    - Music requests infer the music tool when planner omits a tool.
     """
     if intent != "external-data-needed":
         return None
@@ -152,7 +194,11 @@ def _normalize_external_tool(intent: str, prompt: str, tool_name: str | None) ->
     if _looks_like_weather_request(prompt):
         return "weather"
 
+    if _looks_like_music_request(prompt):
+        return "music"
+
     return None
+
 
 _MEMORY_PATTERNS = [
     r"\b(remember|recall)\b.{0,30}\b(i|my|me)\b",

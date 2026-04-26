@@ -18,7 +18,15 @@ from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
 from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
-from memory import memory_store
+from memory import MemoryStore
+
+_memory_db_default = os.path.join(os.path.dirname(__file__), "memory.db")
+_chroma_default = os.path.join(os.path.dirname(__file__), "chroma")
+memory_store = MemoryStore(
+    db_path=os.getenv("MEMORY_DB_PATH", _memory_db_default),
+    chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
+)
+from auth import AuthService, AuthError
 import tools
 from tools.base import ToolResult
 
@@ -54,9 +62,14 @@ _CORS_CREDENTIALS: bool = _CORS_ORIGINS != ["*"]
 # (i.e. when Caddy is in use). Tells the browser to send the cookie only over
 # HTTPS connections. The backend itself may still run plain HTTP internally.
 SESSION_COOKIE_SECURE: bool = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
+AUTH_COOKIE_NAME: str = os.getenv("AUTH_COOKIE_NAME", "auth_token")
 
 _session_store_lock = Lock()
 _session_store: dict[str, dict] = {}
+
+# ── Auth service (shared singleton) ───────────────────────────────────────────
+_auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
+auth_service = AuthService(os.getenv("AUTH_DB_PATH", _auth_db_default))
 
 # ── Startup validation ─────────────────────────────────────────────────────────
 def _validate_startup() -> None:
@@ -77,6 +90,45 @@ def _validate_startup() -> None:
 
 _validate_startup()
 
+# ── Auth middleware ────────────────────────────────────────────────────────────
+# Resolves the bearer token (from Authorization header or auth_token cookie)
+# and attaches user_id to request.state.  Returns 401 for protected routes
+# that have no valid token.
+_UNPROTECTED_PATHS = frozenset(["/health", "/", "/transcribe", "/ws/wake"])
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        # Static files, auth endpoints, and health are always open.
+        if (
+            path in _UNPROTECTED_PATHS
+            or path.startswith("/static")
+            or path.startswith("/auth/")
+        ):
+            request.state.user_id = None
+            return await call_next(request)
+
+        token = _extract_bearer_token(request)
+        user_id = auth_service.verify_token(token) if token else None
+        request.state.user_id = user_id
+
+        if user_id is None:
+            return JSONResponse(
+                {"error": "Authentication required.", "code": "UNAUTHORIZED", "retryable": False},
+                status_code=401,
+            )
+        return await call_next(request)
+
+
+def _extract_bearer_token(request: Request) -> str | None:
+    """Return the raw token from Authorization header or auth_token cookie."""
+    auth_header = request.headers.get("authorization", "")
+    if auth_header.lower().startswith("bearer "):
+        return auth_header[7:].strip()
+    return request.cookies.get(AUTH_COOKIE_NAME)
+
+
 # ── Cross-Origin isolation headers (required for SharedArrayBuffer / vad-web) ──
 class COOPCOEPMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -91,6 +143,8 @@ class COOPCOEPMiddleware(BaseHTTPMiddleware):
 app = FastAPI()
 
 app.add_middleware(COOPCOEPMiddleware)
+# Auth middleware must be added after COOP/COEP so it runs on the resolved request.
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_CORS_ORIGINS,
@@ -429,6 +483,7 @@ async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[overr
 
 @app.post("/chat")
 async def chat(request: ChatRequest, http_request: Request):
+    user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, session_created = _get_or_create_session(cookie_session_id)
 
@@ -446,7 +501,7 @@ async def chat(request: ChatRequest, http_request: Request):
         summary_text=session_summary,
     )
 
-    memory_hits_all = memory_store.retrieve(request.message)
+    memory_hits_all = memory_store.retrieve(user_id, request.message)
 
     decision = await router_route(request.message)
     inject_memory = _should_inject_memory(decision.intent, memory_hits_all, request.message)
@@ -507,7 +562,7 @@ async def chat(request: ChatRequest, http_request: Request):
         if decision.tool:
             tool_result: ToolResult = await tools.dispatch(
                 decision.tool,
-                {"prompt": request.message, "memory": memory_store},
+                {"prompt": request.message, "user_id": user_id, "memory": memory_store},
             )
             log.info(
                 "chat.tool | session_id=%s tool=%s ok=%s retryable=%s",
@@ -551,7 +606,7 @@ async def chat(request: ChatRequest, http_request: Request):
             )
             _append_session_message(session_id, "user", request.message)
             _append_session_message(session_id, "assistant", assistant_accumulated.strip())
-            memory_store.ingest_user_message(request.message, source="chat")
+            memory_store.ingest_user_message(user_id, request.message, source="chat")
             return
         # ── End tool dispatch ─────────────────────────────────────────────────
 
@@ -613,6 +668,7 @@ async def chat(request: ChatRequest, http_request: Request):
         )
 
         memory_result = memory_store.ingest_user_message(
+            user_id,
             request.message,
             source="chat",
             previous_user_message=previous_user_message,
@@ -756,20 +812,23 @@ async def get_chat_session_messages(http_request: Request):
 
 
 @app.get("/memory")
-async def list_memory(limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0)):
-    return JSONResponse(memory_store.list_items(limit=limit, offset=offset))
+async def list_memory(http_request: Request, limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0)):
+    user_id: str = http_request.state.user_id
+    return JSONResponse(memory_store.list_items(user_id, limit=limit, offset=offset))
 
 
 @app.delete("/memory/{memory_id}")
-async def delete_memory(memory_id: str):
-    if not memory_store.delete_item(memory_id):
+async def delete_memory(memory_id: str, http_request: Request):
+    user_id: str = http_request.state.user_id
+    if not memory_store.delete_item(user_id, memory_id):
         return _error_response("Memory item not found", "MEMORY_NOT_FOUND", False, status_code=404)
     return JSONResponse({"ok": True, "id": memory_id})
 
 
 @app.delete("/memory")
-async def clear_memory():
-    counts = memory_store.clear_all()
+async def clear_memory(http_request: Request):
+    user_id: str = http_request.state.user_id
+    counts = memory_store.clear_all(user_id)
     return JSONResponse({"ok": True, "cleared": counts})
 
 
@@ -778,15 +837,17 @@ class WeatherRequest(BaseModel):
 
 
 @app.post("/weather")
-async def weather(request: WeatherRequest):
+async def weather(request: WeatherRequest, http_request: Request):
     """Direct weather endpoint.
 
     Returns the normalized weather data dict for the given location (or stored default).
     Suitable for frontend calls and future LangGraph tool nodes.
     """
+    user_id: str = http_request.state.user_id
     from tools import weather as weather_tool  # type: ignore[attr-defined]
     result = await weather_tool.run({
         "prompt": f"weather in {request.location}" if request.location else "",
+        "user_id": user_id,
         "memory": memory_store,
         "location": request.location,
     })
@@ -796,12 +857,193 @@ async def weather(request: WeatherRequest):
     return JSONResponse(result.data)
 
 
-@app.get("/health")
+# ── Music endpoints (Phase 8) ──────────────────────────────────────────────────
+
+class MusicSearchRequest(BaseModel):
+    query: str
+
+
+class MusicPlayRequest(BaseModel):
+    query: str | None = None
+    song_id: int | None = None
+    artist: str | None = None
+
+
+class MusicQueueRequest(BaseModel):
+    query: str | None = None
+    song_id: int | None = None
+
+
+class MusicControlRequest(BaseModel):
+    action: str  # pause | resume | next | stop
+
+
+async def _music_run(params: dict) -> JSONResponse:
+    """Shared dispatcher for music tool calls."""
+    from tools import dispatch
+    result = await dispatch("music", params)
+    if not result.ok:
+        status = 503 if result.retryable else 422
+        return _error_response(result.error, "MUSIC_ERROR", result.retryable, status_code=status)
+    return JSONResponse(result.data)
+
+
+@app.post("/music/search")
+async def music_search(request: MusicSearchRequest):
+    """Search the Strawberry library by title, artist, or album.
+
+    Returns a ranked list of matching tracks (LIKE query, ordered by playcount).
+    """
+    return await _music_run({"action": "search", "query": request.query, "prompt": request.query})
+
+
+@app.post("/music/play")
+async def music_play(request: MusicPlayRequest):
+    """Play a track immediately (clears current queue).
+
+    Accepts a free-text query, a direct song_id (rowid), or an artist name
+    for artist-radio mode.  Auto-picks the top-ranked match and logs confidence.
+    """
+    return await _music_run({
+        "action": "play",
+        "query": request.query,
+        "song_id": request.song_id,
+        "artist": request.artist,
+        "prompt": request.query or request.artist or "",
+    })
+
+
+@app.post("/music/queue")
+async def music_queue_add(request: MusicQueueRequest):
+    """Append a track to the current MPD queue without interrupting playback."""
+    return await _music_run({
+        "action": "queue",
+        "query": request.query,
+        "song_id": request.song_id,
+        "prompt": request.query or "",
+    })
+
+
+@app.post("/music/control")
+async def music_control(request: MusicControlRequest):
+    """Send a playback control command: pause | resume | next | stop."""
+    if request.action not in ("pause", "resume", "next", "stop"):
+        return _error_response(
+            f"Unknown action '{request.action}'. Use: pause, resume, next, stop.",
+            "MUSIC_INVALID_ACTION",
+            False,
+            status_code=400,
+        )
+    return await _music_run({"action": "control", "control": request.action, "prompt": ""})
+
+
+@app.get("/music/now_playing")
+async def music_now_playing():
+    """Return current MPD playback state and track metadata."""
+    return await _music_run({"action": "now_playing", "prompt": ""})
+
+
+@app.get("/music/queue")
+async def music_queue_view():
+    """Return the current MPD playlist."""
+    return await _music_run({"action": "queue_view", "prompt": ""})
+
+
+
 async def health():
     return {"status": "ok"}
 
 
-# ── Wake-word WebSocket ────────────────────────────────────────────────────────
+# ── Auth endpoints ─────────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
+    username: str
+    password: str
+    device_name: str | None = None
+    persistent: bool = False
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+    device_name: str | None = None
+    persistent: bool = False
+
+
+def _auth_cookie(response: Response, token: str, expires_at: float) -> None:
+    """Set the auth token as an HttpOnly cookie alongside the JSON body."""
+    max_age = max(0, int(expires_at - time.time()))
+    response.set_cookie(
+        key=AUTH_COOKIE_NAME,
+        value=token,
+        httponly=True,
+        samesite="lax",
+        secure=SESSION_COOKIE_SECURE,
+        max_age=max_age,
+    )
+
+
+@app.post("/auth/register")
+async def auth_register(payload: RegisterRequest):
+    try:
+        result = auth_service.register(
+            payload.username,
+            payload.password,
+            device_name=payload.device_name,
+            persistent=payload.persistent,
+        )
+    except AuthError as exc:
+        return _error_response(str(exc), exc.code, False, status_code=exc.status)
+    response = JSONResponse(result, status_code=201)
+    _auth_cookie(response, result["token"], result["expires_at"])
+    return response
+
+
+@app.post("/auth/login")
+async def auth_login(payload: LoginRequest):
+    try:
+        result = auth_service.login(
+            payload.username,
+            payload.password,
+            device_name=payload.device_name,
+            persistent=payload.persistent,
+        )
+    except AuthError as exc:
+        return _error_response(str(exc), exc.code, False, status_code=exc.status)
+    response = JSONResponse(result)
+    _auth_cookie(response, result["token"], result["expires_at"])
+    return response
+
+
+@app.post("/auth/logout")
+async def auth_logout(http_request: Request):
+    token = _extract_bearer_token(http_request)
+    if token:
+        auth_service.revoke_token(token)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(AUTH_COOKIE_NAME)
+    return response
+
+
+@app.post("/auth/logout/all")
+async def auth_logout_all(http_request: Request):
+    user_id: str = http_request.state.user_id
+    count = auth_service.revoke_all_tokens(user_id)
+    response = JSONResponse({"ok": True, "revoked": count})
+    response.delete_cookie(AUTH_COOKIE_NAME)
+    return response
+
+
+@app.get("/auth/me")
+async def auth_me(http_request: Request):
+    user_id: str = http_request.state.user_id
+    info = auth_service.get_user(user_id)
+    if not info:
+        return _error_response("User not found.", "USER_NOT_FOUND", False, status_code=404)
+    return JSONResponse(info)
+
+
+
 # Browser sends raw binary frames: 1280 int16 samples (80ms @ 16kHz).
 # Server replies with {"event": "wake"} when the wake word is detected.
 @app.websocket("/ws/wake")

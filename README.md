@@ -327,4 +327,6 @@ Safety behavior:
 - [faster-whisper](https://github.com/guillaumekln/faster-whisper) for efficient speech-to-text processing.
 - [sqlite3](https://www.sqlite.org/index.html) and [ChromaDB](https://www.trychroma.com/) for a powerful hybrid memory solution.
 - [openmeteo](https://open-meteo.com/) for free weather data with a simple API.
+- [strawberry music player](https://www.strawberrymusicplayer.org/) for local music management and playback via MPD.
+
 

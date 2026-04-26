@@ -9,8 +9,41 @@
   <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="/auth.js" type="module"></script>
 </head>
 <body>
+  <!-- Login overlay — shown before auth is established -->
+  <div id="login-overlay" style="display:none">
+    <div id="login-card">
+      <h2>Assistant</h2>
+      <div id="login-tabs">
+        <button id="tab-login" class="tab-btn active">Sign in</button>
+        <button id="tab-register" class="tab-btn">Register</button>
+      </div>
+
+      <form id="login-form">
+        <input id="login-username" type="text" placeholder="Username" autocomplete="username" required />
+        <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" required />
+        <label class="checkbox-row">
+          <input id="login-persistent" type="checkbox" />
+          Stay signed in for 30 days
+        </label>
+        <button type="submit" class="primary-btn">Sign in</button>
+      </form>
+
+      <form id="register-form" style="display:none">
+        <input id="reg-username" type="text" placeholder="Choose a username" autocomplete="username" required />
+        <input id="reg-password" type="password" placeholder="Choose a password (8+ chars)" autocomplete="new-password" required />
+        <label class="checkbox-row">
+          <input id="reg-persistent" type="checkbox" />
+          Stay signed in for 30 days
+        </label>
+        <button type="submit" class="primary-btn">Create account</button>
+      </form>
+
+      <p id="login-error" class="form-error"></p>
+    </div>
+  </div>
   <header>
     <button id="sidebar-toggle-btn" title="Toggle sidebar" aria-label="Toggle sidebar" aria-expanded="false">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
@@ -27,6 +60,8 @@
     </svg>
     <h1>Assistant</h1>
     <span id="voice-status"></span>
+    <span id="auth-username" title="Logged-in user" style="font-size:0.85rem;opacity:0.7;margin-left:auto;"></span>
+    <button id="logout-btn" title="Sign out" style="margin-left:0.5rem;">Sign out</button>
     <button id="new-chat-btn" title="Start a fresh chat session">New Chat</button>
     <button id="mic-btn" title="Toggle voice (say &quot;Computer,&quot; to activate)">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
@@ -55,6 +90,23 @@
           <button id="memory-clear-btn" class="panel-btn danger" title="Clear all memory">Clear</button>
         </div>
         <div id="memory-list" class="list"></div>
+      </section>
+
+      <!-- Music panel (Phase 8): now-playing + queue -->
+      <section class="panel" id="music-panel">
+        <div class="panel-header">
+          <h2>Music</h2>
+          <div class="music-controls" id="music-controls">
+            <button id="music-prev-btn" class="panel-btn" title="Previous / Restart">&#9664;&#9664;</button>
+            <button id="music-play-pause-btn" class="panel-btn" title="Play / Pause">&#9654;</button>
+            <button id="music-next-btn" class="panel-btn" title="Next track">&#9654;&#9654;</button>
+            <button id="music-stop-btn" class="panel-btn" title="Stop">&#9632;</button>
+          </div>
+        </div>
+        <div id="now-playing-bar">
+          <span id="now-playing-label" class="now-playing-idle">Nothing playing</span>
+        </div>
+        <div id="queue-list" class="list"></div>
       </section>
     </aside>
 

@@ -247,7 +247,7 @@
 
   async function refreshSessions() {
     try {
-      const resp = await fetch('/chat/sessions', { credentials: 'same-origin' });
+      const resp = await (window.apiFetch || fetch)('/chat/sessions', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       currentSessionId = data.current_session_id || currentSessionId;
@@ -259,7 +259,7 @@
 
   async function refreshMemory() {
     try {
-      const resp = await fetch('/memory?limit=200&offset=0', { credentials: 'same-origin' });
+      const resp = await (window.apiFetch || fetch)('/memory?limit=200&offset=0', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       renderMemory(data.items || []);
@@ -268,10 +268,90 @@
     }
   }
 
+  // ── Music panel (Phase 8) ────────────────────────────────────────────────────
+
+  function _esc(str) {
+    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  }
+
+  async function refreshNowPlaying() {
+    const label = document.getElementById('now-playing-label');
+    const btn = document.getElementById('music-play-pause-btn');
+    if (!label) return;
+    try {
+      const resp = await (window.apiFetch || fetch)('/music/now_playing', { credentials: 'same-origin' });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      if (data.track && data.state !== 'stop') {
+        const t = data.track;
+        const parts = [t.title, t.artist].filter(Boolean);
+        label.textContent = parts.join(' — ');
+        label.classList.remove('now-playing-idle');
+        if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
+      } else {
+        label.textContent = 'Nothing playing';
+        label.classList.add('now-playing-idle');
+        if (btn) btn.textContent = '▶';
+      }
+    } catch {
+      // non-fatal — MPD may not be running
+    }
+  }
+
+  async function refreshQueue() {
+    const list = document.getElementById('queue-list');
+    if (!list) return;
+    try {
+      const resp = await (window.apiFetch || fetch)('/music/queue', { credentials: 'same-origin' });
+      if (!resp.ok) return;
+      const data = await resp.json();
+      const items = data.queue || [];
+      if (!items.length) {
+        list.innerHTML = '<div class="list-item" style="color:var(--text-muted);font-style:italic;font-size:0.75rem">Queue empty</div>';
+        return;
+      }
+      list.innerHTML = items.map(item => {
+        const label = [item.title, item.artist].filter(Boolean).join(' — ') || 'Unknown track';
+        return `<div class="list-item"><span class="list-item-title">${_esc(label)}</span></div>`;
+      }).join('');
+    } catch {
+      // non-fatal
+    }
+  }
+
+  async function musicControl(action) {
+    try {
+      await (window.apiFetch || fetch)('/music/control', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ action }),
+      });
+      // Brief delay so MPD state settles before polling.
+      setTimeout(() => { refreshNowPlaying(); refreshQueue(); }, 400);
+    } catch {
+      // non-fatal
+    }
+  }
+
+  // Wire music control buttons.
+  (function _bindMusicControls() {
+    const pp = document.getElementById('music-play-pause-btn');
+    const next = document.getElementById('music-next-btn');
+    const stop = document.getElementById('music-stop-btn');
+    if (pp) pp.addEventListener('click', async () => {
+      // Toggle based on current label (▶ = resume, ⏸ = pause).
+      const action = pp.textContent.trim() === '⏸' ? 'pause' : 'resume';
+      await musicControl(action);
+    });
+    if (next) next.addEventListener('click', () => musicControl('next'));
+    if (stop) stop.addEventListener('click', () => musicControl('stop'));
+  })();
+
   async function loadCurrentSessionMessages() {
     resetMessagesView();
     try {
-      const resp = await fetch('/chat/session/messages', { credentials: 'same-origin' });
+      const resp = await (window.apiFetch || fetch)('/chat/session/messages', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       currentSessionId = data.session_id || currentSessionId;
@@ -289,7 +369,7 @@
     setLocked(true);
     closeSidebar();
     try {
-      const resp = await fetch('/chat/session/select', {
+      const resp = await (window.apiFetch || fetch)('/chat/session/select', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
@@ -309,7 +389,7 @@
 
   async function deleteMemory(id) {
     try {
-      const resp = await fetch(`/memory/${encodeURIComponent(id)}`, {
+      const resp = await (window.apiFetch || fetch)(`/memory/${encodeURIComponent(id)}`, {
         method: 'DELETE',
         credentials: 'same-origin',
       });
@@ -323,7 +403,7 @@
   async function deleteSession(sessionId) {
     try {
       closeSidebar();
-      const resp = await fetch(`/chat/sessions/${encodeURIComponent(sessionId)}`, {
+      const resp = await (window.apiFetch || fetch)(`/chat/sessions/${encodeURIComponent(sessionId)}`, {
         method: 'DELETE',
         credentials: 'same-origin',
       });
@@ -343,7 +423,7 @@
     if (!confirm('Clear all saved memory?')) return;
     closeSidebar();
     try {
-      const resp = await fetch('/memory', {
+      const resp = await (window.apiFetch || fetch)('/memory', {
         method: 'DELETE',
         credentials: 'same-origin',
       });
@@ -373,7 +453,7 @@
     let accumulated = '';
 
     try {
-      const resp = await fetch('/chat', {
+      const resp = await (window.apiFetch || fetch)('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
@@ -440,14 +520,14 @@
       input.focus();
       await refreshSessions();
       await refreshMemory();
+      refreshNowPlaying();
+      refreshQueue();
     }
   }
-
-  async function startNewChat() {
     setLocked(true);
     closeSidebar();
     try {
-      const resp = await fetch('/chat/session/new', {
+      const resp = await (window.apiFetch || fetch)('/chat/session/new', {
         method: 'POST',
         credentials: 'same-origin',
       });
@@ -467,6 +547,10 @@
   async function bootstrap() {
     await Promise.all([refreshSessions(), refreshMemory()]);
     await loadCurrentSessionMessages();
+    refreshNowPlaying();
+    refreshQueue();
+    // Poll now-playing every 10 s to keep the sidebar in sync.
+    setInterval(() => { refreshNowPlaying(); }, 10_000);
   }
 
   void bootstrap();

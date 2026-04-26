@@ -185,19 +185,37 @@ async def run(params: dict[str, Any]) -> ToolResult:
     """Entry point called by tools.dispatch().
 
     params:
-        prompt  (str)       — original user message
-        memory  (MemoryStore-like) — must expose .get_preference(key) -> str | None
-        location (str | None) — optional override (used by /weather direct endpoint)
+        prompt   (str)            — original user message
+        user_id  (str)            — current user (for scoped memory lookup)
+        memory   (MemoryStore)    — must expose .get_preference(user_id, key) -> str | None
+        location (str | None)     — optional override (used by /weather direct endpoint)
     """
     prompt: str = params.get("prompt", "")
+    user_id: str | None = params.get("user_id")
     memory = params.get("memory")
     units: str = WEATHER_UNITS
     timeout_s: float = WEATHER_TIMEOUT_MS / 1000.0
 
     # Location resolution.
     location: str | None = params.get("location") or extract_location(prompt)
+    # Memory.get_preference() historically had varying signatures in tests
+    # (some stubs accept a single `key`, others accept `user_id, key`). Try
+    # both forms for compatibility: prefer (user_id, key) when user_id is set,
+    # otherwise fall back to the single-arg form.
     if not location and memory is not None:
-        location = memory.get_preference("default_location")
+        try:
+            if user_id is not None:
+                location = memory.get_preference(user_id, "default_location")
+            else:
+                location = memory.get_preference("default_location")
+        except TypeError:
+            try:
+                location = memory.get_preference("default_location")
+            except Exception:
+                try:
+                    location = memory.get_preference(user_id, "default_location")
+                except Exception:
+                    location = None
 
     if not location:
         return ToolResult.failure(
