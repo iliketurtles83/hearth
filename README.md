@@ -1,5 +1,7 @@
 # Local AI Assistant
 
+version: 6
+
 Local-first personal AI assistant with streaming chat, wake-word voice input, hybrid memory (SQLite + Chroma), and model routing between local Ollama and optional Anthropic fallback. HTTPS is served on the LAN via a Caddy reverse proxy so all clients — including Android and iOS — can access secure-context browser APIs (microphone, AudioWorklet, etc.).
 
 ## Stack
@@ -317,3 +319,12 @@ Safety behavior:
 - Keep API keys in environment variables only
 - Frontend uses relative API paths and is served by backend static mount
 - File/path safety constraints are enforced in backend features as implemented
+
+## Shoutouts
+
+- [Ollama](https://ollama.com/) for making local LLM hosting accessible and performant.
+- [Caddy](https://caddyserver.com/) for seamless HTTPS on the LAN.
+- [faster-whisper](https://github.com/guillaumekln/faster-whisper) for efficient speech-to-text processing.
+- [sqlite3](https://www.sqlite.org/index.html) and [ChromaDB](https://www.trychroma.com/) for a powerful hybrid memory solution.
+- [openmeteo](https://open-meteo.com/) for free weather data with a simple API.
+

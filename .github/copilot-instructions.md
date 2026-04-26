@@ -56,36 +56,6 @@ from the phase before it.
 
 ---
 
-### Phase 0b — HTTPS on LAN (Caddy)
-**Status: complete**
-**Estimate: 0.5 days**
-**Depends on: Phase 1**
-
-Goal: Terminate HTTPS on the LAN so that all clients — including Android and iOS —
-can access microphone and other secure-context browser APIs. This also unblocks
-several tightening browser API restrictions (AudioWorklet, WebAuthn, etc.) and
-should be done before any further mobile work.
-
-Tasks — all complete:
-- ✅ Add a `caddy` service to `docker-compose.yml` that reverse-proxies to FastAPI on
-  port 8000 and terminates TLS.
-- ✅ Use a self-signed certificate for LAN use, or mkcert for a locally-trusted CA.
-  Document the one-time mkcert install step clearly in the README.
-- ✅ All internal services continue to communicate over plain HTTP inside Docker.
-  Only the edge (Caddy → LAN client) is HTTPS.
-- ✅ Update all documentation, README, and example URLs from `http://` to `https://`.
-- ✅ CORS policy: restrict to the Caddy origin once HTTPS is stable; remove the
-  permissive dev-time CORS rule.
-
-Acceptance:
-- ✅ `https://<LAN-IP>` loads the UI from a phone or tablet without certificate errors
-  (after mkcert CA install on client devices).
-- ✅ `navigator.mediaDevices` is defined and microphone permission works on Android/iOS.
-- ✅ Wake-word WebSocket connects over `wss://` without issues.
-- ✅ Phase 2 Android voice item is unblocked and closed.
-
----
-
 ### Phase 1 — Stabilize LAN access and single-origin serving
 **Status: complete**
 **Estimate: 1–2 days**
@@ -166,7 +136,37 @@ Acceptance:
 
 ---
 
-### Phase 3 — Chat context management
+### Phase 3 — HTTPS on LAN (Caddy)
+**Status: complete**
+**Estimate: 0.5 days**
+**Depends on: Phase 1**
+
+Goal: Terminate HTTPS on the LAN so that all clients — including Android and iOS —
+can access microphone and other secure-context browser APIs. This also unblocks
+several tightening browser API restrictions (AudioWorklet, WebAuthn, etc.) and
+should be done before any further mobile work.
+
+Tasks — all complete:
+- ✅ Add a `caddy` service to `docker-compose.yml` that reverse-proxies to FastAPI on
+  port 8000 and terminates TLS.
+- ✅ Use a self-signed certificate for LAN use, or mkcert for a locally-trusted CA.
+  Document the one-time mkcert install step clearly in the README.
+- ✅ All internal services continue to communicate over plain HTTP inside Docker.
+  Only the edge (Caddy → LAN client) is HTTPS.
+- ✅ Update all documentation, README, and example URLs from `http://` to `https://`.
+- ✅ CORS policy: restrict to the Caddy origin once HTTPS is stable; remove the
+  permissive dev-time CORS rule.
+
+Acceptance:
+- ✅ `https://<LAN-IP>` loads the UI from a phone or tablet without certificate errors
+  (after mkcert CA install on client devices).
+- ✅ `navigator.mediaDevices` is defined and microphone permission works on Android/iOS.
+- ✅ Wake-word WebSocket connects over `wss://` without issues.
+- ✅ Phase 2 Android voice item is unblocked and closed.
+
+---
+
+### Phase 4 — Chat context management
 **Status: complete**
 **Estimate: 1–2 days**
 **Depends on: Phase 1**
@@ -195,10 +195,10 @@ Acceptance:
 
 ---
 
-### Phase 4 — Inner-monologue routing (replaces keyword intent classifier)
+### Phase 5 — Inner-monologue routing (replaces keyword intent classifier)
 **Status: complete**
 **Estimate: 1–2 days**
-**Depends on: Phases 1, 3**
+**Depends on: Phases 1, 4**
 
 Goal: Replace single-step intent classification with a brief inner-monologue
 reasoning pass before routing. The model thinks out loud about what the user
@@ -238,7 +238,7 @@ Intent categories (produced by monologue, not hardcoded):
 Tasks:
 - ✅ Replace keyword heuristics in `router.py` with a lightweight intent classifier
   (prompt-based using the local model itself).
-- ✅ Add a confidence threshold: if local model confidence is below threshold,
+- ✅ Add a confidence: if local model confidence is below threshold,
   escalate to cloud.
 - ✅ Upgrade classifier to a full inner-monologue reasoning pass that outputs a
   structured routing JSON rather than a single intent label.
@@ -259,10 +259,10 @@ Acceptance:
 
 ---
 
-### Phase 5 — SQLite memory layer
+### Phase 6 — SQLite memory layer
 **Status: complete**
 **Estimate: 2–3 days**
-**Depends on: Phase 4**
+**Depends on: Phase 5**
 
 Goal: Assistant remembers user preferences and relevant facts across restarts.
 This is the foundation for personalization, weather defaults, music preferences,
@@ -311,10 +311,10 @@ Acceptance:
 
 ---
 
-### Phase 6 — Weather tool
+### Phase 7 — Weather tool
 **Status: complete**
 **Estimate: 1 day**
-**Depends on: Phase 5**
+**Depends on: Phase 6**
 
 Goal: First external tool integration. Validates the tool-routing architecture
 cleanly before adding more complex tools.
@@ -346,30 +346,37 @@ Acceptance:
 
 ---
 
-### Phase 7 — Local music library playback
+### Phase 8 — Local music library playback
 **Estimate: 3–5 days**
-**Depends on: Phases 2, 5**
+**Depends on: Phases 2, 6**
 
-Goal: Search and play music from a local collection by voice or text.
+Goal: Provide backend music search and playback integration using MPD and the
+Strawberry music database, exposing HTTP endpoints and voice and text commands
+so users can search, queue, and control playback from the UI or via voice.
 
 Tasks:
-- Build a media indexer that scans configured folders and stores metadata in
-  SQLite (title, artist, album, path, duration, genre).
-- Add endpoints: search, play, pause, stop, next, queue, now-playing.
-- Decide playback architecture early:
-  - Browser playback — works for same-device sessions, simpler.
-  - Backend audio daemon (e.g. MPD) — works for always-on host audio, more complex.
-- Add confirmation patterns: "Playing <track> by <artist>".
-- Add ambiguity resolution: if query matches multiple tracks, ask to clarify.
+- Add MPD as a Docker Compose service with your music folder mounted.
+- Open Strawberry DB as read-only SQLite in the backend (STRAWBERRY_DB_PATH env var).
+- Implement search against Strawberry songs table — full-text on title/artist/album, with fallback to songs_fts (Strawberry already maintains an FTS index).
+- Implement python-musicpd client wrapper in backend/tools/music.py — play(url), pause(), resume(), stop(), next(), queue(url), now_playing().
+- Queue model: single song, multi-song, named playlist
+- Add path rewrite config for Docker path differences.
+- Wire ambiguity resolution (multiple matches → ask to clarify) through the existing confirmation pattern.
 
 Acceptance:
-- "Play <song or artist>" works end to end by voice and text.
-- Pause, resume, next, and status commands work.
-- Ambiguous matches prompt clarification rather than picking silently.
+- **Endpoints:** `POST /music/search`, `POST /music/play`, `POST /music/queue`, and `POST /music/control` are implemented and return standardized responses.
+- **Search quality:** `/music/search` returns ranked results from Strawberry's `songs` table (FTS fallback to `songs_fts`) for title/artist/album queries.
+- **Queue model:** Supports single song, multi-song, and named playlists.
+- **Playback controls:** `/music/play` starts playback via MPD; `/music/queue` appends tracks; `/music/control` supports `pause`, `resume`, `next`, and `stop`; `/music/now_playing` returns current track.
+- **Voice & UI:** "Play <song or artist>" works end-to-end via voice or text and updates the frontend player state.
+- **Ambiguity resolution:** Multiple matches trigger the existing confirmation flow (clarify before playing).
+- **Docker & config:** MPD runs as a Docker Compose service with the music folder mounted, and `STRAWBERRY_DB_PATH` is respected by the backend.
+- **Path rewrite:** Container/host path rewrite is handled so stored track paths play correctly from the container.
+- **Errors:** All music endpoints return the standardized error shape (`error`, `code`, `retryable`) on failures.
 
 ---
 
-### Phase 8 — TNG-style voice output (TTS)
+### Phase 9 — TNG-style voice output (TTS)
 **Estimate: 2–4 days**
 **Depends on: Phases 2, 4 (and ideally Phase 6 for tool response parity)**
 
@@ -403,7 +410,7 @@ Acceptance:
 
 ---
 
-### Phase 9 — LangGraph orchestration
+### Phase 10 — LangGraph orchestration
 **Estimate: 1–2 weeks**
 **Depends on: all prior phases**
 
@@ -412,7 +419,7 @@ inner-monologue planning, memory retrieval, tool dispatch, and response generati
 Enables multi-step reasoning, tool chaining, and durable session continuity.
 
 The graph architecture is the foundation for all subsequent intelligence phases
-(9.5 personality, 9.6 tiered memory, 11 sub-agents). Design the state shape and
+(11 personality, 12 tiered memory, 13 sub-agents). Design the state shape and
 node interfaces carefully — retrofitting them later is expensive.
 
 Graph nodes:
@@ -474,9 +481,9 @@ Acceptance:
 
 ---
 
-### Phase 9.5 — Personality and affect layer
+### Phase 11 — Personality and affect layer
 **Estimate: 1–2 weeks**
-**Depends on: Phase 9**
+**Depends on: Phase 10**
 
 Goal: Implement the "best of human qualities" vision — perception of user affect,
 consistent personality, warmth, and intuition — as a bounded layer in the graph
@@ -549,9 +556,9 @@ Acceptance:
 
 ---
 
-### Phase 9.6 — Tiered memory and automatic consolidation
+### Phase 12 — Tiered memory and automatic consolidation
 **Estimate: 1–2 weeks**
-**Depends on: Phase 9**
+**Depends on: Phase 11**
 
 Goal: Upgrade the flat SQLite memory layer to a three-tier memory architecture
 that automatically promotes important information from ephemeral session context
@@ -611,9 +618,9 @@ Acceptance:
 
 ---
 
-### Phase 10 — Local code assistant on LangGraph
+### Phase 13 — Local code assistant on LangGraph
 **Estimate: 1–2 weeks**
-**Depends on: Phase 9**
+**Depends on: Phase 12**
 
 Goal: Add a dedicated code assistant node to the LangGraph flow so code tasks use
 the local coder model with project context, explicit write confirmation, and
@@ -666,9 +673,9 @@ Acceptance:
 
 ---
 
-### Phase 11 — Sub-agent architecture
+### Phase 14 — Sub-agent architecture
 **Estimate: 2–4 weeks**
-**Depends on: Phase 10**
+**Depends on: Phase 13**
 
 Goal: For complex multi-step tasks, the assistant spawns specialist sub-agents
 rather than handling everything in a single monolithic response. This enables
