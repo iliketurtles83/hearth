@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
@@ -101,10 +101,36 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         # Static files, auth endpoints, and health are always open.
+        # Static files are mounted at the application root ("/") so requests
+        # like /message.js or /auth.js must be exempt from auth checks. Use
+        # an extension whitelist to detect common static asset requests.
+        _, ext = os.path.splitext(path)
+        static_exts = {
+            ".js",
+            ".mjs",
+            ".css",
+            ".map",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".svg",
+            ".ico",
+            ".wasm",
+            ".woff2",
+            ".woff",
+            ".ttf",
+            ".mp3",
+            ".wav",
+        }
+
+        # Allow unauthenticated access to a small set of endpoints and static files.
+        # NOTE: do NOT globally exempt the `/auth/` prefix — endpoints like
+        # `/auth/me` must remain protected so they can validate bearer tokens.
         if (
             path in _UNPROTECTED_PATHS
             or path.startswith("/static")
-            or path.startswith("/auth/")
+            or path in ("/auth/login", "/auth/register")
+            or (ext and ext.lower() in static_exts)
         ):
             request.state.user_id = None
             return await call_next(request)
@@ -235,21 +261,27 @@ def _evict_oldest_sessions_if_needed() -> None:
     log.info("chat.session.evicted_capacity | count=%d", overflow)
 
 
-def _get_or_create_session(session_id: str | None) -> tuple[str, bool]:
+def _session_owned_by(session: dict | None, user_id: str) -> bool:
+    return bool(session) and str(session.get("user_id") or "") == user_id
+
+
+def _get_or_create_session(user_id: str, session_id: str | None) -> tuple[str, bool]:
     now = time.time()
     with _session_store_lock:
         _cleanup_expired_sessions(now)
-        effective_id = session_id if session_id and session_id in _session_store else str(uuid4())
+        existing_session = _session_store.get(session_id) if session_id else None
+        effective_id = session_id if session_id and _session_owned_by(existing_session, user_id) else str(uuid4())
         created = effective_id not in _session_store
         if created:
             _session_store[effective_id] = {
+                "user_id": user_id,
                 "messages": [],
                 "summary": "",
                 "summary_message_count": 0,
                 "created_at": now,
                 "updated_at": now,
             }
-            log.info("chat.session.created | session_id=%s", effective_id)
+            log.info("chat.session.created | session_id=%s user_id=%s", effective_id, user_id)
         else:
             _session_store[effective_id]["updated_at"] = now
         _evict_oldest_sessions_if_needed()
@@ -431,9 +463,17 @@ def _session_preview_text(messages: list[dict]) -> str:
     return ""
 
 
-def _list_sessions() -> list[dict]:
+def _list_sessions(user_id: str) -> list[dict]:
     with _session_store_lock:
-        ordered = sorted(_session_store.items(), key=lambda item: item[1]["updated_at"], reverse=True)
+        ordered = sorted(
+            (
+                (sid, data)
+                for sid, data in _session_store.items()
+                if _session_owned_by(data, user_id)
+            ),
+            key=lambda item: item[1]["updated_at"],
+            reverse=True,
+        )
         return [
             {
                 "session_id": sid,
@@ -481,11 +521,233 @@ async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[overr
         for text in stream.text_stream:
             yield text
 
+
+# ── Deterministic music pre-router ────────────────────────────────────────────
+# Maps control verbs to canonical MPD actions.
+_MUSIC_CTRL: dict[str, str] = {
+    "pause": "pause",
+    "stop": "stop",
+    "resume": "resume",
+    "continue": "resume",
+    "unpause": "resume",
+    "next": "next",
+    "skip": "next",
+}
+
+# Target phrases that are too vague to resolve without LLM help.
+_MUSIC_VAGUE: frozenset[str] = frozenset({
+    "something", "anything", "a song", "some songs", "any song",
+    "a track", "some tracks", "any track", "some music", "any music",
+    "a random song", "a random track", "a tune", "some tunes",
+})
+
+
+def _parse_music_command(prompt: str) -> dict | None:
+    """Deterministically parse a high-confidence music command.
+
+    Returns a params dict ready for ``tools.dispatch("music", ...)`` if the
+    prompt maps to a known music action with enough specificity.  Returns None
+    for anything ambiguous so it falls through to the normal LLM path.
+
+    High-confidence cases handled here (no LLM needed):
+      - Control commands: pause / stop / resume / next / skip
+      - Status queries: now-playing, queue view
+      - Explicit play/queue with a concrete target (title, artist, year/decade,
+        or "title by artist")
+
+    Deliberately NOT matched (→ LLM path):
+      - "play something chill", "play something like X"
+      - "play something" / "play anything" (too vague)
+      - Requests with no play/queue verb (no music intent confirmed)
+    """
+    pl = prompt.strip().lower().rstrip(".,!?")
+
+    # ── Control commands ──────────────────────────────────────────────────────
+    # Matches: "pause", "next track", "stop the music", "skip it", etc.
+    ctrl_m = re.match(
+        r"^(pause|stop|resume|continue|unpause|next|skip)"
+        r"(?:\s+(?:the\s+)?(?:music|song|track|playback|it))?$",
+        pl,
+    )
+    if ctrl_m:
+        action = _MUSIC_CTRL.get(ctrl_m.group(1))
+        if action:
+            return {"action": "control", "control": action}
+
+    # ── Now playing ───────────────────────────────────────────────────────────
+    if re.search(
+        r"\b(what'?s|what is)\s+(currently\s+)?(playing|on)\b"
+        r"|\bnow\s+playing\b|\bcurrent\s+(song|track)\b",
+        pl,
+    ):
+        return {"action": "now_playing"}
+
+    # ── Queue view ────────────────────────────────────────────────────────────
+    if re.search(
+        r"\b(what'?s|what is)\s+(in\s+)?(the\s+)?(queue|playlist)\b"
+        r"|\bshow\s+(me\s+)?(the\s+)?(queue|playlist)\b",
+        pl,
+    ):
+        return {"action": "queue_view"}
+
+    # ── Explicit play / queue verb required for all remaining cases ───────────
+    play_m = re.match(
+        r"^(play(?:back)?|queue|add\s+to\s+(?:the\s+)?queue|put\s+on)\s+(.+)$",
+        pl,
+    )
+    if not play_m:
+        return None  # No music verb → not a confident music command.
+
+    verb = play_m.group(1)
+    action = "queue" if re.match(r"queue|add\s+to", verb) else "play"
+    target = play_m.group(2).strip().strip(".,!?\"'")
+
+    # Reject generic / vague targets — these benefit from LLM interpretation.
+    if target in _MUSIC_VAGUE:
+        return None
+    if re.match(
+        r"^something\s+(like|similar\s+to|that\s+sounds?\s+like)",
+        target,
+        re.IGNORECASE,
+    ):
+        return None
+    if re.match(
+        r"^(something|anything)\s*(chill|relaxing|upbeat|heavy|fast|slow|random|good)?$",
+        target,
+        re.IGNORECASE,
+    ):
+        return None
+
+    # ── Decade: "80s", "80s rock", "some 90s music" ──────────────────────────
+    decade_m = re.match(r"^(?:some\s+)?(\d{2})s(?:\s+.*)?$", target, re.IGNORECASE)
+    if decade_m:
+        d = int(decade_m.group(1))
+        yr = (2000 + d) if d < 30 else (1900 + d)
+        return {"action": action, "year_range": (yr, yr + 9)}
+
+    # ── Exact year: "1994", "music from 2003" ────────────────────────────────
+    year_m = re.match(
+        r"^(?:(?:music|songs?|tracks?)\s+from\s+)?(\d{4})$", target, re.IGNORECASE
+    )
+    if year_m:
+        yr = int(year_m.group(1))
+        return {"action": action, "year_range": (yr, yr)}
+
+    # ── "title by artist" ─────────────────────────────────────────────────────
+    by_m = re.match(r"^(?P<title>.+?)\s+by\s+(?P<artist>.+)$", target, re.IGNORECASE)
+    if by_m:
+        title = by_m.group("title").strip().strip("\"'")
+        artist = by_m.group("artist").strip().strip("\"'")
+        if title.lower() in _MUSIC_VAGUE:
+            # "a song by Metallica" → artist radio
+            return {"action": action, "artist": artist}
+        return {"action": action, "query": title, "artist_filter": artist}
+
+    # ── "some/a/any [random] <artist> song/track" ─────────────────────────────
+    artist_song_m = re.match(
+        r"^(?:a|some|any)\s+(?:random\s+)?(?P<artist>.+?)\s+(?:song|track|music)s?$",
+        target,
+        re.IGNORECASE,
+    )
+    if artist_song_m:
+        return {"action": action, "artist": artist_song_m.group("artist").strip()}
+
+    # ── Bare query (title or artist name) ─────────────────────────────────────
+    return {"action": action, "query": target}
+
+
+def _format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:
+    """Format a music ToolResult as a brief plain-text sentence (no LLM needed)."""
+    if not tool_result.ok:
+        return tool_result.error or "Music command failed."
+
+    data = tool_result.data or {}
+    req_action = music_cmd.get("action", "")
+
+    if req_action in ("play", "queue"):
+        data_action = data.get("action", req_action)
+        track = data.get("track")
+        tracks = data.get("tracks")
+        verb = "Queued" if data_action == "queue" else "Now playing"
+        if tracks and len(tracks) > 1:
+            artist = tracks[0].get("artist", "unknown artist")
+            return f"{verb}: {len(tracks)} tracks by {artist}."
+        if track:
+            title = track.get("title", "unknown track")
+            artist = track.get("artist", "unknown artist")
+            return f'{verb}: "{title}" by {artist}.'
+        return "Playback started."
+
+    if req_action == "control":
+        ctrl = music_cmd.get("control", "")
+        return {
+            "pause": "Paused.",
+            "resume": "Resumed.",
+            "stop": "Stopped.",
+            "next": "Skipping to next track.",
+        }.get(ctrl, "Done.")
+
+    if req_action == "now_playing":
+        state = data.get("state", "stop")
+        track = data.get("track")
+        if state == "stop" or not track:
+            return "Nothing is playing."
+        title = track.get("title", "unknown")
+        artist = track.get("artist", "unknown")
+        verb = "Paused" if state == "pause" else "Now playing"
+        return f'{verb}: "{title}" by {artist}.'
+
+    if req_action == "queue_view":
+        queue = data.get("queue", [])
+        n = len(queue)
+        if n == 0:
+            return "The queue is empty."
+        items = ", ".join(
+            f'"{t.get("title", "?")}" by {t.get("artist", "?")}' for t in queue[:5]
+        )
+        suffix = f" +{n - 5} more" if n > 5 else ""
+        return f"Queue ({n} tracks): {items}{suffix}."
+
+    return "Done."
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id, session_created = _get_or_create_session(cookie_session_id)
+    session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
+
+    # ── Deterministic music fast-path ─────────────────────────────────────────
+    # Check before router_route() so clear music commands never touch the LLM.
+    music_cmd = _parse_music_command(request.message)
+    if music_cmd is not None:
+        music_cmd["prompt"] = request.message
+        music_cmd["user_id"] = user_id
+
+        async def generate_music():
+            yield f"data: {json.dumps({'model': 'music', 'intent': 'music', 'confidence': 1.0})}\n\n"
+            try:
+                tool_result: ToolResult = await tools.dispatch("music", music_cmd)
+            except Exception as exc:
+                log.error("chat.music_fast | session_id=%s error=%s", session_id, exc)
+                msg = f"⚠ Music command failed: {exc}"
+                yield f"data: {json.dumps({'text': msg})}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            log.info(
+                "chat.music_fast | session_id=%s action=%s ok=%s retryable=%s",
+                session_id, music_cmd.get("action"), tool_result.ok, tool_result.retryable,
+            )
+            response_text = _format_music_response(tool_result, music_cmd)
+            yield f"data: {json.dumps({'text': response_text})}\n\n"
+            _append_session_message(session_id, "user", request.message)
+            _append_session_message(session_id, "assistant", response_text)
+            yield "data: [DONE]\n\n"
+
+        fast_response = StreamingResponse(generate_music(), media_type="text/event-stream")
+        _set_session_cookie(fast_response, session_id)
+        return fast_response
+    # ── End music fast-path ───────────────────────────────────────────────────
 
     summary_updated, summary_message_count, summary_char_count = _update_session_summary_if_needed(session_id)
 
@@ -573,11 +835,17 @@ async def chat(request: ChatRequest, http_request: Request):
                 # normalized data dict into a natural-language response.
                 tool_data_str = json.dumps(tool_result.data, ensure_ascii=False)
                 summary_prompt = (
-                    f"You are a helpful assistant. Based on the following structured data, "
-                    f"write a concise, natural-language response to the user's request.\n"
+                    f"You are a system that reports tool execution results. "
+                    f"Based on the following structured data, write a concise response.\n"
                     f"User request: {request.message}\n"
                     f"Data: {tool_data_str}\n"
-                    f"Keep your response brief and include all relevant values with units."
+                    "Rules:\n"
+                    "- Do not ask follow-up questions.\n"
+                    "- Do not suggest alternatives.\n"
+                    "- If action is play/queue/control and tool succeeded, state what was done in one sentence.\n"
+                    "- Mention title/artist only from Data fields.\n"
+                    "- If data says nothing is playing, say that plainly.\n"
+                    "- Keep to 1-2 short sentences max."
                 )
                 summary_request = ChatRequest(message=summary_prompt, system=augmented_system)
                 try:
@@ -719,8 +987,9 @@ async def chat(request: ChatRequest, http_request: Request):
 
 @app.delete("/chat/session")
 async def reset_chat_session(http_request: Request):
+    user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id, created = _get_or_create_session(cookie_session_id)
+    session_id, created = _get_or_create_session(user_id, cookie_session_id)
     with _session_store_lock:
         session = _session_store.get(session_id, {"messages": [], "summary": "", "summary_message_count": 0})
         cleared_messages = len(session["messages"])
@@ -743,31 +1012,47 @@ async def reset_chat_session(http_request: Request):
 
 @app.get("/chat/sessions")
 async def list_chat_sessions(http_request: Request):
+    user_id: str = http_request.state.user_id
     current_session = http_request.cookies.get(SESSION_COOKIE_NAME)
-    return JSONResponse({"sessions": _list_sessions(), "current_session_id": current_session})
+    with _session_store_lock:
+        current_owned = _session_owned_by(_session_store.get(current_session), user_id) if current_session else False
+    return JSONResponse(
+        {
+            "sessions": _list_sessions(user_id),
+            "current_session_id": current_session if current_owned else None,
+        }
+    )
 
 
 @app.delete("/chat/sessions/{session_id}")
 async def delete_chat_session(session_id: str, http_request: Request):
+    user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     active_session_id: str | None = None
 
     with _session_store_lock:
-        if session_id not in _session_store:
+        session = _session_store.get(session_id)
+        if not _session_owned_by(session, user_id):
             return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
         del _session_store[session_id]
 
         # If the deleted session was active, prefer an existing remaining session.
-        if cookie_session_id == session_id and _session_store:
-            active_session_id = max(
-                _session_store.items(),
-                key=lambda item: item[1]["updated_at"],
-            )[0]
-    log.info("chat.session.deleted | session_id=%s", session_id)
+        if cookie_session_id == session_id:
+            owned_sessions = [
+                (sid, data)
+                for sid, data in _session_store.items()
+                if _session_owned_by(data, user_id)
+            ]
+            if owned_sessions:
+                active_session_id = max(
+                    owned_sessions,
+                    key=lambda item: item[1]["updated_at"],
+                )[0]
+    log.info("chat.session.deleted | session_id=%s user_id=%s", session_id, user_id)
 
     # If the deleted session was active and nothing remains, create a fresh session.
     if cookie_session_id == session_id and active_session_id is None:
-        active_session_id, _ = _get_or_create_session(None)
+        active_session_id, _ = _get_or_create_session(user_id, None)
 
     payload = {"ok": True, "session_id": session_id}
     if active_session_id:
@@ -780,17 +1065,19 @@ async def delete_chat_session(session_id: str, http_request: Request):
 
 
 @app.post("/chat/session/new")
-async def create_chat_session():
-    session_id, _ = _get_or_create_session(None)
+async def create_chat_session(http_request: Request):
+    user_id: str = http_request.state.user_id
+    session_id, _ = _get_or_create_session(user_id, None)
     response = JSONResponse({"ok": True, "session_id": session_id})
     _set_session_cookie(response, session_id)
     return response
 
 
 @app.post("/chat/session/select")
-async def select_chat_session(payload: SessionSelectRequest):
+async def select_chat_session(payload: SessionSelectRequest, http_request: Request):
+    user_id: str = http_request.state.user_id
     with _session_store_lock:
-        if payload.session_id not in _session_store:
+        if not _session_owned_by(_session_store.get(payload.session_id), user_id):
             return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
     response = JSONResponse({"ok": True, "session_id": payload.session_id})
     _set_session_cookie(response, payload.session_id)
@@ -799,8 +1086,9 @@ async def select_chat_session(payload: SessionSelectRequest):
 
 @app.get("/chat/session/messages")
 async def get_chat_session_messages(http_request: Request):
+    user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id, _ = _get_or_create_session(cookie_session_id)
+    session_id, _ = _get_or_create_session(user_id, cookie_session_id)
     with _session_store_lock:
         messages = list(_session_store.get(session_id, {}).get("messages", []))
     # Set the session cookie so the browser anchors to this session after every
@@ -875,7 +1163,8 @@ class MusicQueueRequest(BaseModel):
 
 
 class MusicControlRequest(BaseModel):
-    action: str  # pause | resume | next | stop
+    action: str  # pause | resume | next | stop | play_pos
+    pos: int | None = None  # required when action == "play_pos"
 
 
 async def _music_run(params: dict) -> JSONResponse:
@@ -926,15 +1215,20 @@ async def music_queue_add(request: MusicQueueRequest):
 
 @app.post("/music/control")
 async def music_control(request: MusicControlRequest):
-    """Send a playback control command: pause | resume | next | stop."""
-    if request.action not in ("pause", "resume", "next", "stop"):
+    """Send a playback control command: pause | resume | next | stop | play_pos."""
+    if request.action not in ("pause", "resume", "next", "stop", "play_pos"):
         return _error_response(
-            f"Unknown action '{request.action}'. Use: pause, resume, next, stop.",
+            f"Unknown action '{request.action}'. Use: pause, resume, next, stop, play_pos.",
             "MUSIC_INVALID_ACTION",
             False,
             status_code=400,
         )
-    return await _music_run({"action": "control", "control": request.action, "prompt": ""})
+    return await _music_run({
+        "action": "control",
+        "control": request.action,
+        "pos": request.pos,
+        "prompt": "",
+    })
 
 
 @app.get("/music/now_playing")
@@ -947,11 +1241,46 @@ async def music_now_playing():
 async def music_queue_view():
     """Return the current MPD playlist."""
     return await _music_run({"action": "queue_view", "prompt": ""})
-
-
-
+#
+#
+@app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.head("/health")
+async def health_head():
+    # Respond to HEAD probes (no body).
+    return Response(status_code=200)
+
+
+# Legacy asset routes (compatibility with clients requesting root-mounted files)
+@app.get("/style.css", include_in_schema=False)
+async def legacy_style():
+    return FileResponse(os.path.join(_frontend_dir, "style.css"))
+
+
+@app.get("/auth.js", include_in_schema=False)
+async def legacy_auth_js():
+    return FileResponse(os.path.join(_frontend_dir, "auth.js"))
+
+
+@app.get("/message.js", include_in_schema=False)
+async def legacy_message_js():
+    return FileResponse(os.path.join(_frontend_dir, "message.js"))
+
+
+@app.get("/voice.js", include_in_schema=False)
+async def legacy_voice_js():
+    return FileResponse(os.path.join(_frontend_dir, "voice.js"))
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def legacy_favicon():
+    path = os.path.join(_frontend_dir, "favicon.ico")
+    if os.path.exists(path):
+        return FileResponse(path)
+    return Response(status_code=404)
 
 
 # ── Auth endpoints ─────────────────────────────────────────────────────────────
@@ -1095,4 +1424,15 @@ async def transcribe(audio: UploadFile = File(...)):
 # ── Static frontend — MUST be last ────────────────────────────────────────────
 _frontend_dir = os.path.join(os.path.dirname(__file__), "..", "frontend")
 if os.path.isdir(_frontend_dir):
-    app.mount("/", StaticFiles(directory=_frontend_dir, html=True), name="static")
+    # Serve static assets under /static so API routes (e.g. /health) are
+    # not intercepted by the static files app which would return 404.
+    app.mount("/static", StaticFiles(directory=_frontend_dir), name="static")
+
+    # Serve the SPA entrypoint for root and unknown paths (client-side routing).
+    @app.get("/", include_in_schema=False)
+    async def _index():
+        return FileResponse(os.path.join(_frontend_dir, "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def _spa_catchall(full_path: str):
+        return FileResponse(os.path.join(_frontend_dir, "index.html"))

@@ -50,6 +50,16 @@ Main backend endpoints:
 - `DELETE /chat/session` (reset current session messages)
 - `DELETE /chat/sessions/{session_id}` (delete a specific session)
 
+Chat sessions are bounded and ephemeral: each authenticated user has their own in-memory session list, recent context is capped by turn/token budget, and older session history is compacted into a rolling summary for continuity.
+
+Music endpoints (Phase 8):
+- `POST /music/search` — search the Strawberry DB (title / artist / album)
+- `POST /music/play` — play a specific track or artist-radio
+- `POST /music/queue` — append tracks to MPD queue
+- `POST /music/control` — controls: `pause`, `resume`, `next`, `stop`
+- `GET /music/now_playing` — current track + playback state
+- `GET /music/queue` — queued tracks
+
 ## Project Layout
 
 ```text
@@ -180,6 +190,19 @@ MEMORY_TOP_N=5
 MEMORY_MIN_RELEVANCE_SCORE=0.28
 # MEMORY_DB_PATH=/app/memory.db
 # CHROMA_PATH=/app/chroma
+#
+# Music / MPD (Phase 8)
+# STRAWBERRY_DB_PATH=/home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry.db
+# MUSIC_PATH_HOST=/media/jack/buffer/audio
+# MUSIC_PATH_CONTAINER=/music
+# MPD_HOST=mpd
+# MPD_PORT=6600
+# MPD_TIMEOUT=5
+# MUSIC_SEARCH_LIMIT=20
+# MUSIC_ARTIST_RADIO_N=10
+# PULSE_SERVER=/run/user/1000/pulse/native
+# PUID=1000
+# PGID=1000
 
 # HTTPS / CORS policy (Phase 0b)
 # Set CORS_ORIGINS to the exact Caddy origin once HTTPS is in use.
@@ -233,6 +256,26 @@ If missing, run:
 bash scripts/download-models.sh
 ```
 
+## Music / MPD (Phase 8)
+
+- The backend now includes a local music tool that integrates Strawberry's
+  SQLite database with an MPD-based playback service (Phase 8).
+- Ensure `STRABERRY_DB_PATH` (or `STRABERRY_DB_PATH` in `.env`) points to your
+  Strawberry sqlite DB; for example:
+
+  /home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry.db
+
+- `MUSIC_PATH_HOST` should match the host path prefix contained in Strawberry's
+  `file:///...` URIs (so the backend can rewrite them into MPD-relative paths).
+- The MPD container commonly mounts `/config` (mpd.conf, mpd.db) and `/music`.
+- If your host uses PipeWire/ PulseAudio, mount the socket and set `PULSE_SERVER`
+  (e.g. `/run/user/1000/pulse/native`) so MPD can output audio from the container.
+
+Frontend behaviour:
+
+- The UI exposes a now-playing bar and queue that poll `GET /music/now_playing`
+  and `GET /music/queue`. Playback controls call `POST /music/control`.
+
 ## Local Development (Without Docker)
 
 ```bash
@@ -244,6 +287,22 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Then open `https://localhost` (via Caddy) or `http://localhost:8000` directly for backend-only dev. Note that microphone access requires a secure context — use the Caddy HTTPS path even for local dev if you need voice features.
+
+## Testing
+
+- Run the backend test suite inside the backend container:
+
+```bash
+docker compose exec -T backend pytest -q
+```
+
+- If you hit import errors like `ModuleNotFoundError: No module named 'tools.music'`, run tests from the application root so `tools` is discoverable:
+
+```bash
+docker compose exec -T backend sh -c 'cd /app && PYTHONPATH=/app python -m pytest -q'
+```
+
+- Current verified result (backend test run): `115 passed, 16 warnings`.
 
 ## Session Management (Phase 5)
 

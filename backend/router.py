@@ -446,6 +446,14 @@ async def route(prompt: str) -> RouteDecision:
         try:
             parsed = await _call_planner(prompt)
             decision = _decision_from_planner(parsed, prompt)
+            # Guardrail: if planner under-classifies obvious music commands,
+            # force tool dispatch so playback actions are executed deterministically.
+            if decision.tool is None and _looks_like_music_request(prompt):
+                decision.intent = "external-data-needed"
+                decision.tool = "music"
+                decision.use_cloud = False
+                decision.model = _pick_local_model(decision.intent)
+                decision.confidence = max(decision.confidence, 0.8)
             log.debug(
                 "router.planner | intent=%s route=%s tool=%s needs_memory=%s "
                 "confidence=%.3f reasoning=%s",

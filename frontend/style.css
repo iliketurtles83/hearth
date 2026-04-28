@@ -192,6 +192,7 @@ body {
 }
 
 
+header {
   padding: 0.9rem 1.5rem;
   border-bottom: 1px solid var(--border);
   background: var(--surface);

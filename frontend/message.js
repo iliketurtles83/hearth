@@ -13,6 +13,7 @@
 
   window.appUi = { messagesEl, messagesInner, input, sendBtn, newChatBtn };
   let currentSessionId = null;
+  let creatingNewSession = false;
 
   function isMobileLayout() {
     return window.matchMedia('(max-width: 900px)').matches;
@@ -312,20 +313,23 @@
       }
       list.innerHTML = items.map(item => {
         const label = [item.title, item.artist].filter(Boolean).join(' — ') || 'Unknown track';
-        return `<div class="list-item"><span class="list-item-title">${_esc(label)}</span></div>`;
+        return `<div class="list-item list-item-clickable" data-pos="${item.pos}" title="Play this track"><span class="list-item-title">${_esc(label)}</span></div>`;
       }).join('');
+      list.querySelectorAll('.list-item-clickable').forEach(el => {
+        el.addEventListener('click', () => musicControl('play_pos', { pos: parseInt(el.dataset.pos, 10) }));
+      });
     } catch {
       // non-fatal
     }
   }
 
-  async function musicControl(action) {
+  async function musicControl(action, extra = {}) {
     try {
       await (window.apiFetch || fetch)('/music/control', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ action }),
+        body: JSON.stringify({ action, ...extra }),
       });
       // Brief delay so MPD state settles before polling.
       setTimeout(() => { refreshNowPlaying(); refreshQueue(); }, 400);
@@ -524,33 +528,40 @@
       refreshQueue();
     }
   }
-    setLocked(true);
-    closeSidebar();
-    try {
-      const resp = await (window.apiFetch || fetch)('/chat/session/new', {
-        method: 'POST',
-        credentials: 'same-origin',
-      });
-      if (!resp.ok) throw new Error(`Server error: HTTP ${resp.status}`);
-      const data = await resp.json();
-      currentSessionId = data.session_id;
-      resetMessagesView();
-      await refreshSessions();
-    } catch (err) {
-      appendMessage('assistant', `⚠ Unable to create new chat session: ${err.message}`);
-    } finally {
-      setLocked(false);
-      input.focus();
+    async function startNewChat(event) {
+      event?.preventDefault?.();
+      event?.stopPropagation?.();
+      if (creatingNewSession) return;
+
+      creatingNewSession = true;
+      setLocked(true);
+      closeSidebar();
+      try {
+        const resp = await (window.apiFetch || fetch)('/chat/session/new', {
+          method: 'POST',
+          credentials: 'same-origin',
+        });
+        if (!resp.ok) throw new Error(`Server error: HTTP ${resp.status}`);
+        const data = await resp.json();
+        currentSessionId = data.session_id;
+        resetMessagesView();
+        await refreshSessions();
+      } catch (err) {
+        appendMessage('assistant', `⚠ Unable to create new chat session: ${err.message}`);
+      } finally {
+        creatingNewSession = false;
+        setLocked(false);
+        input.focus();
+      }
     }
-  }
 
   async function bootstrap() {
     await Promise.all([refreshSessions(), refreshMemory()]);
     await loadCurrentSessionMessages();
     refreshNowPlaying();
     refreshQueue();
-    // Poll now-playing every 10 s to keep the sidebar in sync.
-    setInterval(() => { refreshNowPlaying(); }, 10_000);
+    // Poll now-playing and queue every 10 s to keep the sidebar in sync.
+    setInterval(() => { refreshNowPlaying(); refreshQueue(); }, 10_000);
   }
 
   void bootstrap();

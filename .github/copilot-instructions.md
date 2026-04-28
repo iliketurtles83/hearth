@@ -2,7 +2,8 @@
 
 This project is a local-first personal AI assistant with voice activation, streaming chat,
 tool integrations, and optional cloud model fallback. It runs entirely on-device via Docker
-Compose and is designed to be reachable from all devices on the local network.
+Compose on a Linux machine with an NVIDIA RTX 3060 (12 GB VRAM) and is designed to be
+reachable from devices on the local network.
 
 Stack: FastAPI backend · Ollama (local LLM + local coder) · Anthropic API (cloud fallback) ·
 OpenWakeWord · faster-whisper · Piper TTS (pluggable — Kokoro is a viable swap) · SQLite ·
@@ -13,8 +14,8 @@ ChromaDB · LangGraph · Browser UI
 ## Architecture overview
 
 ```
-Browser / LAN client  (HTTPS via Caddy — Phase 0b)
-  └── https://<LAN-IP>                (single origin — FastAPI serves UI + API)
+Browser / LAN client
+  └── <single origin>                 (FastAPI serves UI + API; HTTPS edge when enabled)
         ├── GET  /                    static frontend (mounted into backend container)
         ├── POST /chat                streaming chat endpoint
         ├── POST /transcribe          audio → text via faster-whisper
@@ -34,11 +35,11 @@ FastAPI backend
   └── tts.py                          pluggable TTS engine (Piper → Kokoro swap-ready)
 
 Ollama (container)                    local model inference (GPU)
-  ├── <chat model>                    general assistant (e.g. mistral, llama3)
-  └── <coder model>                   code-specialized model (e.g. qwen2.5-coder)
+  ├── gemma3:4b                       general conversation, voice responses, persona anchor
+  └── qwen2.5-coder:7b                code-specialized model for all code intents
 Anthropic API (external)              cloud fallback for complex queries
 
-Caddy (container)                     HTTPS reverse proxy on LAN (Phase 0b)
+Reverse proxy / HTTPS edge            enabled when LAN/mobile deployment requires it
 ```
 
 **Serving rule:** frontend is always served from the FastAPI origin. Never run a
@@ -46,6 +47,45 @@ separate dev server in production. Mount `./frontend` into the backend container
 serve it as static files. All browser fetch/WebSocket calls use relative paths
 (`/chat`, `/ws/wake`, etc.) — no hardcoded `localhost` or port numbers anywhere in
 runtime code.
+
+## Current project context
+
+When this section conflicts with historical roadmap notes below, follow this section.
+
+- Phases 1–8 are complete.
+- Phase 8 includes the deterministic music pre-router (`_parse_music_command`) that bypasses the LLM for clear music commands, compound title+artist search, and year/decade range playback.
+- Phases 9–14 have not started yet.
+- Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
+
+## Model setup
+
+- `OLLAMA_CHAT_MODEL=gemma3:4b` for general conversation, voice responses, and persona anchoring.
+- `OLLAMA_CODER_MODEL=qwen2.5-coder:7b` for all code intents. Do not route code tasks to cloud by default.
+- Anthropic is fallback only when local confidence is low or the task exceeds local capability.
+- Both local models hot-swap inside one Ollama container. Simultaneous residency is not realistic on 12 GB VRAM, so routing and UX must account for swap latency.
+
+## Locked architecture decisions
+
+- The coding assistant lives inside the LangGraph graph as a `code_tool` node, not as a VS Code extension.
+- The code node uses a ReAct loop via LangGraph `create_react_agent`; do not implement code generation as a single-shot completion path.
+- Use prebuilt `langchain-community` tools for the code node: `ShellTool`, `ReadFileTool`, `WriteFileTool`, and `PythonREPLTool`.
+- Build codebase context with tree-sitter summaries, signatures, and import graphs stored in ChromaDB. Inject retrieved slices into coder prompts as `code_context`.
+- File writes require explicit confirmation before touching disk. For voice flows, summarize the planned write first, then wait for confirmation.
+- Enforce workspace-root boundaries for all file operations.
+- Ignore terminal-only Ollama launch wrappers such as Claude Code, Codex, OpenCode, Hermes, and OpenClaw for this project. They do not participate in wake-word, graph-state, or voice flows.
+
+## Target LangGraph shape
+
+```text
+input → intent_classifier → memory_retrieval → tool_router
+  ├── weather_tool
+  ├── music_tool
+  ├── code_tool        (ReAct loop, qwen2.5-coder:7b, langchain-community tools)
+  └── chat_fallback
+        └── responder → output
+```
+
+State shape for the graph should include: `messages`, `intent`, `memories`, `tool_result`, `user_prefs`, `session_id`, `active_files`, and `code_context`.
 
 ---
 
@@ -347,6 +387,7 @@ Acceptance:
 ---
 
 ### Phase 8 — Local music library playback
+**Status: complete**
 **Estimate: 3–5 days**
 **Depends on: Phases 2, 6**
 
@@ -372,22 +413,40 @@ Implementation notes (decisions made during review):
 - **Artist radio**: implemented in Phase 8 core as weighted-random by `playcount`,
   seeded for determinism. This is the Phase 8b fallback entry point — 8b calls
   `artist_radio()` directly when the rec engine is unavailable.
+- **Deterministic music pre-router**: `_parse_music_command()` in `main.py` fires
+  BEFORE `router_route()` in the `/chat` endpoint. High-confidence music commands
+  (control, now-playing, queue-view, explicit play/queue with concrete target) bypass
+  the LLM entirely — tool is dispatched directly and a one-sentence plain-text
+  response is formatted by `_format_music_response()` with zero LLM queries.
+  Vague/ambiguous requests ("play something chill", "play something like X") fall
+  through to the existing LLM path.
+- **Compound title+artist search**: `_sync_search_by_title_artist(title, artist)` uses
+  `title LIKE ? AND artist LIKE ?` for "play X by Y" commands — more precise than the
+  general LIKE search. Falls back to artist radio if no match.
+- **Year/decade search**: `_sync_search_by_year_range(year_start, year_end)` queries
+  the Strawberry `year` column. Parser handles "80s" → 1980–1989, "2003" → exact year.
+  Queues N random tracks from the pool, weighted-randomly by playcount.
 
-Tasks:
-- Add MPD as a Docker Compose service with music folder mounted.
-- Mount Strawberry DB directory read-only into backend container; set `STRAWBERRY_DB_PATH`.
-- Implement Strawberry search in `backend/tools/music.py` using LIKE on title/artist/album,
+Tasks — all complete:
+- ✅ Add MPD as a Docker Compose service with music folder mounted.
+- ✅ Mount Strawberry DB directory read-only into backend container; set `STRAWBERRY_DB_PATH`.
+- ✅ Implement Strawberry search in `backend/tools/music.py` using LIKE on title/artist/album,
   ranked by playcount. No FTS — use rowid as track ID.
-- Implement MPD client in `backend/tools/music.py` with per-request connections and
+- ✅ Implement MPD client in `backend/tools/music.py` with per-request connections and
   reconnect-once resilience: play(url), pause(), resume(), stop(), next(), queue(url),
   now_playing(), queue_view().
-- Queue model: single song, multi-song (artist radio).
-- Add path rewrite: URL-decode Strawberry `file://` URIs → strip `MUSIC_PATH_HOST`
+- ✅ Queue model: single song, multi-song (artist radio).
+- ✅ Add path rewrite: URL-decode Strawberry `file://` URIs → strip `MUSIC_PATH_HOST`
   prefix → pass relative path to MPD.
-- Implement `artist_radio(artist, n)` using weighted-random by playcount (Phase 8b dep).
-- Wrap all Strawberry reads in `OperationalError` handling; return retryable errors.
-- Add `GET /music/now_playing` endpoint (required by acceptance — add to tasks explicitly).
-- Add `GET /music/queue` endpoint for queue visibility.
+- ✅ Implement `artist_radio(artist, n)` using weighted-random by playcount (Phase 8b dep).
+- ✅ Wrap all Strawberry reads in `OperationalError` handling; return retryable errors.
+- ✅ Add `GET /music/now_playing` endpoint.
+- ✅ Add `GET /music/queue` endpoint for queue visibility.
+- ✅ Add `_parse_music_command()` deterministic pre-router in `main.py` (fires before LLM).
+- ✅ Add `_format_music_response()` to generate plain-text replies without LLM for music.
+- ✅ Add `_sync_search_by_title_artist()` for compound title+artist queries.
+- ✅ Add `_sync_search_by_year_range()` for decade/year playback.
+- ✅ Wire `artist_filter` and `year_range` params into `music.run()`.
 
 Environment variables:
   `STRAWBERRY_DB_PATH`      path to Strawberry sqlite db inside backend container
@@ -401,30 +460,36 @@ Environment variables:
   `MUSIC_ARTIST_RADIO_N`    tracks for artist radio (default: 10)
 
 Acceptance:
-- **Endpoints:** `POST /music/search`, `POST /music/play`, `POST /music/queue`,
+- ✅ **Endpoints:** `POST /music/search`, `POST /music/play`, `POST /music/queue`,
   `POST /music/control`, `GET /music/now_playing`, and `GET /music/queue` are all
   implemented and return standardized responses.
-- **Search quality:** `/music/search` returns ranked results from Strawberry's `songs`
+- ✅ **Search quality:** `/music/search` returns ranked results from Strawberry's `songs`
   table (LIKE on title/artist/album, ordered by playcount) for title/artist/album queries.
-- **Queue model:** Supports single song and artist radio (multi-song by artist).
-- **Playback controls:** `/music/play` starts playback via MPD; `/music/queue` appends
+- ✅ **Queue model:** Supports single song and artist radio (multi-song by artist).
+- ✅ **Playback controls:** `/music/play` starts playback via MPD; `/music/queue` appends
   tracks; `/music/control` supports `pause`, `resume`, `next`, and `stop`;
   `GET /music/now_playing` returns current track; `GET /music/queue` returns queued tracks.
-- **Voice & UI:** "Play <song or artist>" works end-to-end via voice or text and updates
+- ✅ **Voice & UI:** "Play <song or artist>" works end-to-end via voice or text and updates
   the frontend player state including now-playing bar and queue panel.
-- **Auto-pick:** Multiple search matches auto-pick the top-ranked result; confidence is
+- ✅ **Auto-pick:** Multiple search matches auto-pick the top-ranked result; confidence is
   logged server-side and included in the API response.
-- **Artist radio:** "Play <artist>" with no exact match queues N songs by that artist,
+- ✅ **Artist radio:** "Play <artist>" with no exact match queues N songs by that artist,
   weighted-randomly by playcount. This is the concrete foundation for Phase 8b fallback.
-- **Docker & config:** MPD runs as a Docker Compose service with the music folder mounted;
+- ✅ **Docker & config:** MPD runs as a Docker Compose service with the music folder mounted;
   `STRAWBERRY_DB_PATH`, `MUSIC_PATH_HOST`, and `MPD_HOST` are respected by the backend.
-- **Path rewrite:** file:// URIs from Strawberry are decoded and the host prefix stripped
+- ✅ **Path rewrite:** file:// URIs from Strawberry are decoded and the host prefix stripped
   to produce MPD-relative paths before any MPD add/play call.
-- **MPD resilience:** ConnectionError on any command attempts one reconnect; if that fails,
+- ✅ **MPD resilience:** ConnectionError on any command attempts one reconnect; if that fails,
   returns `retryable=True`. Container restart does not cause silent failure.
-- **Strawberry lock:** OperationalError during a scan returns `retryable=True`, never crashes.
-- **Errors:** All music endpoints return the standardized error shape
+- ✅ **Strawberry lock:** OperationalError during a scan returns `retryable=True`, never crashes.
+- ✅ **Errors:** All music endpoints return the standardized error shape
   (`error`, `code`, `retryable`) on failures.
+- ✅ **LLM bypass:** Clear music commands (control, now-playing, explicit play/queue) never
+  reach the LLM planner or summarizer — deterministic pre-router handles them in `/chat`.
+- ✅ **Title+artist search:** "Play X by Y" uses compound LIKE filter; falls back to
+  artist radio if no match found.
+- ✅ **Year/decade:** "Play 80s", "play 1994", "play music from 2003" resolve to
+  year-range queries against Strawberry `year` column; N tracks queued randomly.
 
 ---
 
@@ -486,38 +551,35 @@ Goal: Replace procedural routing with a stateful LangGraph graph. Nodes handle
 inner-monologue planning, memory retrieval, tool dispatch, and response generation.
 Enables multi-step reasoning, tool chaining, and durable session continuity.
 
-The graph architecture is the foundation for all subsequent intelligence phases
-(11 personality, 12 tiered memory, 13 sub-agents). Design the state shape and
-node interfaces carefully — retrofitting them later is expensive.
+This phase also absorbs the core `code_tool` architecture. The coding assistant is
+part of the graph itself, inherits memory/session/tool access, and should not be
+built as a separate editor extension.
 
 Graph nodes:
 ```
 input
-  └── tone_probe              reads user affect from transcript (feeds Phase 9.5)
-        └── planner           inner monologue → structured plan (replaces router.py)
-              └── memory_retrieval   proactive: pre-loads context before dispatch
-                    └── tool_router
-                          ├── weather_tool
-                          ├── music_tool
-                          ├── code_tool          (Phase 10)
-                          └── chat_fallback
-                                └── responder    generates grounded response
-                                      └── persona_renderer   (Phase 9.5)
-                                            └── output
+  └── intent_classifier
+    └── memory_retrieval
+      └── tool_router
+        ├── weather_tool
+        ├── music_tool
+        ├── code_tool
+        └── chat_fallback
+          └── responder
+            └── output
 ```
 
 State shape — include all fields from day one even if not all are used yet:
 ```python
 class AssistantState(TypedDict):
-    messages: list[dict]          # full conversation history
-    transcript: str               # raw STT output for current turn
-    tone: str                     # detected user affect (calm, frustrated, excited…)
-    plan: dict                    # planner output: route, tool, needs_memory, reasoning
-    memories: list[str]           # retrieved memory snippets
-    tool_result: str              # tool output for current turn
-    user_prefs: dict              # current user preferences
-    session_id: str               # durable session identifier
-    persona: dict                 # active persona parameters (Phase 9.5)
+    messages: list[dict]
+    intent: str
+    memories: list[str]
+    tool_result: str
+    user_prefs: dict
+    session_id: str
+    active_files: list[str]
+    code_context: str
 ```
 
 Implementation notes:
@@ -526,17 +588,17 @@ Implementation notes:
   checkpoint resume explicitly before marking acceptance.
 - Use `SqliteSaver` checkpointer for durable session state.
 - Keep graph state inspectable: add a `GET /graph/state/{session_id}` debug endpoint.
-- The `planner` node is the upgraded inner-monologue from Phase 4 — not a new
-  concept, just the same reasoning pass now running as a named graph node.
-- The `tone_probe` and `persona_renderer` nodes are stubs in Phase 9 and
-  activated in Phase 9.5. Wire them in from the start to avoid graph refactoring.
+- Implement `code_tool` with LangGraph `create_react_agent`.
+- Use prebuilt `langchain-community` tools rather than bespoke shell/file/python wrappers.
+- Build code retrieval around tree-sitter-derived summaries and ChromaDB-backed `code_context` injection.
+- Never allow file writes without explicit confirmation and workspace-root validation.
 
 Tasks:
 - Introduce LangGraph with SqliteSaver checkpointer.
 - Migrate existing router and tool logic into named graph nodes.
-- Add `tone` and `persona` fields to `AssistantState` as stubs.
-- Add `tone_probe` and `persona_renderer` as pass-through stubs.
-- Expand ChromaDB integration for semantic memory retrieval tuning.
+- Add the graph state fields needed for code-aware routing and retrieval.
+- Implement the `code_tool` node with confirmation-gated writes.
+- Expand ChromaDB integration to support semantic memory retrieval and `code_context` slices.
 - Keep graph state inspectable for debugging.
 - Ensure all existing tools work through the graph without regression.
 
@@ -545,7 +607,7 @@ Acceptance:
 - Graph state is inspectable via debug endpoint.
 - Durable session continuity works through LangGraph checkpoints.
 - Checkpoint resume is explicitly tested after container restart.
-- Stub nodes for tone and persona are wired but pass-through.
+- Code intents execute through the graph-local `code_tool` rather than a standalone integration.
 
 ---
 
@@ -694,21 +756,15 @@ Goal: Add a dedicated code assistant node to the LangGraph flow so code tasks us
 the local coder model with project context, explicit write confirmation, and
 voice-friendly interaction.
 
-The code assistant node is built into the graph rather than as a standalone VS Code
-extension. This is the right call: the agent already owns memory, session state,
-tool access, and voice input. Voice-triggered code generation ("Computer, write a
-FastAPI endpoint that calls the weather tool") with project context from memory is
-substantially more capable than an isolated sidebar model.
+The core `code_tool` architecture is established in Phase 10. This phase is for
+refining that capability after tiered memory exists, especially around retrieval
+quality, voice confirmation flows, and UI polish.
 
-Code tool design decisions:
-- Model selection: pull a code-specialized model into Ollama alongside the chat
-  model (for example `qwen2.5-coder`). Route `code` intents here by default.
-- File access: implement `backend/tools/code.py` with workspace-root enforcement;
-  never allow path traversal outside configured root.
-- Context injection: fetch relevant file summaries/schemas/decisions from memory
-  and inject them into coder prompts for code intents.
-- Voice ergonomics: summarize generated code in spoken form, with full code shown
-  in chat and optional write-to-disk flow.
+Code tool refinement decisions:
+- Keep `qwen2.5-coder:7b` as the default local coder path.
+- Preserve workspace-root enforcement on every file operation.
+- Deepen tree-sitter and ChromaDB-backed `code_context` retrieval for code intents.
+- Keep voice ergonomics confirmation-first: summarize generated changes aloud, then write only after explicit approval.
 
 Tool interface (consistent with other tools):
 ```python
@@ -727,9 +783,8 @@ PUT  /code/files/{path}  — write a file (requires confirmation flag)
 ```
 
 Tasks:
-- Pull and configure a code-specialized Ollama model; add `OLLAMA_CODER_MODEL` env var.
-- Implement `code_tool` node with read/write support and confirmation-gated writes.
-- Wire code context retrieval into memory_retrieval for code intents.
+- Improve code context retrieval quality for multi-file and follow-up tasks.
+- Refine confirmation-gated write flows for chat and voice usage.
 - Add voice confirmation flow for file writes.
 - Update UI with syntax highlighting, copy button, and save-to-disk actions.
 
@@ -858,25 +913,5 @@ Acceptance:
 
 ## Immediate next sprint
 
-| # | Issue | Status | Estimate | Depends on |
-|---|-------|--------|----------|------------|
-| 0b | HTTPS on LAN: Caddy reverse proxy, mkcert, wss:// | ✅ done | 0.5 days | 1 |
-| 1 | LAN-safe single-origin serving and health checks | ✅ done | 1–2 days | — |
-| 2 | Replace all `localhost` frontend paths with relative paths | ✅ done | 2–4 hours | 1 |
-| 3 | Harden wake-word pipeline (Phase 2) | ✅ done | 1–2 days | 1, 2 |
-| 4 | Chat context management: bounded session buffer + token-aware context | 🔄 in progress | 1–2 days | 1 |
-| 4b | Upgrade router to inner-monologue reasoning pass (structured JSON output) | ✅ done | 1–2 days | 4 |
-| 5 | Upgrade router: intent categories + `code` route, confidence scoring, telemetry | ✅ done | 1–2 days | 1, 4 |
-| 6 | SQLite memory layer: schema, policy matrix, explicit controls, CRUD endpoints | ✅ done | 2–3 days | 5 |
-| 7 | Chat sessions sidebar: create/switch/reset sessions UI | ✅ done | 1 day | 6 |
-| 8 | Weather tool: adapter, memory-backed default location, error handling | ✅ done | 1 day | 6, 7 |
-| 9 | Local music library tool: media indexer, search/playback endpoints, voice controls | 🔲 | 3–5 days | 2, 5 |
-| 10 | TTS voice output: benchmark Piper vs Kokoro, pluggable engine, barge-in | 🔲 | 2–4 days | 2, 4 |
-| 11 | LangGraph migration: graph orchestration with tone + persona stubs | 🔲 | 1–2 weeks | all prior |
-| 12 | Local code assistant node on LangGraph (coder model, code tool, write-confirm) | 🔲 | 1–2 weeks | 11 |
-| 13 | Personality and affect layer: tone_probe, persona_renderer, proactive retrieval | 🔲 | 1–2 weeks | 11 |
-| 14 | Tiered memory: episodic records, consolidation task, semantic promotion | 🔲 | 1–2 weeks | 11 |
-| 15 | Sub-agent architecture: decomposer, researcher, coder, critic, synthesizer | 🔲 | 2–4 weeks | 12 |
-
-Each numbered issue maps to a phase above. Use these as GitHub issue titles and
-reference the phase section for full task and acceptance detail.
+- Phase 9: TTS voice output with barge-in support.
+- Phase 10: LangGraph migration with the integrated `code_tool` node, ReAct loop, tree-sitter-backed `code_context`, ChromaDB retrieval, and confirmation-gated writes.

@@ -235,6 +235,59 @@ def _sync_artist_songs(artist: str) -> list[dict[str, Any]]:
         conn.close()
 
 
+def _sync_search_by_title_artist(title: str, artist: str) -> list[dict[str, Any]]:
+    """Search Strawberry songs by title AND artist (compound LIKE filter).
+
+    More precise than the general _sync_search when the user says
+    "<title> by <artist>" — filters both dimensions in a single query.
+    Raises sqlite3.OperationalError if the DB is scan-locked.
+    """
+    conn = _open_strawberry()
+    try:
+        cur = conn.execute(
+            """
+            SELECT rowid, title, artist, album, url, playcount
+            FROM songs
+            WHERE title LIKE ? AND artist LIKE ?
+            ORDER BY playcount DESC, title ASC
+            LIMIT ?
+            """,
+            (f"%{title}%", f"%{artist}%", MUSIC_SEARCH_LIMIT),
+        )
+        rows = cur.fetchall()
+        total = len(rows)
+        return [
+            _row_to_track(row, 0.9 - (i / max(total, 1)) * 0.4)
+            for i, row in enumerate(rows)
+        ]
+    finally:
+        conn.close()
+
+
+def _sync_search_by_year_range(year_start: int, year_end: int) -> list[dict[str, Any]]:
+    """Return songs whose year column falls within [year_start, year_end].
+
+    Ordered by playcount so popular tracks are surfaced first.
+    Returns all matches (no LIMIT) — callers sample from the full pool.
+    Raises sqlite3.OperationalError if the DB is scan-locked.
+    """
+    conn = _open_strawberry()
+    try:
+        cur = conn.execute(
+            """
+            SELECT rowid, title, artist, album, url, playcount
+            FROM songs
+            WHERE year BETWEEN ? AND ?
+            ORDER BY playcount DESC, title ASC
+            """,
+            (year_start, year_end),
+        )
+        rows = cur.fetchall()
+        return [_row_to_track(row, 0.9) for row in rows]
+    finally:
+        conn.close()
+
+
 # ── Artist radio ───────────────────────────────────────────────────────────────
 
 def artist_radio(
@@ -319,6 +372,12 @@ def _sync_queue(url: str) -> None:
     path = _url_to_mpd_path(url)
     log.debug("mpd.queue | path=%s", path)
     _with_mpd(lambda c: c.add(path))
+
+
+def _sync_play_pos(pos: int) -> None:
+    """Jump to a specific position in the current MPD queue (0-indexed)."""
+    log.debug("mpd.play_pos | pos=%d", pos)
+    _with_mpd(lambda c: c.play(pos))
 
 
 def _sync_control(action: str) -> None:
@@ -416,6 +475,18 @@ def _extract_control_action(prompt: str) -> str | None:
     return None
 
 
+_GENERIC_TITLE = frozenset({
+    "a song", "some songs", "any song", "a track", "some tracks", "any track",
+    "some music", "any music", "a random song", "a random track",
+    "something", "anything", "a tune", "some tunes",
+})
+
+_GENERIC_TITLE_RE = re.compile(
+    r"^(?:a|some|any)(?:thing)?\s+(?:random\s+)?(?:song|track|music)s?$",
+    re.IGNORECASE,
+)
+
+
 def _extract_search_query(prompt: str) -> str:
     """Strip common command prefixes and return a bare search string."""
     cleaned = re.sub(
@@ -424,7 +495,37 @@ def _extract_search_query(prompt: str) -> str:
         prompt.strip(),
         flags=re.IGNORECASE,
     )
-    return cleaned.strip().strip("\"'")
+    # Remove polite fillers and trailing punctuation.
+    cleaned = re.sub(r"^(the\s+song\s+)?", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip().strip("\"' .,!?")
+
+    # "a/some/any [random] <artist> song/track/music[s]" → return artist name.
+    # e.g. "a random Nightwish song" → "Nightwish"
+    #      "some Metallica tracks"   → "Metallica"
+    artist_song_m = re.match(
+        r"^(?:a|some|any)\s+(?:random\s+)?(?P<artist>.+?)\s+(?:song|track|music)s?$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if artist_song_m:
+        artist = artist_song_m.group("artist").strip()
+        if artist:
+            return artist
+
+    # "<title> by <artist>" — extract title, but if the title is a generic
+    # placeholder ("a song", "something", etc.) return the artist instead.
+    by_match = re.match(
+        r"^(?P<title>.+?)\s+by\s+(?P<artist>.+)$", cleaned, flags=re.IGNORECASE
+    )
+    if by_match:
+        title = by_match.group("title").strip().strip("\"' .,!?")
+        artist = by_match.group("artist").strip().strip("\"' .,!?")
+        if title.lower() in _GENERIC_TITLE or _GENERIC_TITLE_RE.match(title):
+            return artist
+        if title:
+            return title
+
+    return cleaned
 
 
 # ── MPD error classification ───────────────────────────────────────────────────
@@ -453,6 +554,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
     control: str | None = params.get("control")
     song_id: int | None = params.get("song_id")
     artist_param: str | None = params.get("artist")
+    # Compound search params set by the deterministic pre-router.
+    artist_filter: str | None = params.get("artist_filter")  # paired with query
+    year_range: tuple | list | None = params.get("year_range")  # (start, end)
 
     log.info("music.run | prompt=%r action=%s", prompt[:80], action)
 
@@ -497,6 +601,18 @@ async def run(params: dict[str, Any]) -> ToolResult:
     # ── Playback control ──────────────────────────────────────────────────────
     if action == "control":
         cmd = control or _extract_control_action(prompt)
+        # play_pos: jump to a queue position (sent by frontend queue click).
+        if cmd == "play_pos":
+            pos = int(params.get("pos", 0))
+            try:
+                await asyncio.to_thread(_sync_play_pos, pos)
+                return ToolResult(ok=True, data={"action": "play_pos", "pos": pos, "ok": True})
+            except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+                log.warning("music.play_pos | pos=%d mpd_error=%s", pos, exc)
+                return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+            except Exception as exc:
+                log.error("music.play_pos | pos=%d unexpected=%s", pos, exc)
+                return ToolResult.failure(str(exc), retryable=False)
         if not cmd:
             return ToolResult.failure("No control action recognized.", retryable=False)
         try:
@@ -557,6 +673,85 @@ async def run(params: dict[str, Any]) -> ToolResult:
             "picked_from": len(tracks),
         })
 
+    # ── Compound title + artist search ("title by artist") ────────────────────
+    if artist_filter and query:
+        try:
+            results = await asyncio.to_thread(_sync_search_by_title_artist, query, artist_filter)
+        except sqlite3.OperationalError:
+            return ToolResult.failure(
+                "Music library is temporarily locked (scan in progress). Please retry.",
+                retryable=True,
+            )
+        if results:
+            top = results[0]
+            confidence = top.get("score", 0.9)
+            log.info(
+                "music.title_artist_pick | title=%r artist_filter=%r picked=%r confidence=%.3f candidates=%d",
+                query, artist_filter, top["title"], confidence, len(results),
+            )
+            try:
+                if action == "queue":
+                    await asyncio.to_thread(_sync_queue, top["url"])
+                    return ToolResult(ok=True, data={"action": "queue", "track": top, "tracks": None, "confidence": confidence, "picked_from": len(results)})
+                else:
+                    await asyncio.to_thread(_sync_play, top["url"])
+                    return ToolResult(ok=True, data={"action": "play", "track": top, "tracks": None, "confidence": confidence, "picked_from": len(results)})
+            except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+                log.warning("music.title_artist_play | mpd_error=%s", exc)
+                return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+        # No title+artist match — fall back to artist radio.
+        log.info("music.title_artist_miss | title=%r artist_filter=%r trying artist radio", query, artist_filter)
+        try:
+            tracks = await asyncio.to_thread(artist_radio, artist_filter)
+        except sqlite3.OperationalError:
+            return ToolResult.failure(
+                "Music library is temporarily locked (scan in progress). Please retry.",
+                retryable=True,
+            )
+        if tracks:
+            try:
+                await asyncio.to_thread(_sync_play_tracks, tracks)
+            except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+                log.warning("music.title_artist_radio_fallback | mpd_error=%s", exc)
+                return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+            return ToolResult(ok=True, data={"action": "play", "track": tracks[0], "tracks": tracks, "confidence": 0.7, "picked_from": len(tracks)})
+        return ToolResult.failure(
+            f"No tracks found for '{query}' by '{artist_filter}'.", retryable=False
+        )
+
+    # ── Year / decade range search ─────────────────────────────────────────────
+    if year_range is not None:
+        yr_start, yr_end = int(year_range[0]), int(year_range[1])
+        try:
+            all_year_tracks = await asyncio.to_thread(_sync_search_by_year_range, yr_start, yr_end)
+        except sqlite3.OperationalError:
+            return ToolResult.failure(
+                "Music library is temporarily locked (scan in progress). Please retry.",
+                retryable=True,
+            )
+        if not all_year_tracks:
+            period = f"{yr_start}s" if yr_start != yr_end else str(yr_start)
+            return ToolResult.failure(f"No tracks found from {period}.", retryable=False)
+        rng = random.Random(int(time.time()))
+        n_pick = min(MUSIC_ARTIST_RADIO_N, len(all_year_tracks))
+        tracks = rng.sample(all_year_tracks, n_pick)
+        log.info(
+            "music.year_range | yr_start=%d yr_end=%d pool=%d picking=%d",
+            yr_start, yr_end, len(all_year_tracks), n_pick,
+        )
+        try:
+            await asyncio.to_thread(_sync_play_tracks, tracks)
+        except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+            log.warning("music.year_range_play | mpd_error=%s", exc)
+            return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+        return ToolResult(ok=True, data={
+            "action": "play",
+            "track": tracks[0],
+            "tracks": tracks,
+            "confidence": 0.9,
+            "picked_from": len(all_year_tracks),
+        })
+
     # ── Search (explicit action="search") ─────────────────────────────────────
     if action == "search":
         q = query or _extract_search_query(prompt)
@@ -610,6 +805,51 @@ async def run(params: dict[str, Any]) -> ToolResult:
             "confidence": 0.7,
             "picked_from": len(tracks),
         })
+
+    # Artist-radio heuristic: if the query looks like an artist/genre name rather
+    # than a song title, use artist_radio() to queue multiple tracks instead of
+    # single-picking the top LIKE result.
+    #
+    # Criteria (both must be true):
+    #   1. The normalised query doesn't appear in any of the top-5 result titles
+    #      (i.e. no title match → the LIKE hit was on artist/album, not title).
+    #   2. The normalised query does appear in the top result's artist field
+    #      (confirms it's an artist search, not e.g. an album search).
+    #
+    # Strip common genre suffixes ("music", "songs", "tracks") before comparing
+    # so "classical music" matches artist "Classical".
+    _q_norm = re.sub(
+        r"\s+(?:music|songs?|tracks?|bands?|artists?)$", "", q, flags=re.IGNORECASE
+    ).lower().strip()
+    _title_miss = not any(_q_norm in r["title"].lower() for r in results[:5])
+    _artist_hit = _q_norm in results[0]["artist"].lower()
+    if _title_miss and _artist_hit and action != "queue":
+        log.info(
+            "music.play | artist_radio_heuristic query=%r artist=%r candidates=%d",
+            q, results[0]["artist"], len(results),
+        )
+        try:
+            tracks = await asyncio.to_thread(artist_radio, q)
+        except sqlite3.OperationalError:
+            return ToolResult.failure(
+                "Music library is temporarily locked (scan in progress). Please retry.",
+                retryable=True,
+            )
+        if tracks:
+            try:
+                await asyncio.to_thread(_sync_play_tracks, tracks)
+            except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+                log.warning("music.artist_radio_heuristic | mpd_error=%s", exc)
+                return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+            return ToolResult(ok=True, data={
+                "action": "play",
+                "track": tracks[0],
+                "tracks": tracks,
+                "confidence": 0.85,
+                "picked_from": len(tracks),
+            })
+        # artist_radio returned nothing (shouldn't happen if LIKE found results,
+        # but fall through to single-pick as safety net).
 
     # Auto-pick: top-ranked LIKE result.  Confidence logged server-side.
     top = results[0]

@@ -249,7 +249,7 @@
       });
 
       _audioCtx = new AudioContext({ sampleRate: 16000 });
-      await _audioCtx.audioWorklet.addModule(`${location.origin}/audio-processor.js`);
+      await _audioCtx.audioWorklet.addModule(new URL('/static/audio-processor.js', window.location.href));
 
       const source = _audioCtx.createMediaStreamSource(_micStream);
       _workletNode = new AudioWorkletNode(_audioCtx, 'audio-processor');
