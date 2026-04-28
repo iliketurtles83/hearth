@@ -72,7 +72,7 @@
         input.value = text;
         input.style.height = 'auto';
         input.style.height = Math.min(input.scrollHeight, 160) + 'px';
-        await window.sendMessage();
+        await window.sendMessage({ source: 'voice' });
       }
     } catch (err) {
       console.error('[voice] transcribe error:', err);
@@ -184,6 +184,19 @@
   let _reconnectTimerId = null;
   let _manualStop = false;
 
+  function interruptAssistantAudio() {
+    const stopAudio = window.stopAssistantAudio;
+    if (typeof stopAudio !== 'function') return 0;
+
+    const t0 = performance.now();
+    try {
+      stopAudio();
+    } catch (err) {
+      console.warn('[voice] failed to interrupt assistant audio:', err);
+    }
+    return performance.now() - t0;
+  }
+
   function connectWakeWebSocket() {
     const wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
     _ws = new WebSocket(`${wsProto}://${location.host}/ws/wake`);
@@ -196,7 +209,11 @@
     _ws.onmessage = async (evt) => {
       const msg = JSON.parse(evt.data);
       if (msg.event === 'wake' && voiceState === 'sleeping' && Date.now() > _wakeGuardUntil) {
+        const interruptMs = interruptAssistantAudio();
         console.log('[voice] wake word detected, score:', msg.score);
+        if (interruptMs > 0) {
+          console.log(`[voice] barge-in interrupted assistant audio in ${interruptMs.toFixed(1)}ms`);
+        }
         _wakeGuardUntil = Date.now() + 1500;
         beginUtteranceCapture();
       }

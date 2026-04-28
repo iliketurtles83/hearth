@@ -1,0 +1,25 @@
+{
+  "winner": null,
+  "results": [
+    {
+      "engine": "piper",
+      "available": false,
+      "error_code": "TTS_PIPER_MODEL_MISSING",
+      "error": "TTS_PIPER_MODEL is required for the Piper engine",
+      "cold_start_ms": null,
+      "warm_mean_ms": null,
+      "warm_p95_ms": null,
+      "bytes_mean": null
+    },
+    {
+      "engine": "kokoro",
+      "available": false,
+      "error_code": "TTS_KOKORO_UNAVAILABLE",
+      "error": "Kokoro runtime unavailable. Install kokoro_onnx and model assets to enable TTS_ENGINE=kokoro",
+      "cold_start_ms": null,
+      "warm_mean_ms": null,
+      "warm_p95_ms": null,
+      "bytes_mean": null
+    }
+  ]
+}

@@ -361,7 +361,9 @@ def _sync_play(url: str) -> None:
 
     def _fn(c: musicpd.MPDClient) -> None:
         c.clear()
-        c.add(path)
+        added = _add_mpd_paths(c, [path])
+        if added == 0:
+            raise FileNotFoundError(f"Track not available in MPD library: {path}")
         c.play()
 
     _with_mpd(_fn)
@@ -371,7 +373,13 @@ def _sync_queue(url: str) -> None:
     """Append a track to the current MPD queue."""
     path = _url_to_mpd_path(url)
     log.debug("mpd.queue | path=%s", path)
-    _with_mpd(lambda c: c.add(path))
+
+    def _fn(c: musicpd.MPDClient) -> None:
+        added = _add_mpd_paths(c, [path])
+        if added == 0:
+            raise FileNotFoundError(f"Track not available in MPD library: {path}")
+
+    _with_mpd(_fn)
 
 
 def _sync_play_pos(pos: int) -> None:
@@ -447,8 +455,9 @@ def _sync_play_tracks(tracks: list[dict[str, Any]]) -> None:
 
     def _fn(c: musicpd.MPDClient) -> None:
         c.clear()
-        for path in paths:
-            c.add(path)
+        added = _add_mpd_paths(c, paths)
+        if added == 0:
+            raise FileNotFoundError("No selected tracks are available in the MPD library")
         c.play()
 
     _with_mpd(_fn)
@@ -532,6 +541,24 @@ def _extract_search_query(prompt: str) -> str:
 
 def _is_mpd_connection_error(exc: Exception) -> bool:
     return isinstance(exc, (musicpd.ConnectionError, ConnectionRefusedError, BrokenPipeError, OSError))
+
+
+def _is_mpd_missing_path_error(exc: Exception) -> bool:
+    return isinstance(exc, musicpd.CommandError) and "No such directory" in str(exc)
+
+
+def _add_mpd_paths(client: musicpd.MPDClient, paths: list[str]) -> int:
+    added = 0
+    for path in paths:
+        try:
+            client.add(path)
+            added += 1
+        except Exception as exc:
+            if _is_mpd_missing_path_error(exc):
+                log.warning("mpd.add_skip_missing | path=%s", path)
+                continue
+            raise
+    return added
 
 
 # ── Tool entry point ───────────────────────────────────────────────────────────

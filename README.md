@@ -84,7 +84,8 @@ Music endpoints (Phase 8):
 │   ├── style.css
 │   └── audio-processor.js
 └── scripts/
-    └── download-models.sh
+  ├── download-models.sh
+  └── download-tts-models.sh
 ```
 
 ## Prerequisites
@@ -203,6 +204,14 @@ MEMORY_MIN_RELEVANCE_SCORE=0.28
 # PULSE_SERVER=/run/user/1000/pulse/native
 # PUID=1000
 # PGID=1000
+#
+# TTS / Kokoro (Phase 9)
+# TTS_ENGINE=kokoro
+# TTS_KOKORO_MODEL=/app/models/tts/kokoro-v1.0.int8.onnx
+# TTS_KOKORO_VOICES=/app/models/tts/voices-v1.0.bin
+# TTS_KOKORO_VOICE=af_heart
+# TTS_KOKORO_LANG=en-us
+# TTS_KOKORO_SPEED=1.0
 
 # HTTPS / CORS policy (Phase 0b)
 # Set CORS_ORIGINS to the exact Caddy origin once HTTPS is in use.
@@ -256,11 +265,29 @@ If missing, run:
 bash scripts/download-models.sh
 ```
 
+## TTS Models
+
+Phase 9 voice output requires separate Kokoro model assets. Download them into
+`backend/models/tts/` before expecting `/tts` or voice responses to work:
+
+```bash
+bash scripts/download-tts-models.sh
+```
+
+The default Docker setup expects these exact files:
+
+- `backend/models/tts/kokoro-v1.0.int8.onnx`
+- `backend/models/tts/voices-v1.0.bin`
+
+If you prefer a different Kokoro model variant, set `TTS_KOKORO_MODEL` in `.env`
+to the matching file path. The compose defaults point at the int8 model to keep
+download size and memory usage lower.
+
 ## Music / MPD (Phase 8)
 
 - The backend now includes a local music tool that integrates Strawberry's
   SQLite database with an MPD-based playback service (Phase 8).
-- Ensure `STRABERRY_DB_PATH` (or `STRABERRY_DB_PATH` in `.env`) points to your
+- Ensure `STRAWBERRY_DB_PATH` (or `STRAWBERRY_DB_PATH` in `.env`) points to your
   Strawberry sqlite DB; for example:
 
   /home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry.db
@@ -303,6 +330,11 @@ docker compose exec -T backend sh -c 'cd /app && PYTHONPATH=/app python -m pytes
 ```
 
 - Current verified result (backend test run): `115 passed, 16 warnings`.
+
+- Voice/TTS stream regression coverage includes:
+  - `backend/tests/test_chat_sessions.py` for `/chat` SSE framing and `[DONE]` termination.
+  - `backend/tests/test_chat_voice_metadata.py` for source normalization and voice metadata helpers.
+  - `backend/tests/test_tts_endpoint.py` for `/tts` status-code and payload mapping.
 
 ## Session Management (Phase 5)
 
@@ -365,12 +397,10 @@ Safety behavior:
 
 ## Current Status
 
-- Phase 0b: HTTPS on LAN via Caddy — complete
-- Phase 1: LAN-safe single-origin serving — complete
-- Phase 2: Wake-word pipeline — complete (desktop/Linux/LAN browser; Android/iOS unblocked by Phase 0b)
-- Phase 3: Chat context management — in progress
-- Phase 4: Intent routing — complete
-- Phase 5: SQLite/Chroma memory layer and sessions UI — complete
+- Phase 0b (HTTPS edge via Caddy): complete
+- Phases 1-8 (core chat, wake-word, memory, weather, and music): complete
+- Phase 9 (TTS voice output, `/tts`, frontend playback controls, barge-in): complete
+- Phase 10+ (LangGraph migration and modality-aware responder): not started
 
 ## Security Notes
 

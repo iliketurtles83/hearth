@@ -19,6 +19,7 @@ import numpy as np
 from dotenv import load_dotenv
 from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
 from memory import MemoryStore
+import tts
 
 _memory_db_default = os.path.join(os.path.dirname(__file__), "memory.db")
 _chroma_default = os.path.join(os.path.dirname(__file__), "chroma")
@@ -222,6 +223,11 @@ def get_whisper_model():
 class ChatRequest(BaseModel):
     message: str
     system: str = "You are a helpful personal assistant. Be concise and accurate."
+    source: str = "text"
+
+
+class TTSRequest(BaseModel):
+    text: str
 
 
 class SessionSelectRequest(BaseModel):
@@ -230,6 +236,52 @@ class SessionSelectRequest(BaseModel):
 
 def _error_response(message: str, code: str, retryable: bool, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"error": message, "code": code, "retryable": retryable}, status_code=status_code)
+
+
+def _tts_error_status(code: str, retryable: bool) -> int:
+    client_errors = {
+        "TTS_INVALID_TEXT",
+        "TTS_TEXT_TOO_LONG",
+        "TTS_ENGINE_INVALID",
+        "TTS_PIPER_CONFIG_INVALID",
+        "TTS_KOKORO_CONFIG_INVALID",
+    }
+    unavailable_errors = {
+        "TTS_ENGINE_UNAVAILABLE",
+        "TTS_ENGINE_INIT_FAILED",
+        "TTS_PIPER_MODEL_MISSING",
+        "TTS_PIPER_MODEL_NOT_FOUND",
+        "TTS_PIPER_BIN_NOT_FOUND",
+        "TTS_PIPER_PITCH_UNSUPPORTED",
+        "TTS_KOKORO_UNAVAILABLE",
+        "TTS_KOKORO_INIT_FAILED",
+        "TTS_KOKORO_BAD_RUNTIME",
+    }
+
+    if code in client_errors:
+        return 400
+    if code in unavailable_errors:
+        return 503
+    if retryable:
+        return 502
+    return 500
+
+
+def _normalize_chat_source(source: str | None) -> str:
+    s = (source or "text").strip().lower()
+    return s if s in {"text", "voice"} else "text"
+
+
+def _voice_tts_metadata(chat_source: str) -> dict | None:
+    if chat_source != "voice":
+        return None
+    return {
+        "voice": {
+            "source": "voice",
+            "tts_endpoint": "/tts",
+            "tts_ready": True,
+        }
+    }
 
 
 def _set_session_cookie(response: Response, session_id: str) -> None:
@@ -726,6 +778,7 @@ async def chat(request: ChatRequest, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
+    chat_source = _normalize_chat_source(request.source)
 
     # ── Deterministic music fast-path ─────────────────────────────────────────
     # Check before router_route() so clear music commands never touch the LLM.
@@ -782,11 +835,12 @@ async def chat(request: ChatRequest, http_request: Request):
     augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
 
     log.info(
-        "chat.route | session_id=%s intent=%s confidence=%.3f route=%s model=%s "
+        "chat.route | session_id=%s source=%s intent=%s confidence=%.3f route=%s model=%s "
         "planner_status=%s needs_memory=%s tool=%s "
         "total_messages=%d included_messages=%d estimated_history_tokens=%d summary_tokens=%d "
         "summary_updated=%s summary_message_count=%d summary_chars=%d truncated=%s",
         session_id,
+        chat_source,
         decision.intent,
         decision.confidence,
         "cloud" if decision.use_cloud else "local",
@@ -884,7 +938,7 @@ async def chat(request: ChatRequest, http_request: Request):
             )
             _append_session_message(session_id, "user", request.message)
             _append_session_message(session_id, "assistant", assistant_accumulated.strip())
-            memory_store.ingest_user_message(user_id, request.message, source="chat")
+            memory_store.ingest_user_message(user_id, request.message, source=chat_source)
             return
         # ── End tool dispatch ─────────────────────────────────────────────────
 
@@ -948,7 +1002,7 @@ async def chat(request: ChatRequest, http_request: Request):
         memory_result = memory_store.ingest_user_message(
             user_id,
             request.message,
-            source="chat",
+            source=chat_source,
             previous_user_message=previous_user_message,
         )
         log.info(
@@ -985,6 +1039,14 @@ async def chat(request: ChatRequest, http_request: Request):
             )
             + "\n\n"
         )
+
+        voice_meta = _voice_tts_metadata(chat_source)
+        if voice_meta is not None:
+            yield (
+                "data: "
+                + json.dumps(voice_meta)
+                + "\n\n"
+            )
 
         yield "data: [DONE]\n\n"
 
@@ -1262,6 +1324,21 @@ async def health():
 async def health_head():
     # Respond to HEAD probes (no body).
     return Response(status_code=200)
+
+
+@app.post("/tts")
+async def tts_synthesize(request: TTSRequest):
+    try:
+        audio = await tts.synthesize(request.text)
+        return Response(content=audio, media_type="audio/wav")
+    except Exception as exc:
+        payload = tts.error_to_payload(exc)
+        code = str(payload.get("code", "TTS_UNKNOWN_ERROR"))
+        retryable = bool(payload.get("retryable", False))
+        message = str(payload.get("error", "Unknown TTS error"))
+        status = _tts_error_status(code, retryable)
+        log.warning("tts.error | code=%s retryable=%s message=%s", code, retryable, message)
+        return _error_response(message, code, retryable, status_code=status)
 
 
 # Legacy asset routes (compatibility with clients requesting root-mounted files)

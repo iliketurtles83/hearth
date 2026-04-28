@@ -48,6 +48,19 @@ def _json_body(response) -> dict:
     return json.loads(response.body.decode("utf-8"))
 
 
+async def _read_sse_events(streaming_response) -> list[str]:
+    events: list[str] = []
+    async for chunk in streaming_response.body_iterator:
+        if isinstance(chunk, bytes):
+            text = chunk.decode("utf-8")
+        else:
+            text = str(chunk)
+        for line in text.splitlines():
+            if line.startswith("data: "):
+                events.append(line[len("data: "):])
+    return events
+
+
 @pytest.fixture(autouse=True)
 def clear_session_store(monkeypatch):
     main._session_store.clear()
@@ -193,3 +206,99 @@ def test_truncate_summary_keeps_tail_within_limit(monkeypatch):
 
     assert len(truncated) <= 24
     assert truncated.endswith("line 4")
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(monkeypatch):
+    async def _fake_router_route(_message: str):
+        return SimpleNamespace(
+            intent="quick-local",
+            confidence=0.99,
+            use_cloud=False,
+            model="gemma3:4b",
+            planner_status="ok",
+            needs_memory=False,
+            tool=None,
+            reasoning_summary="",
+        )
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "hello"
+        yield " world"
+
+    ingest_sources: list[str] = []
+
+    monkeypatch.setattr(main, "router_route", _fake_router_route)
+    monkeypatch.setattr(main, "stream_local", _fake_stream_local)
+    monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
+
+    def _fake_ingest(*_args, **kwargs):
+        ingest_sources.append(kwargs.get("source", ""))
+        return {
+            "status": "none",
+            "saved": [],
+            "blocked": [],
+            "needs_confirmation": [],
+            "deleted": 0,
+            "explicit": False,
+        }
+
+    monkeypatch.setattr(main.memory_store, "ingest_user_message", _fake_ingest)
+
+    response = await main.chat(
+        main.ChatRequest(message="hello", source="voice"),
+        _request("alice"),
+    )
+    events = await _read_sse_events(response)
+
+    assert events[0] != "[DONE]"
+    assert json.loads(events[0])["model"] == "gemma3:4b"
+    assert any(json.loads(event).get("text") == "hello" for event in events if event != "[DONE]")
+    assert any(json.loads(event).get("text") == " world" for event in events if event != "[DONE]")
+    assert any("voice" in json.loads(event) for event in events if event != "[DONE]")
+    assert events[-1] == "[DONE]"
+    assert ingest_sources == ["voice"]
+
+
+@pytest.mark.asyncio
+async def test_chat_stream_omits_voice_metadata_for_text_source(monkeypatch):
+    async def _fake_router_route(_message: str):
+        return SimpleNamespace(
+            intent="quick-local",
+            confidence=0.99,
+            use_cloud=False,
+            model="gemma3:4b",
+            planner_status="ok",
+            needs_memory=False,
+            tool=None,
+            reasoning_summary="",
+        )
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "text only"
+
+    monkeypatch.setattr(main, "router_route", _fake_router_route)
+    monkeypatch.setattr(main, "stream_local", _fake_stream_local)
+    monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        main.memory_store,
+        "ingest_user_message",
+        lambda *_args, **_kwargs: {
+            "status": "none",
+            "saved": [],
+            "blocked": [],
+            "needs_confirmation": [],
+            "deleted": 0,
+            "explicit": False,
+        },
+    )
+
+    response = await main.chat(
+        main.ChatRequest(message="hello", source="text"),
+        _request("alice"),
+    )
+    events = await _read_sse_events(response)
+
+    assert any(json.loads(event).get("text") == "text only" for event in events if event != "[DONE]")
+    assert not any("voice" in json.loads(event) for event in events if event != "[DONE]")
+    assert events[-1] == "[DONE]"

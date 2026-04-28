@@ -13,3 +13,4 @@ python-musicpd
 pytest
 pytest-asyncio
 respx
+kokoro-onnx==0.5.0

@@ -10,10 +10,106 @@
   const memoryClearBtn = document.getElementById('memory-clear-btn');
   const sidebar = document.getElementById('sidebar');
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
+  const ttsStatusEl = document.getElementById('tts-status');
+  const ttsEnableBtn = document.getElementById('tts-enable-btn');
+  const ttsStopBtn = document.getElementById('tts-stop-btn');
 
   window.appUi = { messagesEl, messagesInner, input, sendBtn, newChatBtn };
   let currentSessionId = null;
   let creatingNewSession = false;
+  let ttsAudio = null;
+  let pendingVoicePlayback = null;
+
+  function setTtsStatus(text) {
+    if (ttsStatusEl) ttsStatusEl.textContent = text;
+  }
+
+  function stopVoicePlayback() {
+    pendingVoicePlayback = null;
+    if (!ttsAudio) {
+      if (ttsStopBtn) ttsStopBtn.style.display = 'none';
+      setTtsStatus('voice idle');
+      return;
+    }
+    ttsAudio.pause();
+    ttsAudio.removeAttribute('src');
+    ttsAudio.load();
+    ttsAudio = null;
+    if (ttsStopBtn) ttsStopBtn.style.display = 'none';
+    setTtsStatus('voice idle');
+  }
+
+  async function playVoiceAudioFromText(text, endpoint = '/tts') {
+    const trimmed = (text || '').trim();
+    if (!trimmed) return;
+
+    setTtsStatus('voice generating...');
+    const resp = await (window.apiFetch || fetch)(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ text: trimmed }),
+    });
+
+    if (!resp.ok) {
+      let details = `HTTP ${resp.status}`;
+      try {
+        const err = await resp.json();
+        if (err?.error) details = err.error;
+      } catch {
+        // best effort
+      }
+      setTtsStatus('voice unavailable');
+      throw new Error(`TTS failed: ${details}`);
+    }
+
+    const audioBytes = await resp.arrayBuffer();
+    const blob = new Blob([audioBytes], { type: 'audio/wav' });
+    const url = URL.createObjectURL(blob);
+
+    stopVoicePlayback();
+    ttsAudio = new Audio(url);
+    ttsAudio.preload = 'auto';
+    ttsAudio.autoplay = false;
+
+    ttsAudio.addEventListener('ended', () => {
+      if (ttsAudio) {
+        URL.revokeObjectURL(ttsAudio.src);
+      }
+      ttsAudio = null;
+      if (ttsStopBtn) ttsStopBtn.style.display = 'none';
+      setTtsStatus('voice idle');
+    }, { once: true });
+
+    ttsAudio.addEventListener('error', () => {
+      if (ttsAudio) {
+        URL.revokeObjectURL(ttsAudio.src);
+      }
+      ttsAudio = null;
+      if (ttsStopBtn) ttsStopBtn.style.display = 'none';
+      setTtsStatus('voice error');
+    }, { once: true });
+
+    try {
+      if (ttsStopBtn) ttsStopBtn.style.display = 'inline-block';
+      setTtsStatus('voice speaking');
+      // Try muted autoplay first (widest browser support), then unmute.
+      ttsAudio.muted = true;
+      await ttsAudio.play();
+      ttsAudio.muted = false;
+    } catch (err) {
+      // Browser blocked autoplay; ask for a user gesture and keep payload queued.
+      pendingVoicePlayback = { text: trimmed, endpoint };
+      setTtsStatus('tap to enable voice');
+      if (ttsEnableBtn) ttsEnableBtn.style.display = 'inline-block';
+      if (ttsStopBtn) ttsStopBtn.style.display = 'none';
+      if (ttsAudio) {
+        URL.revokeObjectURL(ttsAudio.src);
+      }
+      ttsAudio = null;
+      throw err;
+    }
+  }
 
   function isMobileLayout() {
     return window.matchMedia('(max-width: 900px)').matches;
@@ -71,6 +167,25 @@
     if (sessionNewBtn) sessionNewBtn.disabled = locked;
     if (memoryClearBtn) memoryClearBtn.disabled = locked;
   }
+
+  ttsEnableBtn?.addEventListener('click', async () => {
+    const pending = pendingVoicePlayback;
+    pendingVoicePlayback = null;
+    ttsEnableBtn.style.display = 'none';
+    if (!pending) {
+      setTtsStatus('voice idle');
+      return;
+    }
+    try {
+      await playVoiceAudioFromText(pending.text, pending.endpoint);
+    } catch {
+      // keep state in status label
+    }
+  });
+
+  ttsStopBtn?.addEventListener('click', () => {
+    stopVoicePlayback();
+  });
 
   function scrollToBottom() {
     messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -439,7 +554,8 @@
     }
   }
 
-  async function send() {
+  async function send(options = {}) {
+    const source = options?.source === 'voice' ? 'voice' : 'text';
     const text = input.value.trim();
     if (!text) return;
     closeSidebar();
@@ -455,13 +571,14 @@
     bubble.appendChild(cursor);
 
     let accumulated = '';
+    let voiceMeta = null;
 
     try {
       const resp = await (window.apiFetch || fetch)('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
-        body: JSON.stringify({ message: text }),
+        body: JSON.stringify({ message: text, source }),
       });
 
       if (!resp.ok) throw new Error(`Server error: HTTP ${resp.status}`);
@@ -508,6 +625,10 @@
             appendMemoryBadge(wrapper, parsed.memory);
           }
 
+          if (parsed.voice) {
+            voiceMeta = parsed.voice;
+          }
+
           if (parsed.text) {
             accumulated += parsed.text;
             bubble.innerHTML = marked.parse(accumulated);
@@ -515,6 +636,12 @@
             scrollToBottom();
           }
         }
+      }
+
+      if (source === 'voice' && voiceMeta?.tts_ready && voiceMeta?.tts_endpoint) {
+        playVoiceAudioFromText(accumulated, voiceMeta.tts_endpoint).catch((err) => {
+          console.warn('[tts] playback skipped:', err?.message || err);
+        });
       }
     } catch (err) {
       bubble.textContent = `⚠ ${err.message}`;
@@ -568,4 +695,5 @@
 
   window.sendMessage = send;
   window.showVoiceError = showVoiceError;
+  window.stopAssistantAudio = stopVoicePlayback;
 })();

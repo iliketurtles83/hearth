@@ -87,6 +87,12 @@ services:
       # .env if the DB filename differs. Host directory set via STRAWBERRY_DB_DIR.
       - STRAWBERRY_DB_PATH=/strawberry/strawberry.db
       - MPD_HOST=mpd
+      - TTS_ENGINE=${TTS_ENGINE:-kokoro}
+      - TTS_KOKORO_MODEL=${TTS_KOKORO_MODEL:-/app/models/tts/kokoro-v1.0.int8.onnx}
+      - TTS_KOKORO_VOICES=${TTS_KOKORO_VOICES:-/app/models/tts/voices-v1.0.bin}
+      - TTS_KOKORO_VOICE=${TTS_KOKORO_VOICE:-af_heart}
+      - TTS_KOKORO_LANG=${TTS_KOKORO_LANG:-en-us}
+      - TTS_KOKORO_SPEED=${TTS_KOKORO_SPEED:-1.0}
     depends_on:
       - ollama
       - mpd

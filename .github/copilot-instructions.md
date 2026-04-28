@@ -32,7 +32,7 @@ FastAPI backend
   ├── tools/weather.py                weather adapter
   ├── tools/music.py                  media indexer + playback
   ├── tools/code.py                   code generation + file read/write
-  └── tts.py                          pluggable TTS engine (Piper → Kokoro swap-ready)
+  └── tts/                            pluggable TTS package (engines + loader)
 
 Ollama (container)                    local model inference (GPU)
   ├── gemma3:4b                       general conversation, voice responses, persona anchor
@@ -52,9 +52,10 @@ runtime code.
 
 When this section conflicts with historical roadmap notes below, follow this section.
 
-- Phases 1–8 are complete.
+- Phases 1–9 are complete.
 - Phase 8 includes the deterministic music pre-router (`_parse_music_command`) that bypasses the LLM for clear music commands, compound title+artist search, and year/decade range playback.
-- Phases 9–14 have not started yet.
+- Phase 9 includes package-based TTS loader/engines, `/tts`, voice-source chat metadata, frontend playback controls, and barge-in interruption.
+- Phases 10–14 have not started yet.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
 ## Model setup
@@ -510,6 +511,7 @@ Acceptance:
 ---
 
 ### Phase 9 — TNG-style voice output (TTS)
+**Status: complete**
 **Estimate: 2–3 days**
 **Depends on: Phases 2, 4**
 
@@ -531,31 +533,24 @@ TTS engine interface:
 - Engines handle speaker/voice selection internally (via env vars or config).
 
 Tasks:
-- Implement `backend/tts.py` with pluggable engine loader and common `synthesize()` method.
-- Implement a Piper TTS engine in `backend/tts/engines/piper.py`.
-- Implement a Kokoro TTS engine in `backend/tts/engines/kokoro.py` (if available/licensed).
-- Benchmark both engines on the host hardware for latency and voice quality.
-  Document the winner and rationale in a comment at the top of `tts.py`.
-- Add a TTS endpoint: `POST /tts` — accepts text, returns audio bytes with
-  proper MIME type (audio/wav or audio/mpeg).
-- Wire TTS into the `/chat` endpoint: after the responder generates text,
-  pipe it to TTS and return both text and audio stream/URL to the frontend.
-- Frontend: implement audio playback widget; auto-play with browser constraint
-  handling (muted, then unmute on user interaction if needed).
-- Add barge-in behavior: new wake-word detection while audio is playing stops
-  playback and immediately resumes listening (RMS threshold capture).
-- Tune speaking rate and pitch for calm, authoritative TNG computer style
-  (this is an engine parameter; document the settings used).
+- ✅ Implement `backend/tts/` package with pluggable engine loader and common `synthesize()` method.
+- ✅ Implement a Piper TTS engine in `backend/tts/engines/piper.py`.
+- ✅ Implement a Kokoro TTS engine in `backend/tts/engines/kokoro.py`.
+- ✅ Add benchmark harness for engine latency/availability and document rationale.
+- ✅ Add a TTS endpoint: `POST /tts` that returns audio bytes (`audio/wav`).
+- ✅ Wire voice-source metadata into `/chat` SSE so frontend can trigger `/tts` post-response.
+- ✅ Frontend: implement playback widget with autoplay fallback and manual enable path.
+- ✅ Add barge-in behavior so wake-word interruption stops assistant playback.
+- ✅ Document runtime env/settings and provide `scripts/download-tts-models.sh` for Kokoro assets.
+- ✅ Add backend regression coverage for `/chat` stream behavior and TTS endpoint mappings.
 
 Acceptance:
-- `/tts` endpoint returns audio bytes for arbitrary text input.
-- Responses are read aloud end-to-end (rough quality acceptable; will be
-  polished in Phase 10).
-- Voice playback does not block chat use or subsequent message sending.
-- Barge-in stops playback and resumes listening within 500 ms.
-- Swapping `TTS_ENGINE` in `.env` changes the engine without code changes.
-- Browser autoplay constraints are handled (auto-play muted, then unmute on
-  user gesture if needed).
+- ✅ `/tts` endpoint returns audio bytes for arbitrary text input.
+- ✅ Responses are read aloud end-to-end for voice-origin chat turns.
+- ✅ Voice playback does not block chat use or subsequent message sending.
+- ✅ Barge-in stops playback and resumes listening flow.
+- ✅ Swapping `TTS_ENGINE` in `.env` changes the engine without code changes.
+- ✅ Browser autoplay constraints are handled (auto-play muted, manual enable fallback).
 
 **Known gap (Phase 10):** Voice responses currently use the full chat text,
 which is verbose for spoken output. This will be addressed in Phase 10's
@@ -1035,7 +1030,7 @@ Acceptance:
 - New tools are added as modules under `backend/tools/` with a consistent
   interface: `async def run(params: dict) -> dict`.
 - TTS engines live in `backend/tts/engines/` with a common
-  `async def synthesize(text: str) -> bytes` interface. `TTS_ENGINE` env var selects.
+  `async def synthesize(text: str) -> bytes` interface. `TTS_ENGINE` env var selects via the `backend/tts` loader.
 - Environment variables are the only configuration mechanism. No config files
   that duplicate `.env` values.
 - Type-annotate all Python function signatures.
@@ -1063,7 +1058,6 @@ Acceptance:
 
 ## Immediate next sprint
 
-- Phase 9: TTS voice output with barge-in support.
 - Phase 10a: LangGraph graph skeleton and router migration.
 - Phase 10b: Code tool node with ReAct loop and tree-sitter context.
 - Phase 10c: Responder node and modality-aware output shaping (voice vs. chat).

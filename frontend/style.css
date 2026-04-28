@@ -208,6 +208,35 @@ header h1 {
   letter-spacing: 0.03em;
 }
 
+#tts-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  margin-left: 0.35rem;
+}
+
+#tts-status {
+  font-size: 0.76rem;
+  color: var(--text-muted);
+  text-transform: lowercase;
+}
+
+#tts-enable-btn,
+#tts-stop-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  border-radius: 8px;
+  font-size: 0.72rem;
+  padding: 0.18rem 0.42rem;
+  cursor: pointer;
+}
+
+#tts-enable-btn:hover,
+#tts-stop-btn:hover {
+  border-color: var(--text-muted);
+}
+
 #messages {
   flex: 1;
   overflow-y: auto;

@@ -71,8 +71,13 @@ class _FakeConnectionError(Exception):
     pass
 
 
+class _FakeCommandError(Exception):
+    pass
+
+
 _fake_musicpd.MPDClient = _FakeMPDClient
 _fake_musicpd.ConnectionError = _FakeConnectionError
+_fake_musicpd.CommandError = _FakeCommandError
 sys.modules["musicpd"] = _fake_musicpd
 
 # Create a minimal tools registry stub.
@@ -278,6 +283,36 @@ def test_artist_radio_empty_when_no_artist():
     with patch.object(music, "_sync_artist_songs", return_value=[]):
         result = music.artist_radio("NonExistentArtist")
     assert result == []
+
+
+def test_sync_play_tracks_skips_missing_mpd_paths():
+    """Artist radio should skip stale Strawberry rows instead of aborting playback."""
+
+    class ClientWithMissingPath(_FakeMPDClient):
+        def __init__(self):
+            self.added: list[str] = []
+            self.play_called = False
+
+        def add(self, path: str) -> None:
+            if path == "missing/song.mp3":
+                raise _FakeCommandError("[50@0] {add} No such directory")
+            self.added.append(path)
+
+        def play(self, pos: int | None = None) -> None:
+            self.play_called = True
+
+    client = ClientWithMissingPath()
+    tracks = [
+        {"url": "file:///media/jack/buffer/audio/ok/song1.mp3"},
+        {"url": "file:///media/jack/buffer/audio/missing/song.mp3"},
+        {"url": "file:///media/jack/buffer/audio/ok/song2.mp3"},
+    ]
+
+    with patch.object(music, "_mpd_connect", return_value=client):
+        music._sync_play_tracks(tracks)
+
+    assert client.added == ["ok/song1.mp3", "ok/song2.mp3"]
+    assert client.play_called is True
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,7 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+mpd/mpdstate
 
 # Chroma persistence (all generated files/subdirs)
 backend/chroma/
