@@ -510,66 +510,89 @@ Acceptance:
 ---
 
 ### Phase 9 — TNG-style voice output (TTS)
-**Estimate: 2–4 days**
-**Depends on: Phases 2, 4 (and ideally Phase 6 for tool response parity)**
+**Estimate: 2–3 days**
+**Depends on: Phases 2, 4**
 
-Goal: Assistant responds with spoken audio in a clear, consistent voice
-aligned to TNG computer style.
+Goal: Implement a pluggable TTS engine and wire end-to-end audio playback with
+barge-in support. Voice response quality (brevity, tone, pacing) will be polished
+in Phase 10 once the LangGraph responder node can shape output by modality.
 
-TTS engine choice: implement the pluggable interface first, then benchmark
-Piper TTS and Kokoro (open-weight, higher expressiveness ceiling) before
-committing to a default. The interface must make the underlying engine
-swappable without touching callers. `TTS_ENGINE` env var selects the engine.
+Design rationale: Attempting to retrofit spoken brevity into the current
+procedural code path creates a scattered maintenance burden — every tool response
+and responder prompt would need separate versions. The LangGraph responder node
+(Phase 10) provides the right architectural home for modality-aware response
+shaping. Phase 9 builds the foundation (TTS engine + playback + barge-in);
+Phase 10 polishes it (modality-aware responder that compresses for voice).
+
+TTS engine interface:
+- Pluggable engines live in `backend/tts/engines/` with a common
+  `async synthesize(text: str) → bytes` interface.
+- `backend/tts.py` selects engine by `TTS_ENGINE` env var.
+- Engines handle speaker/voice selection internally (via env vars or config).
 
 Tasks:
-- Implement TTS as a backend service with a pluggable engine interface.
-  Engines live in `backend/tts/engines/` with a common async `synthesize(text) → bytes`
-  interface. `tts.py` selects by `TTS_ENGINE` env var.
-- Benchmark Piper and Kokoro on the host hardware for latency and voice quality
-  before Phase 8 is marked complete. Document the winner and why.
-- Tune speaking rate, pitch, and prosody for a calm, authoritative delivery.
-- Add brief/full spoken response modes — spoken output should be shorter than
-  chat output by default.
-- Return audio as a stream or file URL; auto-play in frontend with correct
-  handling of browser autoplay constraints.
-- Add barge-in behavior: a new wake phrase while TTS is playing stops playback
-  and immediately starts listening.
+- Implement `backend/tts.py` with pluggable engine loader and common `synthesize()` method.
+- Implement a Piper TTS engine in `backend/tts/engines/piper.py`.
+- Implement a Kokoro TTS engine in `backend/tts/engines/kokoro.py` (if available/licensed).
+- Benchmark both engines on the host hardware for latency and voice quality.
+  Document the winner and rationale in a comment at the top of `tts.py`.
+- Add a TTS endpoint: `POST /tts` — accepts text, returns audio bytes with
+  proper MIME type (audio/wav or audio/mpeg).
+- Wire TTS into the `/chat` endpoint: after the responder generates text,
+  pipe it to TTS and return both text and audio stream/URL to the frontend.
+- Frontend: implement audio playback widget; auto-play with browser constraint
+  handling (muted, then unmute on user interaction if needed).
+- Add barge-in behavior: new wake-word detection while audio is playing stops
+  playback and immediately resumes listening (RMS threshold capture).
+- Tune speaking rate and pitch for calm, authoritative TNG computer style
+  (this is an engine parameter; document the settings used).
 
 Acceptance:
-- Assistant speaks responses end to end with stable audio quality.
-- Voice playback does not block normal chat use.
-- Barge-in stops TTS and resumes wake-word listening within 500 ms.
+- `/tts` endpoint returns audio bytes for arbitrary text input.
+- Responses are read aloud end-to-end (rough quality acceptable; will be
+  polished in Phase 10).
+- Voice playback does not block chat use or subsequent message sending.
+- Barge-in stops playback and resumes listening within 500 ms.
 - Swapping `TTS_ENGINE` in `.env` changes the engine without code changes.
+- Browser autoplay constraints are handled (auto-play muted, then unmute on
+  user gesture if needed).
+
+**Known gap (Phase 10):** Voice responses currently use the full chat text,
+which is verbose for spoken output. This will be addressed in Phase 10's
+responder node, which will have modality awareness and produce concise output
+for voice, full markdown for chat. Phase 9 intentionally does not attempt to
+retrofit brevity into the current procedural code path.
 
 ---
 
-### Phase 10 — LangGraph orchestration
-**Estimate: 1–2 weeks**
+### Phase 10a — Graph skeleton and router migration
+**Estimate: 3–5 days**
 **Depends on: all prior phases**
 
-Goal: Replace procedural routing with a stateful LangGraph graph. Nodes handle
-inner-monologue planning, memory retrieval, tool dispatch, and response generation.
-Enables multi-step reasoning, tool chaining, and durable session continuity.
+Goal: Introduce LangGraph with durable checkpointing and migrate existing router
+logic into a stateful graph. This phase establishes the graph foundation with zero
+feature additions — all behavior must pass through the graph with no regression.
 
-This phase also absorbs the core `code_tool` architecture. The coding assistant is
-part of the graph itself, inherits memory/session/tool access, and should not be
-built as a separate editor extension.
+Design notes:
+- The deterministic music pre-router (`_parse_music_command()` in the HTTP handler)
+  stays in place, by design. It guards the graph invocation for high-confidence music
+  commands and is never moved into the graph.
+- Pin LangGraph version immediately in `requirements.txt` — the checkpointer
+  interface changed significantly between v0.1 and v0.2.
+- Use `SqliteSaver` for durable session state.
+- Graph skeleton mirrors the target shape but with no advanced features yet:
+  it simply routes to existing tools and the simple responder.
 
-Graph nodes:
+Target graph shape (Phase 10a):
 ```
-input
-  └── intent_classifier
-    └── memory_retrieval
-      └── tool_router
-        ├── weather_tool
-        ├── music_tool
-        ├── code_tool
-        └── chat_fallback
-          └── responder
-            └── output
+input → intent_classifier → memory_retrieval → tool_router
+  ├── weather_tool
+  ├── music_tool
+  └── chat_fallback
+        └── responder → output
 ```
 
-State shape — include all fields from day one even if not all are used yet:
+State shape (fields added incrementally in future phases):
 ```python
 class AssistantState(TypedDict):
     messages: list[dict]
@@ -578,36 +601,163 @@ class AssistantState(TypedDict):
     tool_result: str
     user_prefs: dict
     session_id: str
-    active_files: list[str]
-    code_context: str
+    active_files: list[str]           # added in Phase 10b for code context
+    code_context: str                 # added in Phase 10b for code context
+    modality: str                     # added in Phase 10c (voice or chat)
 ```
 
-Implementation notes:
-- Use LangGraph v0.2+. Pin the exact version in `requirements.txt` immediately —
-  the checkpointer interface changed significantly between v0.1 and v0.2. Test
-  checkpoint resume explicitly before marking acceptance.
-- Use `SqliteSaver` checkpointer for durable session state.
-- Keep graph state inspectable: add a `GET /graph/state/{session_id}` debug endpoint.
-- Implement `code_tool` with LangGraph `create_react_agent`.
-- Use prebuilt `langchain-community` tools rather than bespoke shell/file/python wrappers.
-- Build code retrieval around tree-sitter-derived summaries and ChromaDB-backed `code_context` injection.
-- Never allow file writes without explicit confirmation and workspace-root validation.
-
 Tasks:
-- Introduce LangGraph with SqliteSaver checkpointer.
-- Migrate existing router and tool logic into named graph nodes.
-- Add the graph state fields needed for code-aware routing and retrieval.
-- Implement the `code_tool` node with confirmation-gated writes.
-- Expand ChromaDB integration to support semantic memory retrieval and `code_context` slices.
-- Keep graph state inspectable for debugging.
-- Ensure all existing tools work through the graph without regression.
+- Create `backend/graph.py` with LangGraph StateGraph definition and SqliteSaver checkpointer.
+- Pin LangGraph version in `requirements.txt` (v0.2+) and document the version constraint.
+- Migrate `router.py` intent classification logic into the `intent_classifier` node.
+- Migrate memory retrieval into the `memory_retrieval` node (call existing `memory.py` APIs).
+- Migrate tool routing logic into the `tool_router` node (weather, music, chat fallback).
+- Implement a simple `responder` node that passes through tool results or chat responses unchanged.
+- Wire the `/chat` endpoint in `main.py` to invoke the graph instead of calling `router.route()`.
+- Keep the HTTP-level `_parse_music_command()` guard in place — it fires before graph invocation.
+- Add a `GET /graph/state/{session_id}` debug endpoint for state inspection.
+- Implement checkpoint resume test: verify that after a graph invocation and container restart,
+  loading the session resumes with correct state (not a full re-execution).
 
 Acceptance:
-- Existing chat/tool behavior is preserved while routing is graph-driven.
+- All existing chat, tool (weather, music), and memory behavior passes through the graph
+  with zero functional regression.
 - Graph state is inspectable via debug endpoint.
-- Durable session continuity works through LangGraph checkpoints.
-- Checkpoint resume is explicitly tested after container restart.
-- Code intents execute through the graph-local `code_tool` rather than a standalone integration.
+- Checkpoint save/resume works correctly; state persists across container restart.
+- The deterministic music pre-router (`_parse_music_command`) still guards the graph
+  and handles high-confidence music commands without graph invocation.
+- LangGraph version is pinned in requirements.txt with documented rationale.
+- Checkpoint resume test passes explicitly before Phase 10a is marked complete.
+
+---
+
+### Phase 10b — Code tool node
+**Estimate: 1 week**
+**Depends on: Phase 10a**
+
+Goal: Add a dedicated code assistant node to the graph with a ReAct loop, tree-sitter
+summaries, ChromaDB code context injection, and confirmation-gated file writes.
+
+Design notes:
+- The `code_tool` node is self-contained once the graph exists.
+- Use LangGraph's `create_react_agent` to implement the ReAct loop.
+- Use prebuilt `langchain-community` tools: `ShellTool`, `ReadFileTool`, `WriteFileTool`, `PythonREPLTool`.
+- Tree-sitter summaries (function signatures, class hierarchies, import graphs) are
+  stored in ChromaDB under a dedicated `code_context` collection. Retrieval is injected
+  into coder prompts as `code_context` state field.
+- File writes require explicit confirmation from the user. For voice flows, summarize
+  the planned write aloud, then wait for verbal approval before touching disk.
+- Enforce workspace-root boundaries on all file operations — no path traversal.
+
+Tasks:
+- Add `active_files: list[str]` and `code_context: str` to `AssistantState`.
+- Build tree-sitter summary extraction (function signatures, class hierarchies, import graphs).
+- Create a ChromaDB `code_context` collection separate from conversation memory.
+- Implement `code_context_retrieval()` that queries ChromaDB and formats slices for injection.
+- Implement the `code_tool` node with `create_react_agent` and langchain-community tools.
+- Add workspace-root validation: all file operations must stay within configured boundary.
+- Implement confirmation-gated writes: generate the diff, present to user, wait for approval.
+- Add `tool_router` conditional to detect code intents and dispatch to `code_tool`.
+- Add `/code` endpoints for streaming code generation, file reads, and file writes
+  (with confirmation requirement).
+
+Acceptance:
+- "Computer, write a function that does X" generates code with relevant project context
+  injected from tree-sitter summaries.
+- "Computer, continue that function from yesterday" resolves via checkpointed graph state.
+- File writes present a diff/summary to the user and require explicit approval.
+- Workspace-root boundary is enforced on every file operation.
+- Code intents are routed to the local coder model (`OLLAMA_CODER_MODEL`) and do not
+  silently route to cloud unless unavailable.
+- Tree-sitter summaries are indexed and retrievable; context injection is working.
+
+---
+
+### Phase 10c — Responder node and voice/chat modality split
+**Estimate: 2–3 days**
+**Depends on: Phase 10a, Phase 9**
+
+Goal: Add the responder node with modality-aware output shaping. Voice responses
+are compressed and natural; chat responses are full and detailed. This is where
+the TTS brevity work deferred from Phase 9 is properly solved.
+
+Design notes:
+- The responder node receives a factual, tool-grounded response and shapes it
+  based on the `modality` state field.
+- For `modality="voice"`: compress to brief, natural spoken output; optimize for
+  ear (not eye). Hand off to TTS engine.
+- For `modality="chat"`: return full markdown with proper formatting, details, and links.
+- The `tone` field is wired into state as a nullable field — Phase 11's tone_probe
+  will populate it, but for now it remains null and has no effect.
+- This node closes the design gap from Phase 9: voice responses now have the right
+  architectural home for proper brevity and pacing.
+
+Tasks:
+- Add `modality: str` (values: "voice" or "chat") and `tone: str | None` to `AssistantState`.
+- Add logic to the `/chat` endpoint to set `modality` based on request source
+  (voice call vs. text chat).
+- Implement the `responder` node with modality-aware response shaping:
+  - For voice: use a compression prompt to extract key points and naturalize phrasing.
+    Aim for 20-30% of original length while preserving facts.
+  - For chat: return the full response as-is with markdown formatting.
+- Wire the responder node into the graph flow (comes after tool_router).
+- For voice responses, pipe the shaped output to the TTS engine (`/tts` endpoint).
+- Return both text and audio to the frontend for voice flows.
+- Document speaking rate, pitch, and prosody tuning used for TNG computer style
+  (this was benchmarked in Phase 9; reuse those settings).
+- Add a test that verifies voice responses contain all factual content from the
+  original response (no fact drift through compression).
+
+Acceptance:
+- Voice responses are concise and natural while chat responses are full and detailed.
+- Responder node correctly routes output based on `modality` state field.
+- Voice response compression preserves all factual content (verified by test).
+- TTS integration works end-to-end: response text is compressed, synthesized,
+  and returned with audio stream.
+- The `tone` field is wired into state as nullable; Phase 11 will populate it,
+  but Phase 10c leaves it as null without breaking behavior.
+- Audio playback in frontend works for voice flows; barge-in stops playback and
+  resumes listening (feature from Phase 9) still works with graph-based responses.
+
+---
+
+### Phase 10d — ChromaDB collection architecture cleanup
+**Estimate: 1–2 days**
+**Depends on: Phase 10b, Phase 10c**
+
+Goal: Separate conversation memory collections from code context collections
+in ChromaDB. Verify no retrieval cross-contamination. Handle the summaries table
+migration question from Phase 6.
+
+Design notes:
+- Two ChromaDB collections: `conversation_memory` (facts, episodic summaries,
+  preferences) and `code_context` (tree-sitter summaries, function signatures,
+  import graphs).
+- Retrieval for code intents queries only `code_context`.
+- Retrieval for general intents queries only `conversation_memory`.
+- No cross-contamination: code context never pollutes chat memory retrieval.
+- The summaries table from Phase 6 is formalized here: it's the backing store
+  for episodic memory and the input to Phase 12's consolidation process.
+
+Tasks:
+- Audit existing ChromaDB usage and identify all stored collections and metadata schemas.
+- Create a separate `code_context` collection for tree-sitter summaries (if not done in 10b).
+- Ensure `conversation_memory` collection stores only facts, preferences, and episodic summaries.
+- Update `memory_retrieval` node to query only `conversation_memory`.
+- Update `code_context_retrieval()` to query only `code_context`.
+- Write tests that verify cross-intent queries do not contaminate results
+  (e.g., code context does not appear in chat retrieval, and vice versa).
+- Formalize the summaries table (`id, session_id, summary, created_at, consolidated`)
+  as the backing store for episodic memory tier (Phase 12 prerequisite).
+- Document the ChromaDB schema and migration path for existing instances.
+
+Acceptance:
+- Two ChromaDB collections exist with clear separation: `conversation_memory` and `code_context`.
+- Code context does not pollute chat memory retrieval; conversational facts do not
+  appear in code context queries.
+- Summaries table is formalized in schema with documented columns and purpose.
+- Tests verify retrieval isolation: queries to one collection do not leak into the other.
+- ChromaDB schema is documented for future migrations and maintenance.
 
 ---
 
@@ -914,4 +1064,7 @@ Acceptance:
 ## Immediate next sprint
 
 - Phase 9: TTS voice output with barge-in support.
-- Phase 10: LangGraph migration with the integrated `code_tool` node, ReAct loop, tree-sitter-backed `code_context`, ChromaDB retrieval, and confirmation-gated writes.
+- Phase 10a: LangGraph graph skeleton and router migration.
+- Phase 10b: Code tool node with ReAct loop and tree-sitter context.
+- Phase 10c: Responder node and modality-aware output shaping (voice vs. chat).
+- Phase 10d: ChromaDB collection separation (conversation vs. code context).

@@ -48,6 +48,16 @@ CHAT_SUMMARY_TRIGGER_MESSAGES = int(os.getenv("CHAT_SUMMARY_TRIGGER_MESSAGES", "
 CHAT_SUMMARY_KEEP_RECENT_MESSAGES = int(os.getenv("CHAT_SUMMARY_KEEP_RECENT_MESSAGES", "8"))
 CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
 
+# ── Model swap latency baseline (measured 2026-04-28, RTX 3060 12 GB NVMe) ────
+# Run backend/tests/test_swap_latency.py to re-measure after hardware changes.
+# Measured cold-swap latency (gemma3:4b ↔ qwen2.5-coder:7b, n=10 each):
+#   gemma3:4b→qwen2.5-coder:7b: median=0.2s  min=0.2s  max=1.9s
+#   qwen2.5-coder:7b→gemma3:4b: median=0.3s  min=0.3s  max=2.4s
+#   Overall median: 0.3s — imperceptible; loading-state UX not required.
+# Interpretation: Ollama caches model weights in system RAM after GPU eviction
+# (keep_alive=0). First-ever load hits disk (~2s); subsequent swaps are RAM→GPU
+# re-pin only (~0.2-0.3s). Skip visible loading-state badge in Phase 10b.
+
 # ── HTTPS / CORS / cookie policy (Phase 0b) ───────────────────────────────────
 # CORS_ORIGINS: comma-separated list of allowed origins, e.g.
 #   CORS_ORIGINS=https://192.168.1.42,https://assistant.lan
