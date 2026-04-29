@@ -4,15 +4,15 @@ Goal: introduce LangGraph with durable checkpointing and migrate the current cha
 
 ## Phase 10a success criteria
 
-- [ ] Existing chat behavior still works end to end.
-- [ ] Existing weather and music tool behavior still works end to end.
-- [ ] Memory retrieval and injection behavior still works.
-- [ ] The deterministic music fast-path still bypasses graph invocation.
-- [ ] LangGraph is pinned in `backend/requirements.txt` with rationale.
-- [ ] `backend/graph.py` exists with `StateGraph` and SQLite checkpointer wiring (`AsyncSqliteSaver` for async-safe graph streaming).
-- [ ] `/chat` uses the graph for non-fast-path requests.
-- [ ] `GET /graph/state/{session_id}` returns inspectable state.
-- [ ] Checkpoint resume is covered by an explicit test.
+- [x] Existing chat behavior still works end to end.
+- [x] Existing weather and music tool behavior still works end to end.
+- [x] Memory retrieval and injection behavior still works.
+- [x] The deterministic music fast-path still bypasses graph invocation.
+- [x] LangGraph is pinned in `backend/requirements.txt` with rationale.
+- [x] `backend/graph.py` exists with `StateGraph` and SQLite checkpointer wiring (`AsyncSqliteSaver` for async-safe graph streaming).
+- [x] `/chat` uses the graph for non-fast-path requests.
+- [x] `GET /graph/state/{session_id}` returns inspectable state.
+- [x] Checkpoint resume is covered by an explicit test.
 
 ## Slice 1: freeze current behavior surface
 
@@ -77,15 +77,15 @@ Objective: make session state durable and inspectable.
 
 Deliverables:
 
-- [ ] Wire the SQLite checkpointer into the graph.
-- [ ] Map session identity to graph checkpoint identity.
-- [ ] Add `GET /graph/state/{session_id}`.
-- [ ] Decide which session concerns remain outside the graph for Phase 10a.
+- [x] Wire the SQLite checkpointer into the graph (FastAPI lifespan + `create_assistant_graph`).
+- [x] Map session identity to graph checkpoint identity (`checkpoint_config(session_id)` in `/chat`).
+- [x] Add `GET /graph/state/{session_id}`.
+- [x] Keep session cookies + in-memory session summary/history ownership in HTTP layer for Phase 10a.
 
 Exit criteria:
 
-- [ ] Graph state survives process restart.
-- [ ] State can be inspected without replaying the entire request.
+- [x] Graph state survives process restart (checkpointed graph configured in lifespan).
+- [x] State can be inspected without replaying the entire request.
 
 ## Slice 5: validate migration and resume behavior
 
@@ -93,15 +93,15 @@ Objective: prove the migration is architectural only, not behavioral.
 
 Deliverables:
 
-- [ ] Add graph routing smoke tests.
-- [ ] Add checkpoint resume test.
-- [ ] Add graph debug endpoint test.
-- [ ] Re-run focused chat, router, music, weather, and memory tests.
+- [x] Add graph routing smoke tests.
+- [x] Add checkpoint resume test.
+- [x] Add graph debug endpoint test.
+- [x] Re-run focused chat, router, music, weather, and memory tests.
 
 Exit criteria:
 
-- [ ] Focused regression suite passes.
-- [ ] Checkpoint resume behavior is explicit and green.
+- [x] Focused regression suite passes.
+- [x] Checkpoint resume behavior is explicit and green.
 
 ## Current assessment
 
@@ -112,7 +112,7 @@ Exit criteria:
 - [x] Vague music prompts are now covered by a regression test that proves they still flow through the normal router path.
 - [x] Graph scaffolding now exists in `backend/graph.py` with async-safe SQLite checkpoint wiring.
 - [x] Graph invocation and custom chunk streaming are now covered by `backend/tests/test_graph.py`.
-- [ ] No current tests mention checkpoint resume behavior yet.
+- [x] Checkpoint resume behavior is explicitly covered in `backend/tests/test_graph.py`.
 - [x] No current test explicitly proves music fast-path bypasses later orchestration.
 
 ## Focused test targets for Slice 1

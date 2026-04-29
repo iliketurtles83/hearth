@@ -19,6 +19,7 @@
   let creatingNewSession = false;
   let ttsAudio = null;
   let pendingVoicePlayback = null;
+  let currentQueuePos = null;
 
   function setTtsStatus(text) {
     if (ttsStatusEl) ttsStatusEl.textContent = text;
@@ -297,11 +298,6 @@
     scrollToBottom();
   }
 
-  function formatTime(ts) {
-    if (!ts) return 'unknown';
-    return new Date(ts * 1000).toLocaleString();
-  }
-
   function renderSessions(sessions, activeId) {
     if (!sessionListEl) return;
     sessionListEl.innerHTML = '';
@@ -315,11 +311,10 @@
 
     for (const session of sessions) {
       const item = document.createElement('div');
-      item.className = 'list-item' + (session.session_id === activeId ? ' active' : '');
+      item.className = 'list-item session-list-item' + (session.session_id === activeId ? ' active' : '');
       item.innerHTML = `
-        <div class="list-item-title">${(session.preview || 'New session').slice(0, 44)}</div>
-        <div class="list-item-meta">${session.message_count} msgs · ${formatTime(session.updated_at)}</div>
-        <div class="memory-actions">
+        <div class="session-row">
+          <div class="list-item-title session-title">${_esc((session.preview || 'New session').slice(0, 80))}</div>
           <button class="memory-delete-btn session-delete-btn" data-sid="${session.session_id}">Delete</button>
         </div>
       `;
@@ -393,11 +388,14 @@
   async function refreshNowPlaying() {
     const label = document.getElementById('now-playing-label');
     const btn = document.getElementById('music-play-pause-btn');
+    const volumeInput = document.getElementById('music-volume');
+    const volumeValue = document.getElementById('music-volume-value');
     if (!label) return;
     try {
       const resp = await (window.apiFetch || fetch)('/music/now_playing', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
+      currentQueuePos = Number.isInteger(data.pos) ? data.pos : null;
       if (data.track && data.state !== 'stop') {
         const t = data.track;
         const parts = [t.title, t.artist].filter(Boolean);
@@ -408,6 +406,11 @@
         label.textContent = 'Nothing playing';
         label.classList.add('now-playing-idle');
         if (btn) btn.textContent = '▶';
+      }
+      if (volumeInput && Number.isFinite(data.volume)) {
+        const vol = Math.max(0, Math.min(100, Number(data.volume)));
+        volumeInput.value = String(vol);
+        if (volumeValue) volumeValue.textContent = `${vol}%`;
       }
     } catch {
       // non-fatal — MPD may not be running
@@ -428,7 +431,8 @@
       }
       list.innerHTML = items.map(item => {
         const label = [item.title, item.artist].filter(Boolean).join(' — ') || 'Unknown track';
-        return `<div class="list-item list-item-clickable" data-pos="${item.pos}" title="Play this track"><span class="list-item-title">${_esc(label)}</span></div>`;
+        const active = currentQueuePos === item.pos ? ' active-track' : '';
+        return `<div class="list-item list-item-clickable${active}" data-pos="${item.pos}" title="Play this track"><span class="list-item-title">${_esc(label)}</span></div>`;
       }).join('');
       list.querySelectorAll('.list-item-clickable').forEach(el => {
         el.addEventListener('click', () => musicControl('play_pos', { pos: parseInt(el.dataset.pos, 10) }));
@@ -458,6 +462,8 @@
     const pp = document.getElementById('music-play-pause-btn');
     const next = document.getElementById('music-next-btn');
     const stop = document.getElementById('music-stop-btn');
+    const volume = document.getElementById('music-volume');
+    const volumeValue = document.getElementById('music-volume-value');
     if (pp) pp.addEventListener('click', async () => {
       // Toggle based on current label (▶ = resume, ⏸ = pause).
       const action = pp.textContent.trim() === '⏸' ? 'pause' : 'resume';
@@ -465,6 +471,15 @@
     });
     if (next) next.addEventListener('click', () => musicControl('next'));
     if (stop) stop.addEventListener('click', () => musicControl('stop'));
+    if (volume) {
+      volume.addEventListener('input', () => {
+        if (volumeValue) volumeValue.textContent = `${volume.value}%`;
+      });
+      volume.addEventListener('change', () => {
+        const value = Math.max(0, Math.min(100, parseInt(volume.value, 10) || 0));
+        musicControl('set_volume', { volume: value });
+      });
+    }
   })();
 
   async function loadCurrentSessionMessages() {
@@ -655,12 +670,14 @@
       refreshQueue();
     }
   }
-    async function startNewChat(event) {
+  async function startNewChat(event) {
       event?.preventDefault?.();
       event?.stopPropagation?.();
       if (creatingNewSession) return;
 
       creatingNewSession = true;
+      if (newChatBtn) newChatBtn.disabled = true;
+      if (sessionNewBtn) sessionNewBtn.disabled = true;
       setLocked(true);
       closeSidebar();
       try {
@@ -678,9 +695,11 @@
       } finally {
         creatingNewSession = false;
         setLocked(false);
+        if (newChatBtn) newChatBtn.disabled = false;
+        if (sessionNewBtn) sessionNewBtn.disabled = false;
         input.focus();
       }
-    }
+  }
 
   async function bootstrap() {
     await Promise.all([refreshSessions(), refreshMemory()]);

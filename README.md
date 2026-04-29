@@ -56,8 +56,8 @@ Music endpoints (Phase 8):
 - `POST /music/search` — search the Strawberry DB (title / artist / album)
 - `POST /music/play` — play a specific track or artist-radio
 - `POST /music/queue` — append tracks to MPD queue
-- `POST /music/control` — controls: `pause`, `resume`, `next`, `stop`
-- `GET /music/now_playing` — current track + playback state
+- `POST /music/control` — controls: `pause`, `resume`, `next`, `stop`, `play_pos`, `set_volume`
+- `GET /music/now_playing` — current track + playback state + queue position + volume
 - `GET /music/queue` — queued tracks
 
 ## Project Layout
@@ -201,6 +201,8 @@ MEMORY_MIN_RELEVANCE_SCORE=0.28
 # MPD_TIMEOUT=5
 # MUSIC_SEARCH_LIMIT=20
 # MUSIC_ARTIST_RADIO_N=10
+# MUSIC_PLAYLIST_MIN_N=12
+# MUSIC_PLAYLIST_MAX_N=24
 # PULSE_SERVER=/run/user/1000/pulse/native
 # PUID=1000
 # PGID=1000
@@ -302,6 +304,8 @@ Frontend behaviour:
 
 - The UI exposes a now-playing bar and queue that poll `GET /music/now_playing`
   and `GET /music/queue`. Playback controls call `POST /music/control`.
+- Queue click-to-play uses `play_pos`, and the music panel volume dial uses
+  `set_volume` with values clamped to 0-100.
 
 ## Local Development (Without Docker)
 

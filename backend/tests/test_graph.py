@@ -36,6 +36,10 @@ os.environ["AUTH_DB_PATH"] = os.path.join(_tmp_dir, "auth.db")
 import graph as assistant_graph  # noqa: E402
 
 
+TEST_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3:4b")
+TEST_CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
+
+
 class _FakeMemoryStore:
     def retrieve(self, _user_id: str, _query: str):
         return []
@@ -59,7 +63,7 @@ def _deps_for_local_stream(chunks: list[str]) -> assistant_graph.AssistantGraphD
             intent="quick-local",
             confidence=0.99,
             use_cloud=False,
-            model="gemma3:4b",
+            model=TEST_CHAT_MODEL,
             tool=None,
             planner_status="planner",
             reasoning_summary="short prompt",
@@ -67,7 +71,7 @@ def _deps_for_local_stream(chunks: list[str]) -> assistant_graph.AssistantGraphD
         )
 
     async def _fake_stream_local(_request, model_name=None):
-        assert model_name == "gemma3:4b"
+        assert model_name == TEST_CHAT_MODEL
         for chunk in chunks:
             yield chunk
 
@@ -83,8 +87,8 @@ def _deps_for_local_stream(chunks: list[str]) -> assistant_graph.AssistantGraphD
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
         tool_dispatch=_fake_tool_dispatch,
-        chat_model="gemma3:4b",
-        cloud_model="claude-sonnet-4-20250514",
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
     )
 
 
@@ -96,7 +100,7 @@ async def test_graph_ainvoke_returns_response_text_for_local_route():
 
     assert result["intent"] == "quick-local"
     assert result["route_type"] == "local"
-    assert result["response_model"] == "gemma3:4b"
+    assert result["response_model"] == TEST_CHAT_MODEL
     assert result["response_text"] == "hello world"
 
 
@@ -118,5 +122,61 @@ async def test_graph_astream_custom_emits_response_chunks_with_async_sqlite_chec
     assert "meta" in chunks[0]
     meta = chunks[0]["meta"]
     assert meta["intent"] == "quick-local"
-    assert meta["model"] == "gemma3:4b"
+    assert meta["model"] == TEST_CHAT_MODEL
     assert chunks[1:] == [{"text": "hello"}, {"text": " world"}]
+
+
+@pytest.mark.asyncio
+async def test_graph_checkpoint_resume_reloads_state_without_reexecution():
+    checkpoint_path = os.path.join(_tmp_dir, "graph-checkpoints-resume.sqlite")
+    calls = {"router": 0, "local": 0}
+
+    async def _fake_router(_message: str):
+        calls["router"] += 1
+        return SimpleNamespace(
+            intent="quick-local",
+            confidence=0.99,
+            use_cloud=False,
+            model=TEST_CHAT_MODEL,
+            tool=None,
+            planner_status="planner",
+            reasoning_summary="short prompt",
+            needs_memory=False,
+        )
+
+    async def _fake_stream_local(_request, model_name=None):
+        assert model_name == TEST_CHAT_MODEL
+        calls["local"] += 1
+        yield "checkpoint"
+        yield " state"
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run in checkpoint resume test")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        router_route=_fake_router,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+    config = assistant_graph.checkpoint_config("resume-session")
+
+    async with assistant_graph.create_assistant_graph(deps, checkpoint_path=checkpoint_path) as graph:
+        result = await graph.ainvoke(_base_state(), config=config)
+
+    assert result["response_text"] == "checkpoint state"
+    assert calls == {"router": 1, "local": 1}
+
+    async with assistant_graph.create_assistant_graph(deps, checkpoint_path=checkpoint_path) as graph_restarted:
+        snapshot = await graph_restarted.aget_state(config)
+
+    assert snapshot.values["response_text"] == "checkpoint state"
+    assert snapshot.values["intent"] == "quick-local"
+    # Snapshot read should not execute planner/LLM nodes again.
+    assert calls == {"router": 1, "local": 1}

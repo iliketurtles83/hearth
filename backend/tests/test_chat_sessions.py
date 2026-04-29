@@ -93,6 +93,28 @@ def test_list_sessions_only_returns_owned_sessions():
     assert [item["session_id"] for item in bob_sessions] == [bob_session_id]
 
 
+def test_list_sessions_sorted_by_updated_at_descending():
+    first_id, _ = main._get_or_create_session("alice", None)
+    second_id, _ = main._get_or_create_session("alice", None)
+
+    main._append_session_message(first_id, "user", "older")
+    main._append_session_message(second_id, "user", "newer")
+
+    sessions = main._list_sessions("alice")
+    assert [item["session_id"] for item in sessions] == [second_id, first_id]
+
+
+def test_get_or_create_existing_session_does_not_touch_updated_at():
+    session_id, _ = main._get_or_create_session("alice", None)
+    original_updated_at = main._session_store[session_id]["updated_at"]
+
+    returned_id, created = main._get_or_create_session("alice", session_id)
+
+    assert returned_id == session_id
+    assert created is False
+    assert main._session_store[session_id]["updated_at"] == original_updated_at
+
+
 @pytest.mark.asyncio
 async def test_list_chat_sessions_hides_foreign_current_session_cookie():
     alice_session_id, _ = main._get_or_create_session("alice", None)
@@ -138,6 +160,19 @@ async def test_get_chat_session_messages_reanchors_stale_foreign_cookie():
     assert payload["session_id"] != alice_session_id
     assert payload["messages"] == []
     assert main._session_store[payload["session_id"]]["user_id"] == "bob"
+
+
+@pytest.mark.asyncio
+async def test_get_chat_session_messages_does_not_touch_updated_at_for_existing_session():
+    session_id, _ = main._get_or_create_session("alice", None)
+    main._append_session_message(session_id, "user", "hello")
+    original_updated_at = main._session_store[session_id]["updated_at"]
+
+    response = await main.get_chat_session_messages(_request("alice", session_id))
+    payload = _json_body(response)
+
+    assert payload["session_id"] == session_id
+    assert main._session_store[session_id]["updated_at"] == original_updated_at
 
 
 @pytest.mark.asyncio
@@ -208,6 +243,25 @@ def test_truncate_summary_keeps_tail_within_limit(monkeypatch):
     assert truncated.endswith("line 4")
 
 
+def test_chat_request_default_system_uses_config_constant():
+    req = main.ChatRequest(message="hello")
+    assert req.system == main.CHAT_DEFAULT_SYSTEM_PROMPT
+
+
+def test_required_wake_models_reflect_runtime_constants(monkeypatch):
+    monkeypatch.setattr(main, "WAKEWORD_MODEL_FILE", "wake-custom.onnx")
+    monkeypatch.setattr(main, "OWW_MELSPEC_MODEL_FILE", "melspec-custom.onnx")
+    monkeypatch.setattr(main, "OWW_EMBEDDING_MODEL_FILE", "embed-custom.onnx")
+
+    required = main._required_wake_models()
+
+    assert required == [
+        "wake-custom.onnx",
+        "melspec-custom.onnx",
+        "embed-custom.onnx",
+    ]
+
+
 @pytest.mark.asyncio
 async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(monkeypatch):
     async def _fake_router_route(_message: str):
@@ -215,7 +269,7 @@ async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(mon
             intent="quick-local",
             confidence=0.99,
             use_cloud=False,
-            model="gemma3:4b",
+            model=main.CHAT_MODEL,
             planner_status="ok",
             needs_memory=False,
             tool=None,
@@ -252,7 +306,7 @@ async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(mon
     events = await _read_sse_events(response)
 
     assert events[0] != "[DONE]"
-    assert json.loads(events[0])["model"] == "gemma3:4b"
+    assert json.loads(events[0])["model"] == main.CHAT_MODEL
     assert any(json.loads(event).get("text") == "hello" for event in events if event != "[DONE]")
     assert any(json.loads(event).get("text") == " world" for event in events if event != "[DONE]")
     assert any("voice" in json.loads(event) for event in events if event != "[DONE]")
@@ -267,7 +321,7 @@ async def test_chat_stream_omits_voice_metadata_for_text_source(monkeypatch):
             intent="quick-local",
             confidence=0.99,
             use_cloud=False,
-            model="gemma3:4b",
+            model=main.CHAT_MODEL,
             planner_status="ok",
             needs_memory=False,
             tool=None,
@@ -357,7 +411,7 @@ async def test_chat_vague_music_prompt_still_uses_router_path(monkeypatch):
             intent="quick-local",
             confidence=0.75,
             use_cloud=False,
-            model="gemma3:4b",
+            model=main.CHAT_MODEL,
             planner_status="ok",
             needs_memory=False,
             tool=None,
@@ -390,6 +444,92 @@ async def test_chat_vague_music_prompt_still_uses_router_path(monkeypatch):
     events = await _read_sse_events(response)
 
     assert router_calls == ["play something chill"]
-    assert json.loads(events[0])["model"] == "gemma3:4b"
+    assert json.loads(events[0])["model"] == main.CHAT_MODEL
     assert any(json.loads(event).get("text") == "handled by router" for event in events if event != "[DONE]")
     assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_chat_graph_stream_uses_session_id_as_checkpoint_thread(monkeypatch):
+    session_id, _ = main._get_or_create_session("alice", None)
+    captured: dict[str, object] = {}
+
+    class _FakeGraph:
+        async def astream(self, _state, config=None, stream_mode=None):
+            captured["config"] = config
+            captured["stream_mode"] = stream_mode
+            yield {
+                "meta": {
+                    "model": main.CHAT_MODEL,
+                    "intent": "quick-local",
+                    "confidence": 0.99,
+                    "route_type": "local",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "ok",
+                    "reasoning_summary": "",
+                }
+            }
+            yield {"text": "checkpoint-bound"}
+
+    monkeypatch.setattr(main, "_assistant_graph", _FakeGraph())
+    if hasattr(main.app.state, "assistant_graph"):
+        delattr(main.app.state, "assistant_graph")
+    monkeypatch.setattr(
+        main.memory_store,
+        "ingest_user_message",
+        lambda *_args, **_kwargs: {
+            "status": "none",
+            "saved": [],
+            "blocked": [],
+            "needs_confirmation": [],
+            "deleted": 0,
+            "explicit": False,
+        },
+    )
+
+    response = await main.chat(
+        main.ChatRequest(message="hello", source="text"),
+        _request("alice", session_id),
+    )
+    events = await _read_sse_events(response)
+
+    assert captured["stream_mode"] == "custom"
+    assert captured["config"] == main.checkpoint_config(session_id)
+    assert any(json.loads(event).get("text") == "checkpoint-bound" for event in events if event != "[DONE]")
+    assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_get_graph_state_returns_snapshot_for_owned_session(monkeypatch):
+    session_id, _ = main._get_or_create_session("alice", None)
+
+    class _FakeGraph:
+        async def aget_state(self, _config):
+            return SimpleNamespace(
+                values={"intent": "quick-local", "route_type": "local"},
+                next=("responder",),
+                metadata={"checkpointed": True},
+            )
+
+    monkeypatch.setattr(main, "_assistant_graph", _FakeGraph())
+    if hasattr(main.app.state, "assistant_graph"):
+        delattr(main.app.state, "assistant_graph")
+
+    response = await main.get_graph_state(session_id, _request("alice", session_id))
+    payload = _json_body(response)
+
+    assert payload["session_id"] == session_id
+    assert payload["state"]["intent"] == "quick-local"
+    assert payload["next"] == ["responder"]
+    assert payload["metadata"]["checkpointed"] is True
+
+
+@pytest.mark.asyncio
+async def test_get_graph_state_denies_foreign_session():
+    session_id, _ = main._get_or_create_session("alice", None)
+
+    response = await main.get_graph_state(session_id, _request("bob", None))
+
+    assert response.status_code == 404
+    assert _json_body(response)["code"] == "SESSION_NOT_FOUND"

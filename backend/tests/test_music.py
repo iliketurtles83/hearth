@@ -19,7 +19,7 @@ import sqlite3
 import sys
 import types
 from typing import Any
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import pytest
 
@@ -278,11 +278,91 @@ def test_artist_radio_no_duplicates():
     assert len(ids) == len(set(ids)), "Duplicate tracks returned by artist_radio"
 
 
+def test_playlist_pick_count_adaptive_bounds(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 6)
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 12)
+
+    assert music._playlist_pick_count(0) == 0
+    assert music._playlist_pick_count(4) == 4
+    assert music._playlist_pick_count(20) == 10
+    assert music._playlist_pick_count(100) == 12
+    assert music._playlist_pick_count(100, requested_n=5) == 5
+
+
+def test_artist_radio_default_target_is_adaptive(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 12)
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    songs = [
+        {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
+         "url": f"file:///media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "playcount": i}
+        for i in range(1, 41)
+    ]
+    with patch.object(music, "_sync_artist_songs", return_value=songs):
+        result = music.artist_radio("Band", seed=7)
+    # pool=40 -> adaptive pick count = min(max_n=24, max(min_n=12, pool//2=20)) => 20
+    assert len(result) == 20
+
+
 def test_artist_radio_empty_when_no_artist():
     """Returns empty list when artist is not in the library."""
     with patch.object(music, "_sync_artist_songs", return_value=[]):
         result = music.artist_radio("NonExistentArtist")
     assert result == []
+
+
+def test_resolve_genre_query_matches_taxonomy_term(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_GENRE_TREE_PATH", "/tmp/genres.txt")
+    music._load_genre_terms.cache_clear()
+
+    fake_tree = "Rock\n  Progressive Rock\n# comment\n"
+    with patch("builtins.open", mock_open(read_data=fake_tree)), patch.object(music.os.path, "isfile", return_value=True):
+        matched = music._resolve_genre_query("play progressive rock")
+
+    assert matched == "progressive rock"
+
+
+@pytest.mark.asyncio
+async def test_play_prefers_genre_first_when_query_matches_known_genre(monkeypatch):
+    tracks = [
+        {"id": 1, "title": "Track 1", "artist": "Band", "album": "A", "url": "file:///media/jack/buffer/audio/t1.mp3", "score": 0.0, "playcount": 10},
+        {"id": 2, "title": "Track 2", "artist": "Band", "album": "A", "url": "file:///media/jack/buffer/audio/t2.mp3", "score": 0.0, "playcount": 8},
+    ]
+    monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: "metal")
+
+    with (
+        patch.object(music, "genre_radio", return_value=tracks) as genre_radio_mock,
+        patch.object(music, "_sync_play_tracks", return_value=None),
+        patch.object(music, "_sync_search", side_effect=AssertionError("_sync_search should not run on genre-first path")),
+    ):
+        result = await music.run({"action": "play", "query": "metal", "prompt": "play metal"})
+
+    assert result.ok
+    assert result.data["action"] == "play"
+    assert result.data["tracks"][0]["id"] == 1
+    genre_radio_mock.assert_called_once_with("metal")
+
+
+@pytest.mark.asyncio
+async def test_play_michael_jackson_uses_artist_heuristic_when_not_genre(monkeypatch):
+    search_results = [
+        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "file:///media/jack/buffer/audio/bj.mp3", "score": 0.9},
+        {"id": 11, "title": "Beat It", "artist": "Michael Jackson", "album": "Thriller", "url": "file:///media/jack/buffer/audio/bi.mp3", "score": 0.8},
+    ]
+    radio_tracks = [
+        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "file:///media/jack/buffer/audio/bj.mp3", "score": 0.0, "playcount": 100},
+    ]
+    monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: None)
+
+    with (
+        patch.object(music, "_sync_search", return_value=search_results),
+        patch.object(music, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
+        patch.object(music, "_sync_play_tracks", return_value=None),
+    ):
+        result = await music.run({"action": "play", "query": "michael jackson", "prompt": "play michael jackson"})
+
+    assert result.ok
+    assert result.data["tracks"][0]["artist"] == "Michael Jackson"
+    artist_radio_mock.assert_called_once_with("michael jackson")
 
 
 def test_sync_play_tracks_skips_missing_mpd_paths():
@@ -377,6 +457,38 @@ async def test_queue_view_mpd_down():
         result = await music.run({"action": "queue_view", "prompt": ""})
     assert not result.ok
     assert result.retryable
+
+
+@pytest.mark.asyncio
+async def test_control_set_volume_applies_and_returns_level():
+    with patch.object(music, "_sync_set_volume", return_value=37):
+        result = await music.run({"action": "control", "control": "set_volume", "volume": 37, "prompt": ""})
+    assert result.ok
+    assert result.data["action"] == "set_volume"
+    assert result.data["volume"] == 37
+
+
+@pytest.mark.asyncio
+async def test_control_set_volume_requires_value():
+    result = await music.run({"action": "control", "control": "set_volume", "prompt": ""})
+    assert not result.ok
+    assert not result.retryable
+
+
+def test_sync_now_playing_includes_pos_and_volume():
+    class StatusClient(_FakeMPDClient):
+        def status(self):
+            return {"state": "play", "song": "3", "volume": "64", "elapsed": "12.1", "duration": "240"}
+
+        def currentsong(self):
+            return {"title": "Track", "artist": "Band", "album": "Album"}
+
+    client = StatusClient()
+    with patch.object(music, "_mpd_connect", return_value=client):
+        data = music._sync_now_playing()
+
+    assert data["pos"] == 3
+    assert data["volume"] == 64
 
 
 # ── Phase 8b: direct song_id resolution ───────────────────────────────────────

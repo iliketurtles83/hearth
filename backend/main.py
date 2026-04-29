@@ -5,6 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 import httpx
 import anthropic
 import os
@@ -19,7 +20,13 @@ import numpy as np
 from dotenv import load_dotenv
 from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
 from memory import MemoryStore
-from graph import build_assistant_graph, AssistantGraphDependencies
+from graph import (
+    build_assistant_graph,
+    AssistantGraphDependencies,
+    create_assistant_graph,
+    checkpoint_config,
+    default_checkpoint_path,
+)
 import tts
 
 _memory_db_default = os.path.join(os.path.dirname(__file__), "memory.db")
@@ -49,6 +56,18 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 CHAT_SUMMARY_TRIGGER_MESSAGES = int(os.getenv("CHAT_SUMMARY_TRIGGER_MESSAGES", "18"))
 CHAT_SUMMARY_KEEP_RECENT_MESSAGES = int(os.getenv("CHAT_SUMMARY_KEEP_RECENT_MESSAGES", "8"))
 CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
+CHAT_DEFAULT_SYSTEM_PROMPT = os.getenv(
+    "CHAT_DEFAULT_SYSTEM_PROMPT",
+    "You are a helpful personal assistant. Be concise and accurate.",
+)
+
+WAKEWORD_MODEL_FILE = os.getenv("WAKEWORD_MODEL_FILE", "computer_v2.onnx")
+OWW_MELSPEC_MODEL_FILE = os.getenv("OWW_MELSPEC_MODEL_FILE", "melspectrogram.onnx")
+OWW_EMBEDDING_MODEL_FILE = os.getenv("OWW_EMBEDDING_MODEL_FILE", "embedding_model.onnx")
+
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "").strip().lower()
+WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "").strip().lower()
 
 # ── Model swap latency baseline (measured 2026-04-28, RTX 3060 12 GB NVMe) ────
 # Run backend/tests/test_swap_latency.py to re-measure after hardware changes.
@@ -84,9 +103,14 @@ _auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
 auth_service = AuthService(os.getenv("AUTH_DB_PATH", _auth_db_default))
 
 # ── Startup validation ─────────────────────────────────────────────────────────
+def _required_wake_models() -> list[str]:
+    models = [WAKEWORD_MODEL_FILE, OWW_MELSPEC_MODEL_FILE, OWW_EMBEDDING_MODEL_FILE]
+    return [m for m in models if m]
+
+
 def _validate_startup() -> None:
     _models_dir = os.path.join(os.path.dirname(__file__), "models")
-    required_models = ["computer_v2.onnx", "melspectrogram.onnx", "embedding_model.onnx"]
+    required_models = _required_wake_models()
     missing_models = [m for m in required_models if not os.path.isfile(os.path.join(_models_dir, m))]
     if missing_models:
         log.warning("Missing ONNX model files (wake-word will fail): %s", missing_models)
@@ -182,7 +206,20 @@ class COOPCOEPMiddleware(BaseHTTPMiddleware):
 # The lifespan (Slice 5) will replace this with a checkpointed version.
 _assistant_graph = None  # type: ignore[assignment]
 
-app = FastAPI()
+
+@asynccontextmanager
+async def _graph_lifespan(_app: FastAPI):
+    global _assistant_graph
+    async with create_assistant_graph(
+        _make_graph_deps(),
+        checkpoint_path=default_checkpoint_path(),
+    ) as checkpointed_graph:
+        _assistant_graph = checkpointed_graph
+        _app.state.assistant_graph = checkpointed_graph
+        log.info("graph.ready | checkpointer=sqlite path=%s", default_checkpoint_path())
+        yield
+
+app = FastAPI(lifespan=_graph_lifespan)
 
 app.add_middleware(COOPCOEPMiddleware)
 # Auth middleware must be added after COOP/COEP so it runs on the resolved request.
@@ -206,10 +243,10 @@ def get_oww_model():
         # v0.6.0 removed bundled backbone models — pass explicit paths so AudioFeatures
         # doesn't look in the (empty) library resources directory.
         _oww_model = Model(
-            wakeword_models=[os.path.join(_models_dir, "computer_v2.onnx")],
+            wakeword_models=[os.path.join(_models_dir, WAKEWORD_MODEL_FILE)],
             inference_framework="onnx",
-            melspec_model_path=os.path.join(_models_dir, "melspectrogram.onnx"),
-            embedding_model_path=os.path.join(_models_dir, "embedding_model.onnx"),
+            melspec_model_path=os.path.join(_models_dir, OWW_MELSPEC_MODEL_FILE),
+            embedding_model_path=os.path.join(_models_dir, OWW_EMBEDDING_MODEL_FILE),
         )
     return _oww_model
 
@@ -220,14 +257,17 @@ def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
         from faster_whisper import WhisperModel
-        device = "cuda" if os.path.exists("/dev/nvidia0") else "cpu"
-        compute = "float16" if device == "cuda" else "int8"
-        _whisper_model = WhisperModel("base.en", device=device, compute_type=compute)
+        if WHISPER_DEVICE:
+            device = WHISPER_DEVICE
+        else:
+            device = "cuda" if os.path.exists("/dev/nvidia0") else "cpu"
+        compute = WHISPER_COMPUTE_TYPE or ("float16" if device == "cuda" else "int8")
+        _whisper_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
     return _whisper_model
 
 class ChatRequest(BaseModel):
     message: str
-    system: str = "You are a helpful personal assistant. Be concise and accurate."
+    system: str = CHAT_DEFAULT_SYSTEM_PROMPT
     source: str = "text"
 
 
@@ -349,8 +389,6 @@ def _get_or_create_session(user_id: str, session_id: str | None) -> tuple[str, b
                 "updated_at": now,
             }
             log.info("chat.session.created | session_id=%s user_id=%s", effective_id, user_id)
-        else:
-            _session_store[effective_id]["updated_at"] = now
         _evict_oldest_sessions_if_needed()
         return effective_id, created
 
@@ -873,6 +911,7 @@ async def chat(request: ChatRequest, http_request: Request):
         "history": session_messages,
         "session_summary": session_summary,
     }
+    graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
 
     async def generate():
         assistant_accumulated = ""
@@ -885,7 +924,11 @@ async def chat(request: ChatRequest, http_request: Request):
         fallback_used = False
 
         try:
-            async for event in _assistant_graph.astream(graph_state, stream_mode="custom"):
+            async for event in graph_runner.astream(
+                graph_state,
+                config=checkpoint_config(session_id),
+                stream_mode="custom",
+            ):
                 if "meta" in event:
                     meta = event["meta"]
                     active_model = meta.get("model", CHAT_MODEL)
@@ -982,6 +1025,36 @@ async def chat(request: ChatRequest, http_request: Request):
     if session_created:
         log.info("chat.session.cookie_set | session_id=%s", session_id)
     return response
+
+
+@app.get("/graph/state/{session_id}")
+async def get_graph_state(session_id: str, http_request: Request):
+    user_id: str = http_request.state.user_id
+    with _session_store_lock:
+        if not _session_owned_by(_session_store.get(session_id), user_id):
+            return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
+
+    graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
+    if graph_runner is None:
+        return _error_response("Graph not initialized", "GRAPH_UNAVAILABLE", True, status_code=503)
+
+    try:
+        if hasattr(graph_runner, "aget_state"):
+            snapshot = await graph_runner.aget_state(checkpoint_config(session_id))
+        else:
+            snapshot = graph_runner.get_state(checkpoint_config(session_id))
+    except Exception as exc:
+        log.error("graph.state.error | session_id=%s error=%s", session_id, exc)
+        return _error_response("Graph state unavailable", "GRAPH_STATE_UNAVAILABLE", True, status_code=503)
+
+    return JSONResponse(
+        {
+            "session_id": session_id,
+            "state": getattr(snapshot, "values", {}) or {},
+            "next": list(getattr(snapshot, "next", ()) or ()),
+            "metadata": getattr(snapshot, "metadata", {}) or {},
+        }
+    )
 
 
 @app.delete("/chat/session")
@@ -1162,8 +1235,9 @@ class MusicQueueRequest(BaseModel):
 
 
 class MusicControlRequest(BaseModel):
-    action: str  # pause | resume | next | stop | play_pos
+    action: str  # pause | resume | next | stop | play_pos | set_volume
     pos: int | None = None  # required when action == "play_pos"
+    volume: int | None = None  # required when action == "set_volume"
 
 
 async def _music_run(params: dict) -> JSONResponse:
@@ -1214,10 +1288,10 @@ async def music_queue_add(request: MusicQueueRequest):
 
 @app.post("/music/control")
 async def music_control(request: MusicControlRequest):
-    """Send a playback control command: pause | resume | next | stop | play_pos."""
-    if request.action not in ("pause", "resume", "next", "stop", "play_pos"):
+    """Send a playback control command: pause | resume | next | stop | play_pos | set_volume."""
+    if request.action not in ("pause", "resume", "next", "stop", "play_pos", "set_volume"):
         return _error_response(
-            f"Unknown action '{request.action}'. Use: pause, resume, next, stop, play_pos.",
+            f"Unknown action '{request.action}'. Use: pause, resume, next, stop, play_pos, set_volume.",
             "MUSIC_INVALID_ACTION",
             False,
             status_code=400,
@@ -1226,6 +1300,7 @@ async def music_control(request: MusicControlRequest):
         "action": "control",
         "control": request.action,
         "pos": request.pos,
+        "volume": request.volume,
         "prompt": "",
     })
 

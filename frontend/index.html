@@ -6,7 +6,7 @@
   <title>Assistant</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Source+Serif+4:wght@400;500;600&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@500;600&family=Source+Serif+4:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css" />
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="/static/auth.js" type="module"></script>
@@ -65,8 +65,6 @@
       <button id="tts-enable-btn" type="button" style="display:none">Enable Voice</button>
       <button id="tts-stop-btn" type="button" style="display:none">Stop</button>
     </div>
-    <span id="auth-username" title="Logged-in user" style="font-size:0.85rem;opacity:0.7;margin-left:auto;"></span>
-    <button id="logout-btn" title="Sign out" style="margin-left:0.5rem;">Sign out</button>
     <button id="new-chat-btn" title="Start a fresh chat session">New Chat</button>
     <button id="mic-btn" title="Toggle voice (say &quot;Computer,&quot; to activate)">
       <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
@@ -81,38 +79,62 @@
 
   <div id="app-shell">
     <aside id="sidebar">
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Sessions</h2>
-          <button id="session-new-btn" class="panel-btn" title="Create a new session">New</button>
+      <div id="sidebar-top">
+        <div id="sidebar-sections" aria-label="Sidebar sections">
+          <button id="sidebar-section-chats" class="sidebar-section-btn active" type="button" aria-pressed="true">Chats</button>
+          <button id="sidebar-section-projects" class="sidebar-section-btn" type="button" aria-pressed="false" disabled>Projects</button>
         </div>
-        <div id="session-list" class="list"></div>
-      </section>
+        <p id="sidebar-section-note">Projects coming soon.</p>
+      </div>
 
-      <section class="panel">
-        <div class="panel-header">
-          <h2>Memory</h2>
-          <button id="memory-clear-btn" class="panel-btn danger" title="Clear all memory">Clear</button>
-        </div>
-        <div id="memory-list" class="list"></div>
-      </section>
-
-      <!-- Music panel (Phase 8): now-playing + queue -->
-      <section class="panel" id="music-panel">
-        <div class="panel-header">
-          <h2>Music</h2>
-          <div class="music-controls" id="music-controls">
-            <button id="music-prev-btn" class="panel-btn" title="Previous / Restart">&#9664;&#9664;</button>
-            <button id="music-play-pause-btn" class="panel-btn" title="Play / Pause">&#9654;</button>
-            <button id="music-next-btn" class="panel-btn" title="Next track">&#9654;&#9654;</button>
-            <button id="music-stop-btn" class="panel-btn" title="Stop">&#9632;</button>
+      <div id="sidebar-main">
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Sessions</h2>
+            <button id="session-new-btn" class="panel-btn" title="Create a new session">New</button>
           </div>
+          <div id="session-list" class="list"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Memory</h2>
+            <button id="memory-clear-btn" class="panel-btn danger" title="Clear all memory">Clear</button>
+          </div>
+          <div id="memory-list" class="list"></div>
+        </section>
+
+        <!-- Music panel (Phase 8): now-playing + queue -->
+        <section class="panel" id="music-panel">
+          <div class="panel-header">
+            <h2>Music</h2>
+            <div class="music-controls" id="music-controls">
+              <button id="music-prev-btn" class="panel-btn" title="Previous / Restart">&#9664;&#9664;</button>
+              <button id="music-play-pause-btn" class="panel-btn" title="Play / Pause">&#9654;</button>
+              <button id="music-next-btn" class="panel-btn" title="Next track">&#9654;&#9654;</button>
+              <button id="music-stop-btn" class="panel-btn" title="Stop">&#9632;</button>
+            </div>
+          </div>
+          <div id="now-playing-bar">
+            <span id="now-playing-label" class="now-playing-idle">Nothing playing</span>
+          </div>
+          <div id="music-volume-row">
+            <label for="music-volume" id="music-volume-label">Volume</label>
+            <input id="music-volume" type="range" min="0" max="100" step="1" value="60" />
+            <span id="music-volume-value">60%</span>
+          </div>
+          <div class="queue-header">Queue</div>
+          <div id="queue-list" class="list"></div>
+        </section>
+      </div>
+
+      <div id="sidebar-account">
+        <div id="sidebar-account-meta">
+          <span id="auth-username" title="Logged-in user"></span>
+          <span id="sidebar-account-status">Signed in</span>
         </div>
-        <div id="now-playing-bar">
-          <span id="now-playing-label" class="now-playing-idle">Nothing playing</span>
-        </div>
-        <div id="queue-list" class="list"></div>
-      </section>
+        <button id="logout-btn" class="panel-btn" title="Sign out">Sign out</button>
+      </div>
     </aside>
 
     <div id="chat-column">
