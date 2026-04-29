@@ -52,18 +52,19 @@ runtime code.
 
 When this section conflicts with historical roadmap notes below, follow this section.
 
-- Phases 1–9 are complete.
+- Phases 1–8 are complete.
 - Phase 8 includes the deterministic music pre-router (`_parse_music_command`) that bypasses the LLM for clear music commands, compound title+artist search, and year/decade range playback.
-- Phase 9 includes package-based TTS loader/engines, `/tts`, voice-source chat metadata, frontend playback controls, and barge-in interruption.
-- Phases 10–14 have not started yet.
+- Phases 9–14 have not started yet.
+- Active models: `gemma3:4b` (chat) and `qwen2.5-coder:7b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
 ## Model setup
 
-- `OLLAMA_CHAT_MODEL=gemma3:4b` for general conversation, voice responses, and persona anchoring.
+- `OLLAMA_CHAT_MODEL=gemma3:4b` for general conversation, voice responses, and persona anchoring. Chosen for its natural prose quality and ability to hold a system-prompt persona. Acceptable reasoning at 4B; complex tasks fall through to cloud.
 - `OLLAMA_CODER_MODEL=qwen2.5-coder:7b` for all code intents. Do not route code tasks to cloud by default.
 - Anthropic is fallback only when local confidence is low or the task exceeds local capability.
 - Both local models hot-swap inside one Ollama container. Simultaneous residency is not realistic on 12 GB VRAM, so routing and UX must account for swap latency.
+- Measured swap latency (2026-04-28, RTX 3060 NVMe): median 0.2–0.3 s after first load. Ollama keeps weights in system RAM after GPU eviction so repeat swaps are RAM to GPU re-pin only. First cold load from disk is about 2 s. Overall impact is imperceptible, so loading-state UX in Phase 10b is optional and low priority.
 
 ## Locked architecture decisions
 
@@ -74,6 +75,8 @@ When this section conflicts with historical roadmap notes below, follow this sec
 - File writes require explicit confirmation before touching disk. For voice flows, summarize the planned write first, then wait for confirmation.
 - Enforce workspace-root boundaries for all file operations.
 - Ignore terminal-only Ollama launch wrappers such as Claude Code, Codex, OpenCode, Hermes, and OpenClaw for this project. They do not participate in wake-word, graph-state, or voice flows.
+- The `code_tool` node inherits memory, session state, voice input, and tool access from the graph; keep designs aligned with that shared state model.
+- On code intents, memory retrieval injects relevant tree-sitter and import-graph slices into the coder prompt as `code_context`; this retrieval layer is part of what makes the local coder viable.
 
 ## Target LangGraph shape
 
@@ -87,6 +90,15 @@ input → intent_classifier → memory_retrieval → tool_router
 ```
 
 State shape for the graph should include: `messages`, `intent`, `memories`, `tool_result`, `user_prefs`, `session_id`, `active_files`, and `code_context`.
+
+## Key constraints and rules
+
+- All frontend API calls use relative paths. No hardcoded hosts or ports in runtime code.
+- New tools are modules under `backend/tools/` with interface: `async def run(params: dict) -> dict`.
+- `OLLAMA_CHAT_MODEL` and `OLLAMA_CODER_MODEL` are separate env vars. Never hardcode model names in source.
+- Structured logs for every routing decision, model selected, tool call, and error.
+- Cloud fallback degrades gracefully with a user-visible notice, never silent failure.
+- Android/mobile voice requires HTTPS-capable LAN edge support before it should be considered complete.
 
 ---
 
@@ -511,7 +523,7 @@ Acceptance:
 ---
 
 ### Phase 9 — TNG-style voice output (TTS)
-**Status: complete**
+**Status: not started**
 **Estimate: 2–3 days**
 **Depends on: Phases 2, 4**
 
@@ -643,6 +655,7 @@ Design notes:
 - File writes require explicit confirmation from the user. For voice flows, summarize
   the planned write aloud, then wait for verbal approval before touching disk.
 - Enforce workspace-root boundaries on all file operations — no path traversal.
+- Swap-latency measurements on this machine make model-loading UI a low-priority concern for Phase 10b. Prefer spending implementation budget on retrieval quality, confirmation UX, and correctness before adding load-state polish.
 
 Tasks:
 - Add `active_files: list[str]` and `code_context: str` to `AssistantState`.

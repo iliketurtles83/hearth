@@ -19,6 +19,7 @@ import numpy as np
 from dotenv import load_dotenv
 from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
 from memory import MemoryStore
+from graph import build_assistant_graph, AssistantGraphDependencies
 import tts
 
 _memory_db_default = os.path.join(os.path.dirname(__file__), "memory.db")
@@ -176,6 +177,10 @@ class COOPCOEPMiddleware(BaseHTTPMiddleware):
         # resources that don't set Cross-Origin-Resource-Policy headers.
         response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
         return response
+
+# Module-level graph instance — initialized after stream_local/stream_cloud are defined.
+# The lifespan (Slice 5) will replace this with a checkpointed version.
+_assistant_graph = None  # type: ignore[assignment]
 
 app = FastAPI()
 
@@ -584,6 +589,41 @@ async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[overr
             yield text
 
 
+# ── LangGraph dependency wiring ───────────────────────────────────────────────
+# Late-binding proxies: each closure looks up the current module-level name at
+# *call* time, so monkeypatch.setattr(main, "router_route", fake) in tests
+# propagates transparently through the graph.
+
+def _make_graph_deps() -> AssistantGraphDependencies:
+    async def _late_router_route(msg: str):
+        return await router_route(msg)
+
+    async def _late_stream_local(req, model_name=None):
+        async for chunk in stream_local(req, model_name):  # type: ignore[arg-type]
+            yield chunk
+
+    async def _late_stream_cloud(system: str, messages: list):
+        async for chunk in stream_cloud(system, messages):
+            yield chunk
+
+    async def _late_tool_dispatch(tool_name: str, params: dict):
+        return await tools.dispatch(tool_name, params)
+
+    return AssistantGraphDependencies(
+        memory_store=memory_store,
+        router_route=_late_router_route,
+        stream_local=_late_stream_local,
+        stream_cloud=_late_stream_cloud,
+        tool_dispatch=_late_tool_dispatch,
+        chat_model=CHAT_MODEL,
+        cloud_model=CLOUD_MODEL,
+    )
+
+
+_assistant_graph = build_assistant_graph(_make_graph_deps())
+log.info("graph.ready | checkpointer=none (no-checkpoint mode; Slice 5 adds AsyncSqliteSaver)")
+
+
 # ── Deterministic music pre-router ────────────────────────────────────────────
 # Maps control verbs to canonical MPD actions.
 _MUSIC_CTRL: dict[str, str] = {
@@ -819,185 +859,80 @@ async def chat(request: ChatRequest, http_request: Request):
         session_messages = list(session["messages"])
         session_summary = str(session.get("summary", "") or "")
 
-    selected_history, history_tokens, truncated, summary_tokens = _select_history_for_budget(
-        messages=session_messages,
-        system=request.system,
-        current_user_message=request.message,
-        summary_text=session_summary,
+    previous_user_message = next(
+        (m.get("content", "") for m in reversed(session_messages) if m.get("role") == "user"),
+        None,
     )
 
-    memory_hits_all = memory_store.retrieve(user_id, request.message)
-
-    decision = await router_route(request.message)
-    inject_memory = _should_inject_memory(decision.intent, memory_hits_all, request.message)
-    memory_hits = memory_hits_all if inject_memory else []
-    system_with_summary = _augment_system_with_session_summary(request.system, session_summary)
-    augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
-
-    log.info(
-        "chat.route | session_id=%s source=%s intent=%s confidence=%.3f route=%s model=%s "
-        "planner_status=%s needs_memory=%s tool=%s "
-        "total_messages=%d included_messages=%d estimated_history_tokens=%d summary_tokens=%d "
-        "summary_updated=%s summary_message_count=%d summary_chars=%d truncated=%s",
-        session_id,
-        chat_source,
-        decision.intent,
-        decision.confidence,
-        "cloud" if decision.use_cloud else "local",
-        decision.model,
-        decision.planner_status,
-        decision.needs_memory,
-        decision.tool,
-        len(session_messages),
-        len(selected_history),
-        history_tokens,
-        summary_tokens,
-        summary_updated,
-        summary_message_count,
-        summary_char_count,
-        truncated,
-    )
-    if decision.reasoning_summary:
-        log.debug("chat.planner_reasoning | session_id=%s reasoning=%s", session_id, decision.reasoning_summary)
-
-    # Build history for each backend.
-    # Local: flatten into a single prompt string (Ollama /api/generate).
-    # Cloud: pass as a proper messages array (Anthropic messages API).
-    local_prompt = _build_local_prompt(selected_history, request.message)
-    local_request = ChatRequest(message=local_prompt, system=augmented_system)
-
-    cloud_messages = [
-        {"role": m["role"], "content": m["content"]} for m in selected_history
-    ]
-    cloud_messages.append({"role": "user", "content": request.message})
+    graph_state = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "message": request.message,
+        "system": request.system,
+        "source": chat_source,
+        "history": session_messages,
+        "session_summary": session_summary,
+    }
 
     async def generate():
-        nonlocal decision
         assistant_accumulated = ""
         start_time = time.monotonic()
         first_token_time: float | None = None
-        active_model = decision.model
+        active_model = CHAT_MODEL
+        intent_for_log = "quick-local"
+        confidence_for_log = 1.0
+        route_for_log = "local"
         fallback_used = False
 
-        yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence})}\n\n"
-
-        # ── Tool dispatch ─────────────────────────────────────────────────────
-        # When the router sets decision.tool, call the registered tool module
-        # and summarize its normalized output through the local chat model.
-        # Raw API data is never sent directly to the client.
-        if decision.tool:
-            tool_result: ToolResult = await tools.dispatch(
-                decision.tool,
-                {"prompt": request.message, "user_id": user_id, "memory": memory_store},
-            )
-            log.info(
-                "chat.tool | session_id=%s tool=%s ok=%s retryable=%s",
-                session_id, decision.tool, tool_result.ok, tool_result.retryable,
-            )
-            if tool_result.ok:
-                # Build a summarization prompt: ask the local model to turn the
-                # normalized data dict into a natural-language response.
-                tool_data_str = json.dumps(tool_result.data, ensure_ascii=False)
-                summary_prompt = (
-                    f"You are a system that reports tool execution results. "
-                    f"Based on the following structured data, write a concise response.\n"
-                    f"User request: {request.message}\n"
-                    f"Data: {tool_data_str}\n"
-                    "Rules:\n"
-                    "- Do not ask follow-up questions.\n"
-                    "- Do not suggest alternatives.\n"
-                    "- If action is play/queue/control and tool succeeded, state what was done in one sentence.\n"
-                    "- Mention title/artist only from Data fields.\n"
-                    "- If data says nothing is playing, say that plainly.\n"
-                    "- Keep to 1-2 short sentences max."
-                )
-                summary_request = ChatRequest(message=summary_prompt, system=augmented_system)
-                try:
-                    async for chunk in stream_local(summary_request, model_name=CHAT_MODEL):
-                        if first_token_time is None:
-                            first_token_time = time.monotonic()
-                        assistant_accumulated += chunk
-                        yield f"data: {json.dumps({'text': chunk})}\n\n"
-                except Exception as exc:
-                    log.error("chat.tool_summary_error | session_id=%s error=%s", session_id, exc)
-                    yield f"data: {json.dumps({'text': f'⚠ Could not summarize tool response: {exc}'})}\n\n"
-            else:
-                error_msg = tool_result.error or "The tool returned no data."
-                assistant_accumulated = error_msg
-                yield f"data: {json.dumps({'text': error_msg})}\n\n"
-
-            # Skip stream_local / stream_cloud for tool responses — we are done.
-            completion_time = time.monotonic()
-            first_token_ms = (first_token_time - start_time) * 1000 if first_token_time else -1
-            completion_ms = (completion_time - start_time) * 1000
-            log.info(
-                "chat.telemetry | session_id=%s intent=%s confidence=%.3f route=tool "
-                "model=%s fallback=False first_token_ms=%.0f completion_ms=%.0f response_tokens_approx=%d",
-                session_id, decision.intent, decision.confidence, active_model,
-                first_token_ms, completion_ms, _estimate_tokens(assistant_accumulated),
-            )
-            _append_session_message(session_id, "user", request.message)
-            _append_session_message(session_id, "assistant", assistant_accumulated.strip())
-            memory_store.ingest_user_message(user_id, request.message, source=chat_source)
-            return
-        # ── End tool dispatch ─────────────────────────────────────────────────
-
-        primary = (
-            stream_cloud(augmented_system, cloud_messages)
-            if decision.use_cloud
-            else stream_local(local_request, model_name=decision.model)
-        )
-
         try:
-            async for chunk in primary:
-                if first_token_time is None:
-                    first_token_time = time.monotonic()
-                assistant_accumulated += chunk
-                yield f"data: {json.dumps({'text': chunk})}\n\n"
-
-        except Exception as exc:
-            if decision.use_cloud:
-                # Graceful degradation: fall back to local with a visible notice.
-                log.warning("chat.cloud_fallback | session_id=%s error=%s", session_id, exc)
-                fallback_used = True
-                active_model = CHAT_MODEL
-                notice_msg = 'Cloud unavailable — responding with local model'
-                yield f"data: {json.dumps({'notice': notice_msg})}\n\n"
-                yield f"data: {json.dumps({'model': active_model, 'intent': decision.intent, 'confidence': decision.confidence, 'fallback': True})}\n\n"
-                async for chunk in stream_local(local_request, model_name=CHAT_MODEL):
+            async for event in _assistant_graph.astream(graph_state, stream_mode="custom"):
+                if "meta" in event:
+                    meta = event["meta"]
+                    active_model = meta.get("model", CHAT_MODEL)
+                    intent_for_log = meta.get("intent", "")
+                    confidence_for_log = float(meta.get("confidence", 0.0))
+                    route_for_log = meta.get("route_type", "local")
+                    log.info(
+                        "chat.route | session_id=%s source=%s intent=%s confidence=%.3f route=%s model=%s "
+                        "planner_status=%s needs_memory=%s tool=%s total_messages=%d "
+                        "summary_updated=%s summary_message_count=%d summary_chars=%d",
+                        session_id, chat_source, intent_for_log, confidence_for_log, route_for_log,
+                        active_model, meta.get("planner_status", ""), meta.get("needs_memory", False),
+                        meta.get("tool"), len(session_messages), summary_updated,
+                        summary_message_count, summary_char_count,
+                    )
+                    if meta.get("reasoning_summary"):
+                        log.debug("chat.planner_reasoning | session_id=%s reasoning=%s", session_id, meta["reasoning_summary"])
+                    yield f"data: {json.dumps({'model': active_model, 'intent': intent_for_log, 'confidence': confidence_for_log})}\n\n"
+                elif "text" in event:
+                    chunk = event["text"]
                     if first_token_time is None:
                         first_token_time = time.monotonic()
                     assistant_accumulated += chunk
                     yield f"data: {json.dumps({'text': chunk})}\n\n"
-            else:
-                log.error("chat.local_error | session_id=%s error=%s", session_id, exc)
-                yield f"data: {json.dumps({'text': f'⚠ Error: {exc}'})}\n\n"
+                elif "notice" in event:
+                    fallback_used = True
+                    yield f"data: {json.dumps({'notice': event['notice']})}\n\n"
+                elif event.get("fallback"):
+                    active_model = event.get("model", CHAT_MODEL)
+                    yield f"data: {json.dumps(event)}\n\n"
+        except Exception as exc:
+            log.error("chat.graph_error | session_id=%s error=%s", session_id, exc)
+            yield f"data: {json.dumps({'text': f'⚠ Error: {exc}'})}\n\n"
 
         completion_time = time.monotonic()
         first_token_ms = (first_token_time - start_time) * 1000 if first_token_time else -1
         completion_ms = (completion_time - start_time) * 1000
-
         log.info(
             "chat.telemetry | session_id=%s intent=%s confidence=%.3f route=%s "
             "model=%s fallback=%s first_token_ms=%.0f completion_ms=%.0f response_tokens_approx=%d",
-            session_id,
-            decision.intent,
-            decision.confidence,
-            "cloud" if decision.use_cloud else "local",
-            active_model,
-            fallback_used,
-            first_token_ms,
-            completion_ms,
+            session_id, intent_for_log, confidence_for_log, route_for_log,
+            active_model, fallback_used, first_token_ms, completion_ms,
             _estimate_tokens(assistant_accumulated),
         )
 
         _append_session_message(session_id, "user", request.message)
         _append_session_message(session_id, "assistant", assistant_accumulated.strip())
-
-        previous_user_message = next(
-            (m.get("content", "") for m in reversed(session_messages) if m.get("role") == "user"),
-            None,
-        )
 
         memory_result = memory_store.ingest_user_message(
             user_id,
@@ -1006,10 +941,8 @@ async def chat(request: ChatRequest, http_request: Request):
             previous_user_message=previous_user_message,
         )
         log.info(
-            "chat.memory | session_id=%s retrieved=%d injected=%d status=%s saved=%d blocked=%d needs_confirmation=%d candidates=%d explicit=%s",
+            "chat.memory | session_id=%s status=%s saved=%d blocked=%d needs_confirmation=%d candidates=%d explicit=%s",
             session_id,
-            len(memory_hits_all),
-            len(memory_hits),
             memory_result.get("status", "none"),
             len(memory_result.get("saved", [])),
             len(memory_result.get("blocked", [])),
@@ -1020,33 +953,27 @@ async def chat(request: ChatRequest, http_request: Request):
 
         yield (
             "data: "
-            + json.dumps(
-                {
-                    "memory": {
-                        "status": memory_result.get("status", "none"),
-                        "saved": len(memory_result.get("saved", [])),
-                        "blocked": len(memory_result.get("blocked", [])),
-                        "needs_confirmation": len(memory_result.get("needs_confirmation", [])),
-                        "deleted": int(memory_result.get("deleted", 0) or 0),
-                        "explicit": bool(memory_result.get("explicit", False)),
-                        "hint": (
-                            "Memory needs confirmation. Say 'remember this' to store it."
-                            if memory_result.get("status") == "needs-confirmation"
-                            else ""
-                        ),
-                    }
+            + json.dumps({
+                "memory": {
+                    "status": memory_result.get("status", "none"),
+                    "saved": len(memory_result.get("saved", [])),
+                    "blocked": len(memory_result.get("blocked", [])),
+                    "needs_confirmation": len(memory_result.get("needs_confirmation", [])),
+                    "deleted": int(memory_result.get("deleted", 0) or 0),
+                    "explicit": bool(memory_result.get("explicit", False)),
+                    "hint": (
+                        "Memory needs confirmation. Say 'remember this' to store it."
+                        if memory_result.get("status") == "needs-confirmation"
+                        else ""
+                    ),
                 }
-            )
+            })
             + "\n\n"
         )
 
         voice_meta = _voice_tts_metadata(chat_source)
         if voice_meta is not None:
-            yield (
-                "data: "
-                + json.dumps(voice_meta)
-                + "\n\n"
-            )
+            yield "data: " + json.dumps(voice_meta) + "\n\n"
 
         yield "data: [DONE]\n\n"
 

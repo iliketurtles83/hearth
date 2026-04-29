@@ -9,6 +9,10 @@ openwakeword
 websockets
 numpy
 chromadb
+# Phase 10a: pin LangGraph and the SQLite checkpointer package together so
+# async graph streaming and checkpoint behavior are stable across environments.
+langgraph==1.1.10
+langgraph-checkpoint-sqlite==3.0.3
 python-musicpd
 pytest
 pytest-asyncio

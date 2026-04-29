@@ -302,3 +302,94 @@ async def test_chat_stream_omits_voice_metadata_for_text_source(monkeypatch):
     assert any(json.loads(event).get("text") == "text only" for event in events if event != "[DONE]")
     assert not any("voice" in json.loads(event) for event in events if event != "[DONE]")
     assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(monkeypatch):
+    async def _unexpected_router(_message: str):
+        raise AssertionError("router_route should not run for explicit music commands")
+
+    dispatched: list[tuple[str, dict]] = []
+
+    async def _fake_dispatch(tool_name: str, params: dict):
+        dispatched.append((tool_name, dict(params)))
+        return main.ToolResult(
+            ok=True,
+            data={
+                "action": "play",
+                "track": {"title": "Battery", "artist": "Metallica"},
+            },
+        )
+
+    monkeypatch.setattr(main, "router_route", _unexpected_router)
+    monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
+
+    response = await main.chat(
+        main.ChatRequest(message="play Battery by Metallica", source="text"),
+        _request("alice"),
+    )
+    events = await _read_sse_events(response)
+
+    assert json.loads(events[0]) == {"model": "music", "intent": "music", "confidence": 1.0}
+    assert json.loads(events[1])["text"] == 'Now playing: "Battery" by Metallica.'
+    assert events[-1] == "[DONE]"
+    assert dispatched == [
+        (
+            "music",
+            {
+                "action": "play",
+                "query": "battery",
+                "artist_filter": "metallica",
+                "prompt": "play Battery by Metallica",
+                "user_id": "alice",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_chat_vague_music_prompt_still_uses_router_path(monkeypatch):
+    router_calls: list[str] = []
+
+    async def _fake_router_route(message: str):
+        router_calls.append(message)
+        return SimpleNamespace(
+            intent="quick-local",
+            confidence=0.75,
+            use_cloud=False,
+            model="gemma3:4b",
+            planner_status="ok",
+            needs_memory=False,
+            tool=None,
+            reasoning_summary="",
+        )
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "handled by router"
+
+    monkeypatch.setattr(main, "router_route", _fake_router_route)
+    monkeypatch.setattr(main, "stream_local", _fake_stream_local)
+    monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        main.memory_store,
+        "ingest_user_message",
+        lambda *_args, **_kwargs: {
+            "status": "none",
+            "saved": [],
+            "blocked": [],
+            "needs_confirmation": [],
+            "deleted": 0,
+            "explicit": False,
+        },
+    )
+
+    response = await main.chat(
+        main.ChatRequest(message="play something chill", source="text"),
+        _request("alice"),
+    )
+    events = await _read_sse_events(response)
+
+    assert router_calls == ["play something chill"]
+    assert json.loads(events[0])["model"] == "gemma3:4b"
+    assert any(json.loads(event).get("text") == "handled by router" for event in events if event != "[DONE]")
+    assert events[-1] == "[DONE]"
