@@ -53,6 +53,9 @@ class AssistantState(TypedDict, total=False):
     pending_write: dict[str, Any]    # {path, content, relative_path} awaiting confirmation
     awaiting_confirmation: bool       # True when a write diff is pending user approval
     force_code: bool                  # True for /code endpoint to bypass classifier
+    # Phase 10c — responder modality split
+    modality: str                     # "voice" or "chat"; set by /chat endpoint from request source
+    tone: str | None                  # populated by Phase 11 tone_probe; null until then
 
 
 @dataclass
@@ -399,15 +402,28 @@ def build_assistant_graph(
         system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
         augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
 
-        # Phase 10b: inject code context for code intents
+        # Phase 10b/10d: route ChromaDB queries by intent.
+        # - Non-code intents: deps.memory_store.retrieve() queries 'conversation_memory' only.
+        # - Code intents: code_context_retrieval() queries 'code_context' only.
+        # The two collections are strictly separate — see Phase 10d for migration details.
         code_context = ""
         if state.get("intent") == "code":
+            log.info(
+                "graph.memory_retrieval | collection=code_context | session=%s",
+                state.get("session_id", ""),
+            )
             code_context = code_context_retrieval(state["message"], deps.chroma_path, max_snippets=5)
             if code_context:
                 log.info(
                     "graph.memory_retrieval | code_context_injected=true | session=%s",
                     state.get("session_id", ""),
                 )
+        else:
+            log.debug(
+                "graph.memory_retrieval | collection=conversation_memory | hits=%d | session=%s",
+                len(memory_hits),
+                state.get("session_id", ""),
+            )
 
         return {
             "selected_history": selected_history,
@@ -892,10 +908,50 @@ def build_assistant_graph(
             "active_files": sorted(touched_files),
         }
 
+    _VOICE_COMPRESS_SYSTEM = (
+        "You convert assistant responses to natural spoken English for audio output. "
+        "Rules:\n"
+        "1. Remove all markdown formatting (headers, bullets, bold, italic, code blocks).\n"
+        "2. Preserve ALL factual content: numbers, names, dates, locations, measurements.\n"
+        "3. Target 20-30% of original length. If already short (under 40 words), keep as-is.\n"
+        "4. Use natural conversational phrasing, as if speaking aloud to someone.\n"
+        "5. Do not add new information. Do not ask follow-up questions.\n"
+        "6. Output the spoken version ONLY — no preamble, no labels."
+    )
+
+    async def _compress_response_for_voice(original: str, model_name: str) -> str:
+        """Compress a full chat response into a brief spoken version."""
+        if not original.strip():
+            return original
+        word_count = len(original.split())
+        if word_count <= 30:
+            # Already short — strip markdown and return.
+            import re as _re
+            clean = _re.sub(r"[`*_#>\[\]!]", "", original)
+            clean = _re.sub(r"\s+", " ", clean).strip()
+            return clean
+        compress_request = PromptRequest(
+            message=(
+                f"Original response ({word_count} words):\n{original}\n\nSpoken version:"
+            ),
+            system=_VOICE_COMPRESS_SYSTEM,
+        )
+        compressed = ""
+        async for chunk in deps.stream_local(compress_request, model_name=model_name):
+            compressed += chunk
+        result = compressed.strip()
+        log.info(
+            "graph.responder | voice_compress | original_words=%d compressed_words=%d",
+            word_count,
+            len(result.split()),
+        )
+        return result if result else original
+
     async def responder(state: AssistantState) -> dict[str, Any]:
         writer = get_stream_writer()
         response_text = ""
         response_model = state.get("model", deps.chat_model)
+        modality = state.get("modality", "chat")
 
         if state.get("tool"):
             tool_result = await deps.tool_dispatch(
@@ -908,32 +964,60 @@ def build_assistant_graph(
                     message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),
                     system=state["augmented_system"],
                 )
-                async for chunk in deps.stream_local(summary_request, model_name=deps.chat_model):
-                    writer({"text": chunk})
-                    response_text += chunk
+                if modality == "voice":
+                    collected = ""
+                    async for chunk in deps.stream_local(summary_request, model_name=deps.chat_model):
+                        collected += chunk
+                    response_text = await _compress_response_for_voice(collected, deps.chat_model)
+                    writer({"text": response_text})
+                else:
+                    async for chunk in deps.stream_local(summary_request, model_name=deps.chat_model):
+                        writer({"text": chunk})
+                        response_text += chunk
             else:
                 response_text = getattr(tool_result, "error", "The tool returned no data.") or "The tool returned no data."
                 writer({"text": response_text})
         elif state.get("use_cloud"):
             response_model = deps.cloud_model
             try:
-                async for chunk in deps.stream_cloud(state["augmented_system"], state["cloud_messages"]):
-                    writer({"text": chunk})
-                    response_text += chunk
+                if modality == "voice":
+                    collected = ""
+                    async for chunk in deps.stream_cloud(state["augmented_system"], state["cloud_messages"]):
+                        collected += chunk
+                    response_text = await _compress_response_for_voice(collected, deps.chat_model)
+                    writer({"text": response_text})
+                else:
+                    async for chunk in deps.stream_cloud(state["augmented_system"], state["cloud_messages"]):
+                        writer({"text": chunk})
+                        response_text += chunk
             except Exception:
                 log.warning("graph.cloud_fallback | session_id=%s", state.get("session_id", ""))
                 response_model = deps.chat_model
                 writer({"notice": "Cloud unavailable \u2014 responding with local model"})
                 writer({"model": deps.chat_model, "intent": state.get("intent", ""), "confidence": state.get("confidence", 0.0), "fallback": True})
                 local_request = PromptRequest(message=state["local_prompt"], system=state["augmented_system"])
-                async for chunk in deps.stream_local(local_request, model_name=deps.chat_model):
-                    writer({"text": chunk})
-                    response_text += chunk
+                if modality == "voice":
+                    collected = ""
+                    async for chunk in deps.stream_local(local_request, model_name=deps.chat_model):
+                        collected += chunk
+                    response_text = await _compress_response_for_voice(collected, deps.chat_model)
+                    writer({"text": response_text})
+                else:
+                    async for chunk in deps.stream_local(local_request, model_name=deps.chat_model):
+                        writer({"text": chunk})
+                        response_text += chunk
         else:
             local_request = PromptRequest(message=state["local_prompt"], system=state["augmented_system"])
-            async for chunk in deps.stream_local(local_request, model_name=state["model"]):
-                writer({"text": chunk})
-                response_text += chunk
+            if modality == "voice":
+                collected = ""
+                async for chunk in deps.stream_local(local_request, model_name=state["model"]):
+                    collected += chunk
+                response_text = await _compress_response_for_voice(collected, deps.chat_model)
+                writer({"text": response_text})
+            else:
+                async for chunk in deps.stream_local(local_request, model_name=state["model"]):
+                    writer({"text": chunk})
+                    response_text += chunk
 
         return {"response_text": response_text.strip(), "response_model": response_model}
 

@@ -940,6 +940,8 @@ async def chat(request: ChatRequest, http_request: Request):
         "message": request.message,
         "system": request.system,
         "source": chat_source,
+        "modality": "voice" if chat_source == "voice" else "chat",
+        "tone": None,
         "history": session_messages,
         "session_summary": session_summary,
     }

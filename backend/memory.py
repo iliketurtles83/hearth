@@ -68,10 +68,57 @@ class MemoryStore:
 
         self._embedder = HashEmbeddingFunction()
         self._chroma = chromadb.PersistentClient(path=self.chroma_path)
+        self._migrate_collection_name()
         self._collection = self._chroma.get_or_create_collection(
-            name="assistant_memories",
+            name="conversation_memory",
             embedding_function=self._embedder,
         )
+
+    def _migrate_collection_name(self) -> None:
+        """One-time migration: copy assistant_memories → conversation_memory then delete the old collection.
+
+        Safe to call on every startup — becomes a no-op once migration is done.
+        """
+        import logging as _logging
+        _log = _logging.getLogger("assistant.memory")
+        try:
+            existing_names = [c.name for c in self._chroma.list_collections()]
+        except Exception:
+            return
+
+        has_old = "assistant_memories" in existing_names
+        has_new = "conversation_memory" in existing_names
+
+        if not has_old:
+            return  # nothing to migrate
+
+        if has_old and has_new:
+            _log.warning(
+                "memory: both 'assistant_memories' and 'conversation_memory' exist — "
+                "using 'conversation_memory' as authoritative; 'assistant_memories' left intact"
+            )
+            return
+
+        # Copy all documents from old collection into new collection.
+        old_col = self._chroma.get_collection(name="assistant_memories", embedding_function=self._embedder)
+        new_col = self._chroma.get_or_create_collection(name="conversation_memory", embedding_function=self._embedder)
+
+        try:
+            result = old_col.get(include=["documents", "metadatas"])
+            ids = result.get("ids") or []
+            if ids:
+                new_col.upsert(
+                    ids=ids,
+                    documents=result.get("documents") or [],
+                    metadatas=result.get("metadatas") or [],
+                )
+            self._chroma.delete_collection("assistant_memories")
+            _log.info(
+                "memory: migrated %d documents from 'assistant_memories' to 'conversation_memory'",
+                len(ids),
+            )
+        except Exception as exc:
+            _log.error("memory: migration failed (%s) — leaving both collections intact", exc)
 
     _SENSITIVE_SECRET_PATTERNS = [
         r"\b(api[_-]?key|token|password|secret|passwd|bearer)\b",
@@ -115,11 +162,12 @@ class MemoryStore:
                 );
 
                 CREATE TABLE IF NOT EXISTS summaries (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id    TEXT NOT NULL,
-                    session_id TEXT NOT NULL,
-                    summary    TEXT NOT NULL,
-                    created_at REAL NOT NULL
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id      TEXT NOT NULL,
+                    session_id   TEXT NOT NULL,
+                    summary      TEXT NOT NULL,
+                    created_at   REAL NOT NULL,
+                    consolidated INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_facts_user_id
@@ -130,9 +178,18 @@ class MemoryStore:
                     ON preferences(user_id, key);
                 CREATE INDEX IF NOT EXISTS idx_summaries_user_id
                     ON summaries(user_id);
+                CREATE INDEX IF NOT EXISTS idx_summaries_session_id
+                    ON summaries(session_id);
                 """
             )
-            self._conn.commit()
+            # Live-instance migration: add 'consolidated' column if it doesn't exist yet.
+            try:
+                self._conn.execute(
+                    "ALTER TABLE summaries ADD COLUMN consolidated INTEGER NOT NULL DEFAULT 0"
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
 
     def _is_sensitive(self, text: str) -> bool:
         t = text.lower()
@@ -401,6 +458,25 @@ class MemoryStore:
                 (user_id, key, value, now),
             )
             self._conn.commit()
+
+    def save_summary(self, user_id: str, session_id: str, summary: str) -> int:
+        """Persist an episodic session summary.  Returns the new row id.
+
+        The ``consolidated`` flag is left at 0 (False).  Phase 12's consolidation
+        process will set it to 1 once the summary has been promoted to long-term
+        semantic memory (SQLite facts + ChromaDB conversation_memory).
+        """
+        now = time.time()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO summaries (user_id, session_id, summary, created_at, consolidated)
+                VALUES (?, ?, ?, ?, 0)
+                """,
+                (user_id, session_id, summary, now),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)  # type: ignore[arg-type]
 
     def list_items(self, user_id: str, limit: int = 200, offset: int = 0) -> dict[str, Any]:
         with self._lock:

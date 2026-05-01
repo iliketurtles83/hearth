@@ -266,8 +266,17 @@ This repository includes baseline review controls for security and correctness:
 Run local checks before opening a PR:
 
 ```bash
+bash scripts/review_changed_tests.sh --base origin/main
 bash scripts/review_baseline.sh
 ```
+
+Optional local iteration mode (does not affect CI):
+
+```bash
+bash scripts/review_changed_tests.sh --base origin/main --allow-known-failures
+```
+
+Known-failures deselection list is stored at `docs/review/KNOWN_FAILURES.txt`.
 
 Notes:
 
