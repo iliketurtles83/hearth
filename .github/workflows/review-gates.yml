@@ -7,6 +7,35 @@ on:
       - main
 
 jobs:
+  changed-files-fast-tests:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    continue-on-error: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+          cache-dependency-path: |
+            backend/requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r backend/requirements.txt
+
+      - name: Run changed-files fast tests
+        run: |
+          bash scripts/review_changed_tests.sh --base origin/main
+
   backend-review-gates:
     runs-on: ubuntu-latest
     timeout-minutes: 25
