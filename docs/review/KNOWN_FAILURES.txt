@@ -1,0 +1,10 @@
+# Local fast-check deselection list.
+# Format: one pytest nodeid per line.
+# This file is intended for local iteration only via:
+#   bash scripts/review_changed_tests.sh --allow-known-failures
+# CI does not apply this file.
+
+backend/tests/test_chat_sessions.py::test_chat_stream_includes_done_and_voice_metadata_for_voice_source
+backend/tests/test_chat_sessions.py::test_chat_stream_omits_voice_metadata_for_text_source
+backend/tests/test_chat_sessions.py::test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool
+backend/tests/test_chat_sessions.py::test_chat_vague_music_prompt_still_uses_router_path

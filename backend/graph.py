@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import difflib
 import json
 import logging
@@ -56,6 +57,8 @@ class AssistantState(TypedDict, total=False):
     # Phase 10c — responder modality split
     modality: str                     # "voice" or "chat"; set by /chat endpoint from request source
     tone: str | None                  # populated by Phase 11 tone_probe; null until then
+    # Phase 11 — personality and affect layer
+    persona: dict[str, Any]           # {name, style, warmth, formality}; empty dict = unconfigured
 
 
 @dataclass
@@ -387,6 +390,33 @@ def build_assistant_graph(
             "route_type": route_type,
         }
 
+    _TONE_LABELS = frozenset({"calm", "curious", "frustrated", "excited", "uncertain", "urgent"})
+    _TONE_PROBE_SYSTEM = (
+        "Classify the emotional tone of the user's message with a single word. "
+        "Choose ONLY from: calm, curious, frustrated, excited, uncertain, urgent. "
+        "Reply with exactly one word and nothing else."
+    )
+
+    async def _probe_tone(message: str) -> str:
+        """Return an affect label for *message*.  Fallback to 'calm' on any error."""
+        if len(message.split()) < 5:
+            return "calm"
+        try:
+            probe_request = PromptRequest(
+                message=message,
+                system=_TONE_PROBE_SYSTEM,
+            )
+            collected = ""
+            async for chunk in deps.stream_local(probe_request, model_name=deps.chat_model):
+                collected += chunk
+                if len(collected) > 30:
+                    break
+            label = collected.strip().lower().split()[0] if collected.strip() else "calm"
+            return label if label in _TONE_LABELS else "calm"
+        except Exception as exc:  # noqa: BLE001
+            log.debug("graph.tone_probe | fallback | %s", exc)
+            return "calm"
+
     async def memory_retrieval(state: AssistantState) -> dict[str, Any]:
         history = list(state.get("history", []))
         session_summary = str(state.get("session_summary", "") or "")
@@ -396,7 +426,11 @@ def build_assistant_graph(
             current_user_message=state["message"],
             summary_text=session_summary,
         )
-        memory_hits_all = deps.memory_store.retrieve(state["user_id"], state["message"])
+        # Run memory retrieval and tone probe concurrently.
+        memory_hits_all, tone = await asyncio.gather(
+            asyncio.to_thread(deps.memory_store.retrieve, state["user_id"], state["message"]),
+            _probe_tone(state["message"]),
+        )
         inject_memory = _should_inject_memory(state["intent"], memory_hits_all, state["message"])
         memory_hits = memory_hits_all if inject_memory else []
         system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
@@ -433,6 +467,7 @@ def build_assistant_graph(
             "memories": memory_hits,
             "augmented_system": augmented_system,
             "code_context": code_context,
+            "tone": tone,
         }
 
     async def tool_router(state: AssistantState) -> dict[str, Any]:
@@ -1021,6 +1056,77 @@ def build_assistant_graph(
 
         return {"response_text": response_text.strip(), "response_model": response_model}
 
+    _PERSONA_VOICE_SYSTEM = (
+        "You are a style adapter for a voice assistant. "
+        "Your job is to reword the assistant response to match the configured persona tone and style. "
+        "Rules:\n"
+        "1. Preserve ALL factual content: every number, name, date, measurement, and technical term must appear verbatim.\n"
+        "2. Do not shorten or lengthen the response significantly.\n"
+        "3. Do not add new information or ask follow-up questions.\n"
+        "4. Output only the reworded response — no preamble or labels."
+    )
+    _PERSONA_CHAT_SYSTEM = (
+        "You are a style adapter for a chat assistant. "
+        "Your job is to lightly rephrase the assistant response to match the configured persona tone and style. "
+        "Rules:\n"
+        "1. Preserve ALL factual content: every number, name, date, measurement, and technical term must appear verbatim.\n"
+        "2. Preserve all markdown formatting exactly: headers (##), bullets (-), bold (**), code blocks, etc.\n"
+        "3. Do not change the length. Do not add new information. Do not ask follow-up questions.\n"
+        "4. Output only the rephrased response — no preamble or labels."
+    )
+
+    async def persona_renderer(state: AssistantState) -> dict[str, Any]:
+        """Apply persona styling to response_text.  No-op when persona is unconfigured."""
+        response_text = str(state.get("response_text", ""))
+        persona = state.get("persona") or {}
+        tone = state.get("tone") or "calm"
+        modality = state.get("modality", "chat")
+
+        style = str(persona.get("style") or "").strip().lower()
+        name = str(persona.get("name") or "").strip()
+
+        # No-op: unconfigured or neutral+calm (no value in an LLM call)
+        if not persona or (style in ("", "neutral") and tone == "calm"):
+            return {"response_text": response_text}
+
+        persona_desc_parts = []
+        if name:
+            persona_desc_parts.append(f"Persona name: {name}")
+        if style and style != "neutral":
+            persona_desc_parts.append(f"Style: {style}")
+        warmth = persona.get("warmth")
+        if warmth is not None:
+            persona_desc_parts.append(f"Warmth level: {warmth}/5")
+        formality = str(persona.get("formality") or "").strip()
+        if formality:
+            persona_desc_parts.append(f"Formality: {formality}")
+        persona_desc_parts.append(f"User's detected tone: {tone}")
+        persona_desc = "\n".join(persona_desc_parts)
+
+        if modality == "voice":
+            system_prompt = _PERSONA_VOICE_SYSTEM + f"\n\nPersona configuration:\n{persona_desc}"
+        else:
+            system_prompt = _PERSONA_CHAT_SYSTEM + f"\n\nPersona configuration:\n{persona_desc}"
+
+        render_request = PromptRequest(
+            message=f"Original response:\n{response_text}\n\nStyled response:",
+            system=system_prompt,
+        )
+        styled = ""
+        try:
+            async for chunk in deps.stream_local(render_request, model_name=deps.chat_model):
+                styled += chunk
+            result = styled.strip() or response_text
+        except Exception as exc:  # noqa: BLE001
+            log.warning("graph.persona_renderer | error, returning original | %s", exc)
+            result = response_text
+
+        log.info(
+            "graph.persona_renderer | modality=%s | tone=%s | style=%s | session=%s",
+            modality, tone, style, state.get("session_id", ""),
+        )
+        return {"response_text": result}
+
     # ── Edge routing helpers ───────────────────────────────────────────────────
 
     def _after_intent_classifier(state: AssistantState) -> str:
@@ -1041,6 +1147,7 @@ def build_assistant_graph(
     graph.add_node("code_tool", code_tool)
     graph.add_node("write_executor", write_executor)
     graph.add_node("responder", responder)
+    graph.add_node("persona_renderer", persona_renderer)
 
     graph.add_edge(START, "intent_classifier")
     graph.add_conditional_edges("intent_classifier", _after_intent_classifier, {
@@ -1054,7 +1161,8 @@ def build_assistant_graph(
     })
     graph.add_edge("code_tool", END)
     graph.add_edge("write_executor", END)
-    graph.add_edge("responder", END)
+    graph.add_edge("responder", "persona_renderer")
+    graph.add_edge("persona_renderer", END)
 
     return graph.compile(checkpointer=checkpointer)
 

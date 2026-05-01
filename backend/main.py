@@ -934,6 +934,12 @@ async def chat(request: ChatRequest, http_request: Request):
         None,
     )
 
+    _persona_config = {
+        "name": memory_store.get_preference(user_id, "persona_name") or "",
+        "style": memory_store.get_preference(user_id, "persona_style") or "neutral",
+        "warmth": int(memory_store.get_preference(user_id, "persona_warmth") or 3),
+        "formality": memory_store.get_preference(user_id, "persona_formality") or "",
+    }
     graph_state = {
         "user_id": user_id,
         "session_id": session_id,
@@ -942,6 +948,7 @@ async def chat(request: ChatRequest, http_request: Request):
         "source": chat_source,
         "modality": "voice" if chat_source == "voice" else "chat",
         "tone": None,
+        "persona": _persona_config,
         "history": session_messages,
         "session_summary": session_summary,
     }
@@ -1205,6 +1212,58 @@ async def get_chat_session_messages(http_request: Request):
     return response
 
 
+# ── Persona config endpoints (Phase 11) ──────────────────────────────────────
+
+_PERSONA_STYLE_VALUES = frozenset({"neutral", "warm", "direct"})
+
+
+class PersonaConfigRequest(BaseModel):
+    name: str | None = None
+    style: str | None = None
+    warmth: int | None = None
+    formality: str | None = None
+
+
+@app.get("/persona")
+async def get_persona(http_request: Request):
+    user_id: str = http_request.state.user_id
+    return JSONResponse({
+        "name": memory_store.get_preference(user_id, "persona_name") or "",
+        "style": memory_store.get_preference(user_id, "persona_style") or "neutral",
+        "warmth": int(memory_store.get_preference(user_id, "persona_warmth") or 3),
+        "formality": memory_store.get_preference(user_id, "persona_formality") or "",
+    })
+
+
+@app.post("/persona")
+async def set_persona(payload: PersonaConfigRequest, http_request: Request):
+    user_id: str = http_request.state.user_id
+    if payload.name is not None:
+        memory_store.set_preference(user_id, "persona_name", payload.name)
+    if payload.style is not None:
+        if payload.style not in _PERSONA_STYLE_VALUES:
+            return _error_response(
+                f"style must be one of: {', '.join(sorted(_PERSONA_STYLE_VALUES))}",
+                "PERSONA_INVALID_STYLE",
+                False,
+                status_code=400,
+            )
+        memory_store.set_preference(user_id, "persona_style", payload.style)
+    if payload.warmth is not None:
+        if not (1 <= payload.warmth <= 5):
+            return _error_response("warmth must be between 1 and 5", "PERSONA_INVALID_WARMTH", False, status_code=400)
+        memory_store.set_preference(user_id, "persona_warmth", str(payload.warmth))
+    if payload.formality is not None:
+        memory_store.set_preference(user_id, "persona_formality", payload.formality)
+    log.info("persona.set | user_id=%s name=%s style=%s warmth=%s", user_id, payload.name, payload.style, payload.warmth)
+    return JSONResponse({
+        "name": memory_store.get_preference(user_id, "persona_name") or "",
+        "style": memory_store.get_preference(user_id, "persona_style") or "neutral",
+        "warmth": int(memory_store.get_preference(user_id, "persona_warmth") or 3),
+        "formality": memory_store.get_preference(user_id, "persona_formality") or "",
+    })
+
+
 @app.get("/memory")
 async def list_memory(http_request: Request, limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0)):
     user_id: str = http_request.state.user_id
@@ -1396,6 +1455,11 @@ async def legacy_message_js():
 @app.get("/voice.js", include_in_schema=False)
 async def legacy_voice_js():
     return FileResponse(os.path.join(_frontend_dir, "voice.js"))
+
+
+@app.get("/persona.js", include_in_schema=False)
+async def legacy_persona_js():
+    return FileResponse(os.path.join(_frontend_dir, "persona.js"))
 
 
 @app.get("/favicon.ico", include_in_schema=False)

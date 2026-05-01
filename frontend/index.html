@@ -104,6 +104,30 @@
           <div id="memory-list" class="list"></div>
         </section>
 
+        <!-- Persona panel (Phase 11): personality and affect configuration -->
+        <section class="panel" id="persona-panel">
+          <div class="panel-header">
+            <h2>Persona</h2>
+          </div>
+          <div id="persona-form">
+            <label class="persona-label" for="persona-name">Name</label>
+            <input id="persona-name" type="text" placeholder="e.g. Aria" maxlength="40" autocomplete="off" />
+
+            <label class="persona-label" for="persona-style">Style</label>
+            <select id="persona-style">
+              <option value="neutral">Neutral (default)</option>
+              <option value="warm">Warm</option>
+              <option value="direct">Direct</option>
+            </select>
+
+            <label class="persona-label" for="persona-warmth">Warmth <span id="persona-warmth-value">3</span>/5</label>
+            <input id="persona-warmth" type="range" min="1" max="5" step="1" value="3" />
+
+            <button id="persona-save-btn" class="panel-btn" type="button">Save</button>
+            <span id="persona-save-status" class="persona-status"></span>
+          </div>
+        </section>
+
         <!-- Music panel (Phase 8): now-playing + queue -->
         <section class="panel" id="music-panel">
           <div class="panel-header">
@@ -174,5 +198,6 @@
 
   <script src="/static/message.js"></script>
   <script src="/static/voice.js"></script>
+  <script src="/static/persona.js"></script>
 </body>
 </html>

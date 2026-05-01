@@ -74,8 +74,11 @@ def _make_deps(
     original_chunks: list[str],
     compressed_response: str,
 ) -> assistant_graph.AssistantGraphDependencies:
-    """Build deps where the first stream_local call returns original_chunks,
-    and the second (compression) call returns compressed_response."""
+    """Build deps where stream_local calls are:
+      call 1: tone probe (returns 'calm')
+      call 2: original model response (original_chunks)
+      call 3+: compression / persona_renderer (compressed_response)
+    """
     call_count = {"n": 0}
 
     async def _fake_router(_message: str):
@@ -93,11 +96,14 @@ def _make_deps(
     async def _fake_stream_local(_request, model_name=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            # First call: original model response
+            # Tone probe call (Phase 11) — return a valid label
+            yield "calm"
+        elif call_count["n"] == 2:
+            # Original model response
             for chunk in original_chunks:
                 yield chunk
         else:
-            # Second call: compression call — yield the compressed response
+            # Compression pass (voice) or persona_renderer
             yield compressed_response
 
     async def _fake_stream_cloud(_system: str, _messages: list):
@@ -169,13 +175,16 @@ async def test_chat_modality_response_passes_through_full_text():
 
 @pytest.mark.asyncio
 async def test_chat_modality_tone_is_none():
-    """tone field should be None by default (Phase 11 populates it)."""
+    """tone field must be a valid label after Phase 11 memory_retrieval runs."""
     deps = _make_deps(original_chunks=["Hello!"], compressed_response="unused")
     graph = assistant_graph.build_assistant_graph(deps)
 
     result = await graph.ainvoke(_chat_state(message="Hi"))
 
-    assert result.get("tone") is None
+    _valid_labels = {"calm", "curious", "frustrated", "excited", "uncertain", "urgent"}
+    assert result.get("tone") in _valid_labels, (
+        f"Expected tone to be a valid label, got {result.get('tone')!r}"
+    )
 
 
 # ── Voice modality: compression pass must run ────────────────────────────────

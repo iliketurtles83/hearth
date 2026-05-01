@@ -52,7 +52,7 @@ runtime code.
 
 When this section conflicts with historical roadmap notes below, follow this section.
 
-- Phases 1–10d are complete.
+- Phases 1–11 are complete.
 - Phase 8 includes the deterministic music pre-router (`_parse_music_command`) that bypasses the LLM for clear music commands, compound title+artist search, and year/decade range playback.
 - Phase 9 TTS is complete (Piper + Kokoro engines, `/tts` endpoint, barge-in, voice SSE metadata).
 - Phase 10a LangGraph migration is complete (graph skeleton, checkpointing, all nodes wired, `/graph/state` endpoint, checkpoint resume test passing).
