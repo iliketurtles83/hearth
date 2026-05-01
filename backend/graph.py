@@ -52,6 +52,7 @@ class AssistantState(TypedDict, total=False):
     code_context: str                 # tree-sitter snippets injected into coder prompt
     pending_write: dict[str, Any]    # {path, content, relative_path} awaiting confirmation
     awaiting_confirmation: bool       # True when a write diff is pending user approval
+    force_code: bool                  # True for /code endpoint to bypass classifier
 
 
 @dataclass
@@ -198,6 +199,25 @@ def _tool_summary_prompt(user_message: str, tool_data: dict[str, Any]) -> str:
     )
 
 
+def code_context_retrieval(query: str, chroma_path: str, max_snippets: int = 5) -> str:
+    """Fetch and format code-context snippets for prompt injection."""
+    if not chroma_path:
+        return ""
+    try:
+        from tools.code_indexer import query_code_context
+    except Exception:
+        return ""
+
+    snippets = query_code_context(query, chroma_path, n=max_snippets)
+    if not snippets:
+        return ""
+
+    formatted: list[str] = []
+    for idx, snippet in enumerate(snippets, start=1):
+        formatted.append(f"[code_context {idx}]\n{snippet}")
+    return "\n\n---\n\n".join(formatted)
+
+
 def build_assistant_graph(
     deps: AssistantGraphDependencies,
     *,
@@ -226,10 +246,26 @@ def build_assistant_graph(
                 proposed.splitlines(keepends=True),
                 fromfile=f"a/{relative_path}",
                 tofile=f"b/{relative_path}",
-                lineterm="",
+                lineterm="\n",
             )
         )
         return "".join(lines) if lines else ""
+
+    def _write_summary_for_voice(relative_path: str, diff_text: str) -> str:
+        additions = 0
+        deletions = 0
+        for line in diff_text.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                continue
+            if line.startswith("+"):
+                additions += 1
+            elif line.startswith("-"):
+                deletions += 1
+        return (
+            f"Planned write to {relative_path}. "
+            f"About {additions} additions and {deletions} deletions. "
+            "Say yes to apply, or tell me what to change."
+        )
 
     _CONFIRM_PATTERN = re.compile(
         r"^\s*(yes|confirm|approve|go ahead|do it|write it|apply|proceed)\s*[.!]?\s*$",
@@ -241,6 +277,38 @@ def build_assistant_graph(
     async def intent_classifier(state: AssistantState) -> dict[str, Any]:
         writer = get_stream_writer()
 
+        def _last_assistant_message() -> str:
+            for item in reversed(list(state.get("history", []))):
+                if item.get("role") == "assistant":
+                    return str(item.get("content", ""))
+            return ""
+
+        # Dedicated /code endpoint can force code routing deterministically.
+        if state.get("force_code"):
+            writer({
+                "meta": {
+                    "model": deps.coder_model or deps.chat_model,
+                    "intent": "code",
+                    "confidence": 1.0,
+                    "route_type": "code",
+                    "needs_memory": True,
+                    "tool": None,
+                    "planner_status": "forced",
+                    "reasoning_summary": "",
+                }
+            })
+            return {
+                "intent": "code",
+                "confidence": 1.0,
+                "use_cloud": False,
+                "model": deps.coder_model or deps.chat_model,
+                "tool": None,
+                "planner_status": "forced",
+                "reasoning_summary": "",
+                "needs_memory": True,
+                "route_type": "code",
+            }
+
         # Short-circuit: if a write diff is pending and the user confirmed it,
         # skip normal LLM routing and go straight to write_executor.
         if state.get("awaiting_confirmation") and state.get("pending_write"):
@@ -248,6 +316,33 @@ def build_assistant_graph(
             if _CONFIRM_PATTERN.match(msg):
                 log.info(
                     "graph.intent_classifier | confirm_write detected | session=%s",
+                    state.get("session_id", ""),
+                )
+                writer({"meta": {"intent": "confirm_write", "route_type": "write_executor"}})
+                return {
+                    "intent": "confirm_write",
+                    "route_type": "write_executor",
+                    "confidence": 1.0,
+                    "use_cloud": False,
+                    "planner_status": "deterministic",
+                    "reasoning_summary": "",
+                    "needs_memory": False,
+                }
+
+        # Safety: if user sends a bare confirmation after a write-prompt but
+        # pending_write was lost/cleared, route deterministically so the system
+        # reports "No pending write" instead of hallucinating a write success.
+        msg = str(state.get("message", "")).strip()
+        if _CONFIRM_PATTERN.match(msg):
+            last_assistant = _last_assistant_message().lower()
+            looks_like_write_prompt = (
+                "type **yes** to confirm the write" in last_assistant
+                or "type yes to confirm the write" in last_assistant
+                or "say yes to apply" in last_assistant
+            )
+            if looks_like_write_prompt and not state.get("pending_write"):
+                log.info(
+                    "graph.intent_classifier | confirm_without_pending | session=%s",
                     state.get("session_id", ""),
                 )
                 writer({"meta": {"intent": "confirm_write", "route_type": "write_executor"}})
@@ -306,14 +401,11 @@ def build_assistant_graph(
 
         # Phase 10b: inject code context for code intents
         code_context = ""
-        if state.get("intent") == "code" and deps.chroma_path:
-            from tools.code_indexer import query_code_context
-            snippets = query_code_context(state["message"], deps.chroma_path)
-            if snippets:
-                code_context = "\n\n---\n".join(snippets)
+        if state.get("intent") == "code":
+            code_context = code_context_retrieval(state["message"], deps.chroma_path, max_snippets=5)
+            if code_context:
                 log.info(
-                    "graph.memory_retrieval | code_context_snippets=%d | session=%s",
-                    len(snippets),
+                    "graph.memory_retrieval | code_context_injected=true | session=%s",
                     state.get("session_id", ""),
                 )
 
@@ -359,6 +451,24 @@ def build_assistant_graph(
 
         # Mutable capture for write requests from within tool calls
         _pending: dict[str, Any] = {}
+        touched_files: set[str] = set(state.get("active_files", []))
+
+        # In code mode, a bare confirmation without a pending diff should not
+        # re-enter the coder loop and potentially trigger unrelated writes.
+        msg = str(state.get("message", "")).strip()
+        if _CONFIRM_PATTERN.match(msg) and not state.get("pending_write"):
+            no_pending_msg = (
+                "No pending write to confirm. Describe the code change you want "
+                "(for example: add pytest tests for bubble_sort in test_bubble_sort.py)."
+            )
+            writer({"text": no_pending_msg})
+            return {
+                "response_text": no_pending_msg,
+                "response_model": deps.coder_model or deps.chat_model,
+                "pending_write": {},
+                "awaiting_confirmation": False,
+                "active_files": sorted(touched_files),
+            }
 
         # ── Custom tools ──────────────────────────────────────────────────────
         try:
@@ -367,6 +477,14 @@ def build_assistant_graph(
             writer({"text": "langchain-core is not installed. Run: pip install langchain-core"})
             return {"response_text": "langchain-core missing", "response_model": ""}
 
+        read_file_tool = None
+        try:
+            from langchain_community.tools import ReadFileTool, WriteFileTool  # type: ignore[import-untyped]
+            read_file_tool = ReadFileTool(root_dir=_workspace_root)
+            _ = WriteFileTool(root_dir=_workspace_root)
+        except Exception as exc:
+            log.warning("code_tool: ReadFileTool/WriteFileTool unavailable, using fallback (%s)", exc)
+
         @lc_tool
         def read_file(relative_path: str) -> str:
             """Read a file from the code workspace. Input: path relative to workspace root."""
@@ -374,6 +492,12 @@ def build_assistant_graph(
                 resolved = _resolve_workspace_path(relative_path)
             except ValueError as exc:
                 return f"Error: {exc}"
+            touched_files.add(relative_path)
+            if read_file_tool is not None:
+                try:
+                    return str(read_file_tool.invoke(relative_path))
+                except Exception as exc:
+                    return f"Error reading file: {exc}"
             try:
                 return Path(resolved).read_text(encoding="utf-8", errors="replace")
             except FileNotFoundError:
@@ -407,6 +531,7 @@ def build_assistant_graph(
                 resolved = _resolve_workspace_path(relative_path)
             except ValueError as exc:
                 return f"Error: {exc}"
+            touched_files.add(relative_path)
             try:
                 original = Path(resolved).read_text(encoding="utf-8", errors="replace")
             except FileNotFoundError:
@@ -416,6 +541,8 @@ def build_assistant_graph(
             _pending["content"] = content
             _pending["relative_path"] = relative_path
             if diff:
+                if str(state.get("source", "text")).lower() == "voice":
+                    return _write_summary_for_voice(relative_path, diff)
                 return (
                     f"```diff\n{diff}\n```\n\n"
                     "Type **yes** to confirm the write, or describe any changes you want first."
@@ -469,10 +596,10 @@ def build_assistant_graph(
         else:
             system_prompt = f"{base_system}{workspace_note}"
 
-        agent = create_react_agent(llm, active_tools, state_modifier=system_prompt)
+        agent = create_react_agent(llm, active_tools, prompt=system_prompt)
 
-        messages = [{"role": "user", "content": state["message"]}]
         response_text = ""
+        handled_json_tool_call = False
 
         log.info(
             "graph.code_tool | model=%s | session=%s | tools=%s",
@@ -481,25 +608,212 @@ def build_assistant_graph(
             [t.name for t in active_tools],
         )
 
-        try:
-            async for event in agent.astream_events(
-                {"messages": messages},
-                version="v2",
-            ):
-                if event["event"] == "on_chat_model_stream":
-                    chunk = event["data"].get("chunk")
-                    if chunk and hasattr(chunk, "content") and chunk.content:
-                        writer({"text": chunk.content})
-                        response_text += chunk.content
-        except Exception as exc:
-            log.error("graph.code_tool | stream error: %s", exc, exc_info=True)
-            err_msg = f"Code tool error: {exc}"
-            writer({"text": err_msg})
-            response_text = err_msg
+        async def _run_agent_once(user_message: str) -> str:
+            collected = ""
+            try:
+                async for event in agent.astream_events(
+                    {"messages": [{"role": "user", "content": user_message}]},
+                    version="v2",
+                ):
+                    event_type = event.get("event", "")
+                    if event_type == "on_chat_model_stream":
+                        chunk = event["data"].get("chunk")
+                        if chunk and hasattr(chunk, "content") and chunk.content:
+                            collected += chunk.content
+                    elif event_type == "on_tool_start":
+                        tool_name = event.get("name", "unknown")
+                        log.info(
+                            "graph.code_tool | tool_start | tool=%s | session=%s",
+                            tool_name,
+                            state.get("session_id", ""),
+                        )
+                    elif event_type == "on_tool_end":
+                        tool_name = event.get("name", "unknown")
+                        tool_output = event.get("data", {}).get("output", "")
+                        log.info(
+                            "graph.code_tool | tool_end | tool=%s | output_len=%d | session=%s",
+                            tool_name,
+                            len(str(tool_output)),
+                            state.get("session_id", ""),
+                        )
+            except Exception as exc:
+                log.error(
+                    "graph.code_tool | stream error: %s | session=%s",
+                    exc,
+                    state.get("session_id", ""),
+                    exc_info=True,
+                )
+                err_msg = f"Code tool error: {exc}"
+                writer({"text": err_msg})
+                return err_msg
+            return collected
+
+        def _extract_json_tool_payload(text: str) -> dict[str, Any] | None:
+            candidate = text.strip()
+            if not candidate:
+                return None
+            if not (candidate.startswith("{") and candidate.endswith("}")):
+                first = candidate.find("{")
+                last = candidate.rfind("}")
+                if first != -1 and last != -1 and last > first:
+                    candidate = candidate[first:last + 1]
+            try:
+                payload = json.loads(candidate)
+            except Exception:
+                return None
+            if isinstance(payload, dict) and payload.get("name"):
+                return payload
+            return None
+
+        def _execute_readonly_fallback_tool(payload: dict[str, Any]) -> str | None:
+            tool_name = str(payload.get("name", ""))
+            args = payload.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except Exception:
+                    args = {}
+
+            if tool_name == "list_files":
+                sub_path = args.get("sub_path", "") if isinstance(args, dict) else ""
+                try:
+                    base = _resolve_workspace_path(sub_path) if sub_path else _workspace_root
+                except ValueError:
+                    base = _workspace_root
+                result_files: list[str] = []
+                for dirpath, dirnames, filenames in os.walk(base):
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if not d.startswith(".") and d not in ("__pycache__", "node_modules", ".venv")
+                    ]
+                    for fname in filenames:
+                        p = Path(dirpath) / fname
+                        try:
+                            rel = str(p.relative_to(_workspace_root))
+                        except ValueError:
+                            rel = str(p)
+                        result_files.append(rel)
+                        touched_files.add(rel)
+                log.info(
+                    "graph.code_tool | fallback_executed_list_files | count=%d | session=%s",
+                    len(result_files),
+                    state.get("session_id", ""),
+                )
+                return "\n".join(result_files) if result_files else "(empty)"
+
+            if tool_name == "read_file":
+                relative_path = args.get("relative_path", "") if isinstance(args, dict) else ""
+                if not relative_path and isinstance(args, dict):
+                    relative_path = args.get("file_path", "")
+                if not relative_path:
+                    return "Error: missing relative_path"
+                try:
+                    resolved = _resolve_workspace_path(relative_path)
+                    touched_files.add(relative_path)
+                    return Path(resolved).read_text(encoding="utf-8", errors="replace")
+                except (FileNotFoundError, ValueError, OSError) as exc:
+                    return f"Error: {exc}"
+
+            return None
+
+        response_text = await _run_agent_once(str(state.get("message", "")))
+
+        # Fallback for models that emit JSON tool calls as plain text instead of
+        # structured tool-call messages (observed with some Ollama coder models).
+        # If we see a read-only tool call, execute it and run one follow-up turn
+        # automatically so the model can proceed to a write_file call in the same turn.
+        max_fallback_turns = 3
+        fallback_turn = 0
+        while not _pending and response_text.strip() and fallback_turn < max_fallback_turns:
+            payload = _extract_json_tool_payload(response_text)
+            if not payload:
+                break
+
+            tool_name = str(payload.get("name", ""))
+            if tool_name == "write_file":
+                args = payload.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except Exception:
+                        args = {}
+                if isinstance(args, dict):
+                    relative_path = str(args.get("relative_path", "") or "").strip()
+                    content = args.get("content", "")
+                    if relative_path and isinstance(content, str):
+                        try:
+                            resolved = _resolve_workspace_path(relative_path)
+                            try:
+                                original = Path(resolved).read_text(encoding="utf-8", errors="replace")
+                            except FileNotFoundError:
+                                original = ""
+
+                            diff = _make_unified_diff(relative_path, original, content)
+                            _pending["path"] = resolved
+                            _pending["content"] = content
+                            _pending["relative_path"] = relative_path
+                            touched_files.add(relative_path)
+
+                            if diff:
+                                if str(state.get("source", "text")).lower() == "voice":
+                                    confirm_msg = _write_summary_for_voice(relative_path, diff)
+                                else:
+                                    confirm_msg = (
+                                        f"```diff\n{diff}\n```\n\n"
+                                        "Type **yes** to confirm the write, or describe any changes you want first."
+                                    )
+                            else:
+                                confirm_msg = "No changes detected — the file already has that content."
+
+                            writer({"text": confirm_msg})
+                            response_text = confirm_msg
+                            handled_json_tool_call = True
+                            log.info(
+                                "graph.code_tool | fallback_tool_parse=write_file | path=%s | session=%s",
+                                relative_path,
+                                state.get("session_id", ""),
+                            )
+                        except ValueError as exc:
+                            msg = f"Write blocked: {exc}"
+                            writer({"text": msg})
+                            response_text = msg
+                            handled_json_tool_call = True
+                break
+
+            readonly_output = _execute_readonly_fallback_tool(payload)
+            if readonly_output is None:
+                log.warning(
+                    "graph.code_tool | unknown_tool_in_fallback | tool=%s | session=%s",
+                    tool_name,
+                    state.get("session_id", ""),
+                )
+                break
+
+            fallback_turn += 1
+            followup_prompt = (
+                "You emitted a tool call as JSON text instead of a structured tool call.\n"
+                f"Tool name: {tool_name}\n"
+                "Tool output:\n"
+                f"{readonly_output}\n\n"
+                f"Original user request: {state.get('message', '')}\n"
+                "Continue solving the request now. If you need to create or edit files, "
+                "emit a write_file JSON tool call with relative_path and content."
+            )
+            log.info(
+                "graph.code_tool | fallback_followup_turn=%d | tool=%s | session=%s",
+                fallback_turn,
+                tool_name,
+                state.get("session_id", ""),
+            )
+            response_text = await _run_agent_once(followup_prompt)
+
+        if not handled_json_tool_call and response_text.strip() and not response_text.startswith("Code tool error:"):
+            writer({"text": response_text})
 
         result: dict[str, Any] = {
             "response_text": response_text.strip(),
             "response_model": coder_model_name,
+            "active_files": sorted(touched_files),
         }
         if _pending:
             result["pending_write"] = dict(_pending)
@@ -520,6 +834,7 @@ def build_assistant_graph(
         """Execute a confirmed file write from pending_write state."""
         writer = get_stream_writer()
         pending = state.get("pending_write") or {}
+        touched_files: set[str] = set(state.get("active_files", []))
 
         if not pending or not pending.get("path") or not pending.get("content"):
             msg = "No pending write to execute."
@@ -548,8 +863,20 @@ def build_assistant_graph(
             }
 
         try:
-            Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
-            Path(resolved_path).write_text(content, encoding="utf-8")
+            wrote_with_tool = False
+            try:
+                from langchain_community.tools import WriteFileTool  # type: ignore[import-untyped]
+                wf = WriteFileTool(root_dir=_workspace_root)
+                wf.invoke({"file_path": relative_path, "text": content})
+                wrote_with_tool = True
+            except Exception:
+                wrote_with_tool = False
+
+            if not wrote_with_tool:
+                Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(resolved_path).write_text(content, encoding="utf-8")
+
+            touched_files.add(relative_path)
             msg = f"Written: `{relative_path}`"
             log.info("graph.write_executor | written | path=%s | session=%s", relative_path, state.get("session_id", ""))
         except OSError as exc:
@@ -562,6 +889,7 @@ def build_assistant_graph(
             "response_model": deps.chat_model,
             "pending_write": {},
             "awaiting_confirmation": False,
+            "active_files": sorted(touched_files),
         }
 
     async def responder(state: AssistantState) -> dict[str, Any]:

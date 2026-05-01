@@ -216,6 +216,8 @@ _MEMORY_KEYWORDS = [
 
 _CODE_PATTERNS = [
     r"\b(write|create|generate|implement|build)\b.{0,40}\b(function|class|method|script|endpoint|api|module|test)\b",
+    r"\b(add|create|generate|write)\b.{0,40}\b(test|tests|test\s+case|test\s+cases|pytest|unittest)\b",
+    r"\bcan\s+you\b.{0,20}\b(add|write|create|generate)\b.{0,40}\btests?\b",
     r"\b(debug|fix)\b.{0,30}\b(bug|error|exception|crash|issue|problem)\b",
     r"\b(refactor|optimise|optimize|rewrite)\b.{0,30}\b(function|class|code|snippet)\b",
     r"\bwrite\s+(a\s+)?(python|javascript|typescript|sql|bash|shell|css|html)\b",
@@ -229,8 +231,17 @@ _CODE_KEYWORDS = [
     "implement a", "code this", "generate code", "write code",
     "debug this", "fix this bug", "fix the error", "fix the bug",
     "refactor this", "optimize this", "add a function",
+    "add tests", "add test", "test this", "test this function",
+    "test cases", "pytest", "unittest",
     "create an endpoint", "write an api", "write a module",
 ]
+
+
+def _looks_like_code_request(text: str) -> bool:
+    """Conservative gate for forcing code routing on obvious coding prompts."""
+    p = text.lower()
+    score = _score_patterns(p, _CODE_PATTERNS) + _score_keywords(p, _CODE_KEYWORDS)
+    return score >= 0.25
 
 
 def _score_patterns(text: str, patterns: list[str]) -> float:
@@ -453,6 +464,14 @@ async def route(prompt: str) -> RouteDecision:
                 decision.tool = "music"
                 decision.use_cloud = False
                 decision.model = _pick_local_model(decision.intent)
+                decision.confidence = max(decision.confidence, 0.8)
+            # Guardrail: if planner under-classifies obvious coding requests,
+            # force local coder route so edits/tests don't fall through to chat.
+            if decision.intent != "code" and _looks_like_code_request(prompt):
+                decision.intent = "code"
+                decision.tool = None
+                decision.use_cloud = False
+                decision.model = _pick_local_model("code")
                 decision.confidence = max(decision.confidence, 0.8)
             log.debug(
                 "router.planner | intent=%s route=%s tool=%s needs_memory=%s "

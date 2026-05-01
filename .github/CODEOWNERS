@@ -1,0 +1,22 @@
+# Default ownership
+* @iliketurtles83
+
+# Tier 0 critical surfaces
+/backend/main.py @iliketurtles83
+/backend/auth.py @iliketurtles83
+/backend/graph.py @iliketurtles83
+/backend/memory.py @iliketurtles83
+/backend/tools/code*.py @iliketurtles83
+/backend/tests/test_auth.py @iliketurtles83
+/backend/tests/test_graph.py @iliketurtles83
+/backend/tests/test_memory_isolation.py @iliketurtles83
+/backend/tests/test_code_tool.py @iliketurtles83
+
+# Deployment and edge security
+/docker-compose.yml @iliketurtles83
+/backend/Dockerfile @iliketurtles83
+/caddy/Caddyfile @iliketurtles83
+
+# Review governance and gates
+/.github/workflows/review-gates.yml @iliketurtles83
+/docs/review/SECURITY_CORRECTNESS_CHECKLIST.md @iliketurtles83

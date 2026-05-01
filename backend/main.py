@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -17,6 +17,7 @@ import time
 from pathlib import Path
 from threading import Lock
 from uuid import uuid4
+import difflib
 import numpy as np
 from dotenv import load_dotenv
 from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
@@ -98,6 +99,8 @@ AUTH_COOKIE_NAME: str = os.getenv("AUTH_COOKIE_NAME", "auth_token")
 
 _session_store_lock = Lock()
 _session_store: dict[str, dict] = {}
+_code_write_lock = Lock()
+_pending_code_writes: dict[str, dict] = {}
 
 # ── Auth service (shared singleton) ───────────────────────────────────────────
 _auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
@@ -294,6 +297,12 @@ class ChatRequest(BaseModel):
 
 class TTSRequest(BaseModel):
     text: str
+
+
+class CodeRequest(BaseModel):
+    message: str
+    system: str = CHAT_DEFAULT_SYSTEM_PROMPT
+    source: str = "text"
 
 
 class SessionSelectRequest(BaseModel):
@@ -1555,7 +1564,6 @@ def _safe_resolve(root: str, relative: str) -> str:
 @app.get("/code/files", summary="List workspace files")
 async def list_code_files(
     sub_path: str = "",
-    _user_id: str = Depends(get_current_user),
 ):
     """Return relative paths of all files under the workspace root (or sub-path)."""
     root = _get_code_root()
@@ -1576,7 +1584,6 @@ async def list_code_files(
 @app.get("/code/files/{file_path:path}", summary="Read a workspace file")
 async def read_code_file(
     file_path: str,
-    _user_id: str = Depends(get_current_user),
 ):
     root = _get_code_root()
     resolved = _safe_resolve(root, file_path)
@@ -1591,25 +1598,155 @@ async def read_code_file(
 
 class _WriteRequest(BaseModel):
     content: str
+    confirm: bool = False
+    request_id: str | None = None
+
+
+def _make_unified_diff(relative_path: str, original: str, proposed: str) -> str:
+    lines = list(
+        difflib.unified_diff(
+            original.splitlines(keepends=True),
+            proposed.splitlines(keepends=True),
+            fromfile=f"a/{relative_path}",
+            tofile=f"b/{relative_path}",
+            lineterm="\n",
+        )
+    )
+    return "".join(lines) if lines else ""
 
 
 @app.put("/code/files/{file_path:path}", summary="Write a workspace file (explicit API write)")
 async def write_code_file(
     file_path: str,
     body: _WriteRequest,
-    _user_id: str = Depends(get_current_user),
+    request: Request,
 ):
-    """Direct file write. The confirmation flow is handled in-graph for chat;
-    this endpoint is for programmatic / test usage only."""
+    """Confirmation-gated direct file write.
+
+    First call with confirm=false (default) to receive diff + request_id.
+    Second call with confirm=true and the same request_id to execute the write.
+    """
     root = _get_code_root()
     resolved = _safe_resolve(root, file_path)
+    user_id = getattr(request.state, "user_id", "unknown")
+
     try:
-        Path(resolved).parent.mkdir(parents=True, exist_ok=True)
-        Path(resolved).write_text(body.content, encoding="utf-8")
+        current = Path(resolved).read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        current = ""
     except OSError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    log.info("code.write_file | path=%s | user=%s", file_path, _user_id)
-    return JSONResponse({"written": file_path})
+
+    if not body.confirm:
+        diff = _make_unified_diff(file_path, current, body.content)
+        request_id = str(uuid4())
+        with _code_write_lock:
+            _pending_code_writes[request_id] = {
+                "user_id": user_id,
+                "file_path": file_path,
+                "resolved": resolved,
+                "content": body.content,
+                "created_at": time.time(),
+            }
+        summary = "No changes detected." if not diff else "Diff generated. Confirmation required before write."
+        return JSONResponse(
+            {
+                "status": "pending_confirmation",
+                "request_id": request_id,
+                "path": file_path,
+                "summary": summary,
+                "diff": diff,
+            }
+        )
+
+    if not body.request_id:
+        raise HTTPException(status_code=400, detail="request_id is required when confirm=true")
+
+    with _code_write_lock:
+        pending = _pending_code_writes.get(body.request_id)
+        if not pending:
+            raise HTTPException(status_code=404, detail="Pending write not found or expired")
+        if str(pending.get("user_id", "")) != str(user_id):
+            raise HTTPException(status_code=403, detail="Pending write belongs to another user")
+        if pending.get("file_path") != file_path:
+            raise HTTPException(status_code=400, detail="request_id does not match file_path")
+
+        content_to_write = str(pending.get("content", ""))
+        del _pending_code_writes[body.request_id]
+
+    try:
+        Path(resolved).parent.mkdir(parents=True, exist_ok=True)
+        Path(resolved).write_text(content_to_write, encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    log.info("code.write_file | path=%s | user=%s | confirmed=true", file_path, user_id)
+    return JSONResponse({"status": "written", "written": file_path})
+
+
+@app.post("/code", summary="Stream code generation/editing via graph code_tool")
+async def code(request: CodeRequest, http_request: Request):
+    user_id: str = http_request.state.user_id
+    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
+    code_source = _normalize_chat_source(request.source)
+
+    with _session_store_lock:
+        session = _session_store[session_id]
+        session_messages = list(session["messages"])
+        session_summary = str(session.get("summary", "") or "")
+
+    graph_state = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "message": request.message,
+        "system": request.system,
+        "source": code_source,
+        "history": session_messages,
+        "session_summary": session_summary,
+        "force_code": True,
+    }
+
+    graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
+
+    async def generate():
+        assistant_accumulated = ""
+        active_model = CODER_MODEL
+
+        try:
+            async for event in graph_runner.astream(
+                graph_state,
+                config=checkpoint_config(session_id),
+                stream_mode="custom",
+            ):
+                if "meta" in event:
+                    meta = event["meta"]
+                    active_model = meta.get("model", CODER_MODEL)
+                    yield f"data: {json.dumps({'model': active_model, 'intent': meta.get('intent', 'code'), 'confidence': meta.get('confidence', 1.0)})}\n\n"
+                elif "text" in event:
+                    chunk = event["text"]
+                    assistant_accumulated += chunk
+                    yield f"data: {json.dumps({'text': chunk})}\n\n"
+                elif "notice" in event:
+                    yield f"data: {json.dumps({'notice': event['notice']})}\n\n"
+        except Exception as exc:
+            log.error("code.graph_error | session_id=%s error=%s", session_id, exc)
+            yield f"data: {json.dumps({'text': f'⚠ Error: {exc}'})}\n\n"
+
+        _append_session_message(session_id, "user", request.message)
+        _append_session_message(session_id, "assistant", assistant_accumulated.strip())
+
+        voice_meta = _voice_tts_metadata(code_source)
+        if voice_meta is not None:
+            yield "data: " + json.dumps(voice_meta) + "\n\n"
+
+        yield "data: [DONE]\n\n"
+
+    response = StreamingResponse(generate(), media_type="text/event-stream")
+    _set_session_cookie(response, session_id)
+    if session_created:
+        log.info("code.session.cookie_set | session_id=%s", session_id)
+    return response
 
 
 # ── Static frontend — MUST be last ────────────────────────────────────────────

@@ -180,3 +180,53 @@ async def test_graph_checkpoint_resume_reloads_state_without_reexecution():
     assert snapshot.values["intent"] == "quick-local"
     # Snapshot read should not execute planner/LLM nodes again.
     assert calls == {"router": 1, "local": 1}
+
+
+@pytest.mark.asyncio
+async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
+    async def _fake_router(_message: str):
+        return SimpleNamespace(
+            intent="quick-local",
+            confidence=0.99,
+            use_cloud=False,
+            model=TEST_CHAT_MODEL,
+            tool=None,
+            planner_status="planner",
+            reasoning_summary="short prompt",
+            needs_memory=False,
+        )
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "should not run"
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "should not run"
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run in confirm-write orphan test")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        router_route=_fake_router,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+
+    graph = assistant_graph.build_assistant_graph(deps)
+    state = _base_state()
+    state["message"] = "yes"
+    state["history"] = [
+        {
+            "role": "assistant",
+            "content": "Type **yes** to confirm the write, or describe any changes you want first.",
+        }
+    ]
+    state["pending_write"] = {}
+    state["awaiting_confirmation"] = False
+
+    result = await graph.ainvoke(state)
+    assert result["intent"] == "confirm_write"
+    assert result["response_text"] == "No pending write to execute."

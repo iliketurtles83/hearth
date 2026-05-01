@@ -253,6 +253,27 @@ Open UI:
 
 > **Microphone and voice** require a secure context. On Android and iOS, install the mkcert CA certificate first (see HTTPS Setup above). Once trusted, `navigator.mediaDevices` will be available and wake-word voice input will work.
 
+## Review and Security Gates
+
+This repository includes baseline review controls for security and correctness:
+
+- CI workflow: `.github/workflows/review-gates.yml`
+- Local baseline script: `scripts/review_baseline.sh`
+- PR checklist: `.github/pull_request_template.md`
+- Review checklist: `docs/review/SECURITY_CORRECTNESS_CHECKLIST.md`
+- Enforcement guide: `docs/review/ENFORCEMENT.md`
+
+Run local checks before opening a PR:
+
+```bash
+bash scripts/review_baseline.sh
+```
+
+Notes:
+
+- CI always runs secret scanning via gitleaks.
+- Local secret scanning runs automatically when `gitleaks` is installed.
+
 ## Wake Word Models
 
 Required ONNX model files in `backend/models/`:

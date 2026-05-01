@@ -234,8 +234,11 @@ class MemoryStore:
             for row in rows:
                 table = row["table_name"]
                 row_id = int(row["id"])
-                cur.execute(f"DELETE FROM {table} WHERE id = ? AND user_id = ?", (row_id, user_id))
-                if table in {"facts", "preferences"}:
+                if table == "facts":
+                    cur.execute("DELETE FROM facts WHERE id = ? AND user_id = ?", (row_id, user_id))
+                    ids.append(f"{table}:{row_id}")
+                elif table == "preferences":
+                    cur.execute("DELETE FROM preferences WHERE id = ? AND user_id = ?", (row_id, user_id))
                     ids.append(f"{table}:{row_id}")
             self._conn.commit()
 
@@ -455,7 +458,12 @@ class MemoryStore:
         with self._lock:
             cur = self._conn.cursor()
             # user_id guard prevents cross-user deletion.
-            cur.execute(f"DELETE FROM {table} WHERE id = ? AND user_id = ?", (int(raw_id), user_id))
+            if table == "facts":
+                cur.execute("DELETE FROM facts WHERE id = ? AND user_id = ?", (int(raw_id), user_id))
+            elif table == "preferences":
+                cur.execute("DELETE FROM preferences WHERE id = ? AND user_id = ?", (int(raw_id), user_id))
+            else:
+                cur.execute("DELETE FROM summaries WHERE id = ? AND user_id = ?", (int(raw_id), user_id))
             deleted = cur.rowcount > 0
             self._conn.commit()
 

@@ -315,8 +315,29 @@ def code_workspace(tmp_path):
     sub = ws / "sub"
     sub.mkdir()
     (sub / "util.py").write_text("def noop(): pass\n")
-    monkeypatch_env = {"CODE_WORKSPACE_ROOT": str(ws)}
+    memory_db = tmp_path / "memory.db"
+    chroma_dir = tmp_path / "chroma"
+    chroma_dir.mkdir()
+    auth_db = tmp_path / "auth.db"
+    monkeypatch_env = {
+        "CODE_WORKSPACE_ROOT": str(ws),
+        "MEMORY_DB_PATH": str(memory_db),
+        "CHROMA_PATH": str(chroma_dir),
+        "AUTH_DB_PATH": str(auth_db),
+    }
     return ws, monkeypatch_env
+
+
+def _import_main_module():
+    import importlib
+    import sys
+
+    if "main" in sys.modules:
+        return importlib.reload(sys.modules["main"])
+
+    import main as main_mod  # type: ignore[import]
+
+    return main_mod
 
 
 @pytest.mark.asyncio
@@ -330,8 +351,7 @@ async def test_list_code_files_endpoint(code_workspace, monkeypatch):
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 
     # Re-import main with the env var set so _get_code_root() sees it
-    import importlib
-    import main as main_mod  # type: ignore[import]
+    main_mod = _import_main_module()
 
     client = TestClient(main_mod.app, raise_server_exceptions=True)
     # We need an auth token; use the bypass header if available or skip
@@ -349,7 +369,7 @@ async def test_read_code_file_endpoint(code_workspace, monkeypatch):
     from fastapi.testclient import TestClient
     import sys
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-    import main as main_mod  # type: ignore[import]
+    main_mod = _import_main_module()
 
     client = TestClient(main_mod.app, raise_server_exceptions=False)
     resp = client.get("/code/files/hello.py", headers={"Authorization": "Bearer test-skip"})
@@ -365,9 +385,152 @@ async def test_safe_resolve_blocks_traversal(code_workspace, monkeypatch):
     from fastapi.testclient import TestClient
     import sys
     sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
-    import main as main_mod  # type: ignore[import]
+    main_mod = _import_main_module()
 
     client = TestClient(main_mod.app, raise_server_exceptions=False)
     resp = client.get("/code/files/../../../etc/passwd", headers={"Authorization": "Bearer test-skip"})
     # Must not return 200 with /etc/passwd contents
     assert resp.status_code in (400, 401, 403, 404, 422, 503)
+
+
+@pytest.fixture()
+def authed_client(code_workspace, monkeypatch):
+    _, env = code_workspace
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+
+    from fastapi.testclient import TestClient
+    import sys
+    sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
+    main_mod = _import_main_module()
+
+    monkeypatch.setattr(main_mod.auth_service, "verify_token", lambda _token: "test-user")
+    client = TestClient(main_mod.app, raise_server_exceptions=True)
+    return client
+
+
+def test_write_code_file_confirmation_required(authed_client):
+    resp = authed_client.put(
+        "/code/files/hello.py",
+        headers={"Authorization": "Bearer ok"},
+        json={"content": "print('updated')\n"},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "pending_confirmation"
+    assert data["request_id"]
+    assert "diff" in data
+
+    read_resp = authed_client.get("/code/files/hello.py", headers={"Authorization": "Bearer ok"})
+    assert read_resp.status_code == 200
+    assert "updated" not in read_resp.json().get("content", "")
+
+
+def test_write_code_file_confirm_executes(authed_client):
+    first = authed_client.put(
+        "/code/files/hello.py",
+        headers={"Authorization": "Bearer ok"},
+        json={"content": "print('confirmed')\n"},
+    )
+    assert first.status_code == 200
+    request_id = first.json().get("request_id")
+    assert request_id
+
+    second = authed_client.put(
+        "/code/files/hello.py",
+        headers={"Authorization": "Bearer ok"},
+        json={"content": "ignored\n", "confirm": True, "request_id": request_id},
+    )
+    assert second.status_code == 200
+    assert second.json().get("status") == "written"
+
+    read_resp = authed_client.get("/code/files/hello.py", headers={"Authorization": "Bearer ok"})
+    assert read_resp.status_code == 200
+    assert read_resp.json().get("content") == "print('confirmed')\n"
+
+
+def test_code_stream_endpoint_sse(authed_client, monkeypatch):
+    import main as main_mod  # type: ignore[import]
+
+    class _FakeGraph:
+        async def astream(self, *_args, **_kwargs):
+            yield {"meta": {"model": "qwen2.5-coder:7b", "intent": "code", "confidence": 1.0}}
+            yield {"text": "def bubble_sort(arr):\n"}
+            yield {"text": "    return arr\n"}
+
+    main_mod.app.state.assistant_graph = _FakeGraph()
+
+    with authed_client.stream(
+        "POST",
+        "/code",
+        headers={"Authorization": "Bearer ok"},
+        json={"message": "write bubble sort", "source": "text"},
+    ) as resp:
+        assert resp.status_code == 200
+        body = "".join(line for line in resp.iter_text())
+
+    assert "def bubble_sort" in body
+    assert "[DONE]" in body
+
+
+def test_code_mode_yes_without_pending_write_is_blocked(monkeypatch):
+    """Regression: bare 'yes' in code mode must not trigger a phantom write."""
+    from graph import build_assistant_graph, AssistantGraphDependencies  # type: ignore[import]
+    from router import RouteDecision  # type: ignore[import]
+    import memory as memory_mod  # type: ignore[import]
+
+    async def _router_route(_message: str):
+        return RouteDecision(
+            intent="code",
+            confidence=1.0,
+            use_cloud=False,
+            model="qwen2.5-coder:14b",
+            tool=None,
+            planner_status="deterministic",
+            reasoning_summary="",
+            needs_memory=False,
+        )
+
+    async def _stream_noop(*_args, **_kwargs):
+        if False:
+            yield ""
+
+    async def _tool_dispatch_noop(*_args, **_kwargs):
+        return None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        monkeypatch.setenv("CODE_WORKSPACE_ROOT", tmpdir)
+        deps = AssistantGraphDependencies(
+            chat_model="gemma3:4b",
+            coder_model="qwen2.5-coder:14b",
+            cloud_model=None,
+            memory_store=memory_mod.MemoryStore(),
+            router_route=_router_route,
+            stream_local=_stream_noop,
+            stream_cloud=_stream_noop,
+            tool_dispatch=_tool_dispatch_noop,
+        )
+        graph = build_assistant_graph(deps)
+
+        state = _make_state(
+            message="yes",
+            force_code=True,
+            intent="code",
+            pending_write={},
+            awaiting_confirmation=False,
+        )
+
+        events: list[dict] = []
+
+        async def _run():
+            async for event in graph.astream(
+                state,
+                config={"configurable": {"thread_id": "test-thread"}},
+                stream_mode="custom",
+            ):
+                events.append(event)
+
+        asyncio.run(_run())
+        text_output = "".join(e.get("text", "") for e in events if "text" in e)
+        assert "No pending write to confirm." in text_output
+        assert "Written:" not in text_output

@@ -317,6 +317,11 @@ class TestCodeIntentRouting:
         assert d.intent == "code"
         assert d.model == r.CODER_MODEL
 
+    def test_heuristic_add_tests_prompt_is_code(self):
+        d = r.classify_intent("Can you add tests for quick sort?")
+        assert d.intent == "code"
+        assert d.model == r.CODER_MODEL
+
     def test_heuristic_non_code_uses_chat_model(self):
         d = r.classify_intent("What is the capital of France?")
         assert d.intent != "code"
@@ -366,3 +371,24 @@ class TestCodeIntentRouting:
         d = r._decision_from_planner(parsed)
         assert d.use_cloud
         assert d.model == r.CLOUD_MODEL
+
+
+@pytest.mark.asyncio
+async def test_route_forces_code_when_planner_misses_obvious_code_prompt(monkeypatch):
+    async def _fake_planner(_prompt: str):
+        return {
+            "intent": "quick-local",
+            "route": "local",
+            "tool": None,
+            "needs_memory": False,
+            "confidence": 0.60,
+            "reasoning": "Short prompt.",
+        }
+
+    monkeypatch.setattr(r, "_call_planner", _fake_planner)
+    monkeypatch.setattr(r, "PLANNER_ENABLED", True)
+
+    d = await r.route("Can you add tests for quick sort?")
+    assert d.intent == "code"
+    assert not d.use_cloud
+    assert d.model == r.CODER_MODEL

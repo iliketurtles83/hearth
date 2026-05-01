@@ -86,6 +86,7 @@ services:
       # Strawberry DB mounted from host (read-only). Override STRAWBERRY_DB_PATH in
       # .env if the DB filename differs. Host directory set via STRAWBERRY_DB_DIR.
       - STRAWBERRY_DB_PATH=/strawberry/strawberry.db
+      - CODE_WORKSPACE_ROOT=/code-workspace
       - MPD_HOST=mpd
       - TTS_ENGINE=${TTS_ENGINE:-kokoro}
       - TTS_KOKORO_MODEL=${TTS_KOKORO_MODEL:-/app/models/tts/kokoro-v1.0.int8.onnx}
@@ -106,7 +107,13 @@ services:
       # Set STRAWBERRY_DB_DIR in .env to the directory containing strawberry.db.
       - ${STRAWBERRY_DB_DIR:-/home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry}:/strawberry:ro
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=3)",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
