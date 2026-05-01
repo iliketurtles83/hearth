@@ -8,7 +8,7 @@ __pycache__/
 *.sqlite
 *.sqlite3
 mpd/mpdstate
-
+graph_checkpoints.*
 # Chroma persistence (all generated files/subdirs)
 backend/chroma/
 # mkcert-generated certificates — never commit private keys

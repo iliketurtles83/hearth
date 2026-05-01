@@ -14,6 +14,7 @@ import logging
 import re
 import tempfile
 import time
+from pathlib import Path
 from threading import Lock
 from uuid import uuid4
 import numpy as np
@@ -118,6 +119,26 @@ def _validate_startup() -> None:
 
     if not os.getenv("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
+
+    # Phase 10b: code workspace
+    _code_root = os.getenv("CODE_WORKSPACE_ROOT", "")
+    if not _code_root:
+        log.warning(
+            "CODE_WORKSPACE_ROOT not set — code_tool node will refuse all file operations. "
+            "Set it in .env and restart."
+        )
+    elif not os.path.isdir(_code_root):
+        log.warning(
+            "CODE_WORKSPACE_ROOT=%s does not exist or is not a directory — "
+            "create it and mount it into the container before using the code tool.",
+            _code_root,
+        )
+    else:
+        # Start background workspace indexer
+        _index_paths_raw = os.getenv("CODE_INDEX_PATHS", "")
+        _index_paths = [p.strip() for p in _index_paths_raw.split() if p.strip()] or None
+        from tools.code_indexer import start_background_index
+        start_background_index(_code_root, os.getenv("CHROMA_PATH", _chroma_default), _index_paths)
 
     log.info(
         "Startup OK | chat_model=%s | coder_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",
@@ -655,6 +676,8 @@ def _make_graph_deps() -> AssistantGraphDependencies:
         tool_dispatch=_late_tool_dispatch,
         chat_model=CHAT_MODEL,
         cloud_model=CLOUD_MODEL,
+        coder_model=CODER_MODEL,
+        chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
     )
 
 
@@ -1508,6 +1531,85 @@ async def transcribe(audio: UploadFile = File(...)):
     finally:
         os.unlink(tmp_path)
     return JSONResponse({"text": text})
+
+
+# ── Code tool HTTP endpoints (Phase 10b) ──────────────────────────────────────
+
+def _get_code_root() -> str:
+    """Return the configured workspace root or raise HTTPException."""
+    root = os.getenv("CODE_WORKSPACE_ROOT", "")
+    if not root or not os.path.isdir(root):
+        raise HTTPException(status_code=503, detail="CODE_WORKSPACE_ROOT not configured or missing")
+    return root
+
+
+def _safe_resolve(root: str, relative: str) -> str:
+    """Resolve *relative* inside *root*.  Raises HTTPException on traversal."""
+    real_root = os.path.realpath(root)
+    candidate = os.path.realpath(os.path.join(real_root, relative))
+    if not (candidate == real_root or candidate.startswith(real_root + os.sep)):
+        raise HTTPException(status_code=400, detail="Path traversal is not allowed")
+    return candidate
+
+
+@app.get("/code/files", summary="List workspace files")
+async def list_code_files(
+    sub_path: str = "",
+    _user_id: str = Depends(get_current_user),
+):
+    """Return relative paths of all files under the workspace root (or sub-path)."""
+    root = _get_code_root()
+    base = _safe_resolve(root, sub_path) if sub_path else os.path.realpath(root)
+    _SKIP_DIRS = {"__pycache__", "node_modules", ".venv", ".git", "chroma", "models"}
+    paths: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(base):
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
+        for fname in filenames:
+            full = os.path.join(dirpath, fname)
+            try:
+                paths.append(os.path.relpath(full, root))
+            except ValueError:
+                paths.append(full)
+    return JSONResponse({"files": sorted(paths)})
+
+
+@app.get("/code/files/{file_path:path}", summary="Read a workspace file")
+async def read_code_file(
+    file_path: str,
+    _user_id: str = Depends(get_current_user),
+):
+    root = _get_code_root()
+    resolved = _safe_resolve(root, file_path)
+    if not os.path.isfile(resolved):
+        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
+    try:
+        content = Path(resolved).read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    return JSONResponse({"path": file_path, "content": content})
+
+
+class _WriteRequest(BaseModel):
+    content: str
+
+
+@app.put("/code/files/{file_path:path}", summary="Write a workspace file (explicit API write)")
+async def write_code_file(
+    file_path: str,
+    body: _WriteRequest,
+    _user_id: str = Depends(get_current_user),
+):
+    """Direct file write. The confirmation flow is handled in-graph for chat;
+    this endpoint is for programmatic / test usage only."""
+    root = _get_code_root()
+    resolved = _safe_resolve(root, file_path)
+    try:
+        Path(resolved).parent.mkdir(parents=True, exist_ok=True)
+        Path(resolved).write_text(body.content, encoding="utf-8")
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    log.info("code.write_file | path=%s | user=%s", file_path, _user_id)
+    return JSONResponse({"written": file_path})
 
 
 # ── Static frontend — MUST be last ────────────────────────────────────────────

@@ -18,3 +18,12 @@ pytest
 pytest-asyncio
 respx
 kokoro-onnx==0.5.0
+# Phase 10b: LangChain tooling for the code_tool ReAct node.
+langchain>=0.3
+langchain-core>=0.3
+langchain-community>=0.3
+langchain-ollama>=0.3
+# Phase 10b: tree-sitter for workspace code summarisation and ChromaDB indexing.
+tree-sitter>=0.22
+tree-sitter-python>=0.22
+tree-sitter-javascript>=0.22

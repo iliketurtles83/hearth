@@ -99,6 +99,9 @@ services:
     volumes:
       - ./backend:/app
       - ./frontend:/frontend
+      # Code tool workspace — writable volume for the code_tool node (Phase 10b).
+      # CODE_WORKSPACE_ROOT inside the container is /code-workspace.
+      - ${CODE_WORKSPACE_ROOT:-/home/jack/code-workspace}:/code-workspace
       # Strawberry music library DB — mounted read-only so the backend can search it.
       # Set STRAWBERRY_DB_DIR in .env to the directory containing strawberry.db.
       - ${STRAWBERRY_DB_DIR:-/home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry}:/strawberry:ro
