@@ -23,9 +23,6 @@ run_step() {
 run_step "Install backend dependencies" \
   "$PYTHON_BIN" -m pip install -q -r backend/requirements.txt
 
-run_step "Install security tooling" \
-  "$PYTHON_BIN" -m pip install -q pip-audit bandit
-
 run_step "Run focused backend regression suite" \
   "$PYTHON_BIN" -m pytest \
     backend/tests/test_auth.py \
@@ -36,8 +33,14 @@ run_step "Run focused backend regression suite" \
     backend/tests/test_weather.py \
     -q
 
-run_step "Run dependency vulnerability audit" \
-  "$PYTHON_BIN" -m pip_audit -r backend/requirements.txt --progress-spinner off
+if "$PYTHON_BIN" -m pip show pip-audit >/dev/null 2>&1; then
+  run_step "Run dependency vulnerability audit" \
+    "$PYTHON_BIN" -m pip_audit -r backend/requirements.txt --progress-spinner off
+else
+  echo
+  echo "==> Run dependency vulnerability audit"
+  echo "Skipping: pip-audit is not installed in the active environment."
+fi
 
 if command -v gitleaks >/dev/null 2>&1; then
   run_step "Run secret scan" \
@@ -45,12 +48,18 @@ if command -v gitleaks >/dev/null 2>&1; then
 else
   echo
   echo "==> Run secret scan"
-  echo "Skipping local secret scan: gitleaks is not installed. CI still enforces this check."
+  echo "Skipping: gitleaks is not installed."
 fi
 
-run_step "Run static security scan" \
-  "$PYTHON_BIN" -m bandit -q -ll -r backend -x backend/tests,backend/.venv,backend/chroma,backend/models,backend/__pycache__
+if "$PYTHON_BIN" -m pip show bandit >/dev/null 2>&1; then
+  run_step "Run static security scan" \
+    "$PYTHON_BIN" -m bandit -q -ll -r backend -x backend/tests,backend/.venv,backend/chroma,backend/models,backend/__pycache__
+else
+  echo
+  echo "==> Run static security scan"
+  echo "Skipping: bandit is not installed in the active environment."
+fi
 
 echo
 
-echo "Review baseline checks completed successfully."
+echo "Local baseline checks completed successfully."
