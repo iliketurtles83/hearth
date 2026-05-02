@@ -1,8 +1,0 @@
-{
-    "chat.tools.terminal.autoApprove": {
-        "/^docker compose exec mpd sh -c \"ps aux \\| grep '\\[m\\]pd' \\|\\| true\"$/": {
-            "approve": true,
-            "matchCommandLine": true
-        }
-    }
-}
