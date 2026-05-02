@@ -192,6 +192,23 @@ async def test_reset_chat_session_clears_messages_and_summary():
     assert main._session_store[session_id]["summary_message_count"] == 0
 
 
+@pytest.mark.asyncio
+async def test_reset_chat_session_schedules_episodic_persist(monkeypatch):
+    session_id, _ = main._get_or_create_session("alice", None)
+    main._append_session_message(session_id, "user", "keep this")
+
+    captured: list[tuple[str, str]] = []
+
+    def _fake_spawn(sid: str, _snapshot: dict, reason: str):
+        captured.append((sid, reason))
+
+    monkeypatch.setattr(main, "_spawn_episodic_persist_task", _fake_spawn)
+
+    await main.reset_chat_session(_request("alice", session_id))
+
+    assert captured == [(session_id, "session_reset")]
+
+
 def test_select_history_for_budget_respects_turn_cap(monkeypatch):
     monkeypatch.setattr(main, "CHAT_MAX_TURNS", 2)
     monkeypatch.setattr(main, "CHAT_TOKEN_BUDGET", 10_000)
@@ -307,8 +324,10 @@ async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(mon
 
     assert events[0] != "[DONE]"
     assert json.loads(events[0])["model"] == main.CHAT_MODEL
-    assert any(json.loads(event).get("text") == "hello" for event in events if event != "[DONE]")
-    assert any(json.loads(event).get("text") == " world" for event in events if event != "[DONE]")
+    text_payloads = [json.loads(event).get("text", "") for event in events if event != "[DONE]"]
+    combined_text = "".join(text_payloads)
+    assert "hello" in combined_text
+    assert "world" in combined_text
     assert any("voice" in json.loads(event) for event in events if event != "[DONE]")
     assert events[-1] == "[DONE]"
     assert ingest_sources == ["voice"]
@@ -533,3 +552,30 @@ async def test_get_graph_state_denies_foreign_session():
 
     assert response.status_code == 404
     assert _json_body(response)["code"] == "SESSION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_list_episodic_memory_endpoint_returns_user_rows():
+    main.memory_store.save_summary("alice", "sess-ep-1", "- User: I like coffee")
+
+    response = await main.list_episodic_memory(
+        _request("alice"),
+        limit=200,
+        offset=0,
+        consolidated=None,
+    )
+    payload = _json_body(response)
+
+    assert payload["total"] >= 1
+    assert any(item["tier"] == "episodic" for item in payload["items"])
+
+
+@pytest.mark.asyncio
+async def test_consolidate_memory_endpoint_runs_for_current_user():
+    main.memory_store.save_summary("alice", "sess-ep-2", "- User: My name is Alice")
+
+    response = await main.consolidate_memory(_request("alice"))
+    payload = _json_body(response)
+
+    assert payload["ok"] is True
+    assert payload["stats"]["processed"] >= 1

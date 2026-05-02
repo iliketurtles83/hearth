@@ -339,11 +339,18 @@
     }
 
     for (const item of items) {
+      const tier = String(item.tier || '').toLowerCase();
+      const tierLabel = tier === 'episodic' ? 'Episodic' : tier === 'semantic' ? 'Semantic' : 'Working';
+      const consolidatedLabel = tier === 'episodic'
+        ? (item.consolidated ? 'Consolidated' : 'Pending consolidation')
+        : '';
+
       const div = document.createElement('div');
       div.className = 'list-item';
       div.innerHTML = `
         <div class="list-item-title">${item.key}</div>
         <div class="list-item-meta">${(item.value || '').slice(0, 90)}</div>
+        <div class="list-item-meta">${tierLabel}${consolidatedLabel ? ` · ${consolidatedLabel}` : ''}</div>
         <div class="memory-actions">
           <button class="memory-delete-btn" data-id="${item.id}">Delete</button>
         </div>

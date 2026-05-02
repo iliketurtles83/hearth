@@ -105,11 +105,50 @@ def test_retrieve_scoped_to_user(store):
     alice_results = store.retrieve("alice", "pet")
     bob_results   = store.retrieve("bob",   "pet")
 
-    alice_texts = " ".join(r.get("value", "") for r in alice_results).lower()
-    bob_texts   = " ".join(r.get("value", "") for r in bob_results).lower()
+    alice_texts = " ".join(str(r.get("text", "")) for r in alice_results).lower()
+    bob_texts   = " ".join(str(r.get("text", "")) for r in bob_results).lower()
 
     # Each user's retrieval should surface their own pet, not the other's.
     if alice_results:
         assert "max" in alice_texts or "golden" in alice_texts or "dog" in alice_texts
     if bob_results:
         assert "luna" in bob_texts or "siamese" in bob_texts or "cat" in bob_texts
+
+
+def test_list_items_exposes_tier_labels(store):
+    store.ingest_user_message("alice", "My name is Alice.")
+    store.save_summary("alice", "sess-1", "- User: I prefer dark themes")
+
+    items = store.list_items("alice")["items"]
+    tiers = {item["tier"] for item in items}
+
+    assert "semantic" in tiers
+    assert "episodic" in tiers
+
+
+def test_list_episodic_returns_only_summaries(store):
+    store.ingest_user_message("alice", "My favorite editor is VS Code.")
+    row_id = store.save_summary("alice", "sess-2", "- User: My favorite editor is VS Code.")
+
+    episodic = store.list_episodic("alice")
+    assert episodic["total"] >= 1
+    assert any(item["id"] == f"summaries:{row_id}" for item in episodic["items"])
+    assert all(item["tier"] == "episodic" for item in episodic["items"])
+
+
+def test_consolidate_pending_promotes_summary_facts(store):
+    store.save_summary(
+        "alice",
+        "sess-3",
+        "- User: My name is Alice\n- User: I live in Tallinn",
+    )
+
+    stats = store.consolidate_pending("alice", limit=10)
+    assert stats["processed"] == 1
+    assert stats["promoted"] >= 1
+
+    episodic_pending = store.list_episodic("alice", consolidated=False)
+    assert episodic_pending["total"] == 0
+
+    hits = store.retrieve("alice", "where do I live")
+    assert any("tallinn" in str(hit.get("text", "")).lower() for hit in hits)

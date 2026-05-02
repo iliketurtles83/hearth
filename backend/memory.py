@@ -478,18 +478,25 @@ class MemoryStore:
             self._conn.commit()
             return int(cur.lastrowid)  # type: ignore[arg-type]
 
+    def _tier_for_table(self, table: str) -> str:
+        if table in {"facts", "preferences"}:
+            return "semantic"
+        if table == "summaries":
+            return "episodic"
+        return "working"
+
     def list_items(self, user_id: str, limit: int = 200, offset: int = 0) -> dict[str, Any]:
         with self._lock:
             cur = self._conn.cursor()
             rows = cur.execute(
                 """
-                SELECT id, 'facts' AS table_name, key, value, source, created_at AS ts
+                SELECT id, 'facts' AS table_name, key, value, source, created_at AS ts, 1 AS consolidated
                 FROM facts WHERE user_id = ?
                 UNION ALL
-                SELECT id, 'preferences' AS table_name, key, value, '' AS source, updated_at AS ts
+                SELECT id, 'preferences' AS table_name, key, value, '' AS source, updated_at AS ts, 1 AS consolidated
                 FROM preferences WHERE user_id = ?
                 UNION ALL
-                SELECT id, 'summaries' AS table_name, session_id AS key, summary AS value, '' AS source, created_at AS ts
+                SELECT id, 'summaries' AS table_name, session_id AS key, summary AS value, '' AS source, created_at AS ts, consolidated
                 FROM summaries WHERE user_id = ?
                 ORDER BY ts DESC
                 LIMIT ? OFFSET ?
@@ -512,14 +519,159 @@ class MemoryStore:
             {
                 "id": f"{r['table_name']}:{r['id']}",
                 "table": r["table_name"],
+                "tier": self._tier_for_table(r["table_name"]),
                 "key": r["key"],
                 "value": r["value"],
                 "source": r["source"],
+                "consolidated": bool(r["consolidated"]),
                 "ts": r["ts"],
             }
             for r in rows
         ]
         return {"items": items, "total": int(total), "limit": limit, "offset": offset}
+
+    def list_episodic(
+        self,
+        user_id: str,
+        limit: int = 200,
+        offset: int = 0,
+        consolidated: bool | None = None,
+    ) -> dict[str, Any]:
+        where_sql = "WHERE user_id = ?"
+        args: list[Any] = [user_id]
+        if consolidated is not None:
+            where_sql += " AND consolidated = ?"
+            args.append(1 if consolidated else 0)
+
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                f"""
+                SELECT id, session_id, summary, created_at, consolidated
+                FROM summaries
+                {where_sql}
+                ORDER BY created_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(args + [limit, offset]),
+            ).fetchall()
+
+            total = cur.execute(
+                f"""
+                SELECT COUNT(*) AS total
+                FROM summaries
+                {where_sql}
+                """,
+                tuple(args),
+            ).fetchone()["total"]
+
+        items = [
+            {
+                "id": f"summaries:{r['id']}",
+                "table": "summaries",
+                "tier": "episodic",
+                "key": r["session_id"],
+                "value": r["summary"],
+                "source": "",
+                "consolidated": bool(r["consolidated"]),
+                "ts": r["created_at"],
+            }
+            for r in rows
+        ]
+        return {"items": items, "total": int(total), "limit": limit, "offset": offset}
+
+    def consolidate_pending(self, user_id: str | None = None, limit: int = 50) -> dict[str, int]:
+        now = time.time()
+        with self._lock:
+            cur = self._conn.cursor()
+            if user_id:
+                rows = cur.execute(
+                    """
+                    SELECT id, user_id, session_id, summary
+                    FROM summaries
+                    WHERE user_id = ? AND consolidated = 0
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                    """,
+                    (user_id, limit),
+                ).fetchall()
+            else:
+                rows = cur.execute(
+                    """
+                    SELECT id, user_id, session_id, summary
+                    FROM summaries
+                    WHERE consolidated = 0
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+
+            processed = 0
+            promoted = 0
+            blocked = 0
+            for row in rows:
+                summary_id = int(row["id"])
+                summary_text = str(row["summary"] or "")
+                summary_user_id = str(row["user_id"])
+                candidates = self._extract_candidates(summary_text, source="consolidation")
+
+                for c in candidates:
+                    text = f"{c.key}: {c.value}"
+                    if self._is_sensitive(text):
+                        blocked += 1
+                        continue
+
+                    if c.table == "preferences":
+                        cur.execute(
+                            """
+                            INSERT INTO preferences (user_id, key, value, updated_at, sensitive)
+                            VALUES (?, ?, ?, ?, 0)
+                            ON CONFLICT(user_id, key)
+                                DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                            """,
+                            (summary_user_id, c.key, c.value, now),
+                        )
+                        pref_row = cur.execute(
+                            "SELECT id FROM preferences WHERE user_id = ? AND key = ? LIMIT 1",
+                            (summary_user_id, c.key),
+                        ).fetchone()
+                        memory_id = f"preferences:{int(pref_row['id'])}"
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO facts (user_id, key, value, source, created_at, expires_at, sensitive)
+                            VALUES (?, ?, ?, ?, ?, NULL, 0)
+                            """,
+                            (summary_user_id, c.key, c.value, c.source, now),
+                        )
+                        memory_id = f"facts:{int(cur.lastrowid)}"
+
+                    self._upsert_chroma(
+                        memory_id,
+                        text,
+                        {
+                            "table": c.table,
+                            "key": c.key,
+                            "source": "consolidation",
+                            "user_id": summary_user_id,
+                            "created_at": now,
+                            "consent_status": "consolidated",
+                            "from_summary_id": summary_id,
+                        },
+                    )
+                    promoted += 1
+
+                cur.execute("UPDATE summaries SET consolidated = 1 WHERE id = ?", (summary_id,))
+                processed += 1
+
+            self._conn.commit()
+
+        return {
+            "processed": int(processed),
+            "promoted": int(promoted),
+            "blocked": int(blocked),
+        }
 
     def delete_item(self, user_id: str, memory_id: str) -> bool:
         if ":" not in memory_id:
@@ -594,7 +746,6 @@ class MemoryStore:
             if overlap <= 0:
                 continue
 
-            # Normalize overlap so sqlite scores can be merged with chroma scores.
             score = overlap / float(len(terms))
             if any(t == key for t in terms):
                 score += 0.15
@@ -603,7 +754,11 @@ class MemoryStore:
             ranked.append(
                 {
                     "id": item["id"],
-                    "text": f"{item['key']}: {item['value']}",
+                    "table": item.get("table", ""),
+                    "tier": item.get("tier", "semantic"),
+                    "key": item.get("key", ""),
+                    "value": item.get("value", ""),
+                    "text": f"{item.get('key', '')}: {item.get('value', '')}",
                     "score": float(score),
                     "source": "sqlite",
                 }
@@ -619,12 +774,24 @@ class MemoryStore:
 
         limit = top_n or self.top_n
         query_terms = self._query_terms(raw_query)
-        listed = [
+        listed_all = self.list_items(user_id, limit=300, offset=0)["items"]
+
+        semantic_items = [
             item
-            for item in self.list_items(user_id, limit=300, offset=0)["items"]
+            for item in listed_all
             if item.get("table") in {"facts", "preferences"}
         ]
-        sqlite_hits = self._keyword_rank(raw_query, listed, limit * 2)
+        episodic_items = [
+            item
+            for item in listed_all
+            if item.get("table") == "summaries"
+        ]
+
+        sqlite_sem_hits = self._keyword_rank(raw_query, semantic_items, limit * 2)
+        sqlite_epi_hits = self._keyword_rank(raw_query, episodic_items, limit)
+        for hit in sqlite_epi_hits:
+            hit["score"] = float(hit["score"]) * 0.85
+            hit["source"] = "sqlite-episodic"
 
         chroma_hits: list[dict[str, Any]] = []
         try:
@@ -638,12 +805,25 @@ class MemoryStore:
             distances = (result.get("distances") or [[]])[0]
             for idx, doc, dist in zip(ids, docs, distances):
                 score = 1.0 / (1.0 + float(dist))
-                chroma_hits.append({"id": idx, "text": doc, "score": score, "source": "chroma"})
+                table = str(idx).split(":", 1)[0] if ":" in str(idx) else "facts"
+                key, _, value = str(doc).partition(":")
+                chroma_hits.append(
+                    {
+                        "id": idx,
+                        "table": table,
+                        "tier": "semantic",
+                        "key": key.strip(),
+                        "value": value.strip(),
+                        "text": doc,
+                        "score": score,
+                        "source": "chroma",
+                    }
+                )
         except Exception:
             chroma_hits = []
 
         merged: dict[str, dict[str, Any]] = {}
-        for hit in sqlite_hits + chroma_hits:
+        for hit in sqlite_sem_hits + sqlite_epi_hits + chroma_hits:
             overlap = self._token_overlap(query_terms, str(hit.get("text", "")))
             if overlap == 0 and hit.get("source") == "chroma":
                 continue
@@ -651,8 +831,8 @@ class MemoryStore:
                 continue
 
             existing = merged.get(hit["id"])
-            if not existing or hit["score"] > existing["score"]:
+            if not existing or float(hit["score"]) > float(existing["score"]):
                 merged[hit["id"]] = hit
 
-        merged_list = sorted(merged.values(), key=lambda h: h["score"], reverse=True)[:limit]
+        merged_list = sorted(merged.values(), key=lambda h: float(h["score"]), reverse=True)[:limit]
         return merged_list

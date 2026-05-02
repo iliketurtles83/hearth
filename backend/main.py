@@ -6,6 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+import asyncio
 import httpx
 import anthropic
 import os
@@ -58,6 +59,9 @@ OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 CHAT_SUMMARY_TRIGGER_MESSAGES = int(os.getenv("CHAT_SUMMARY_TRIGGER_MESSAGES", "18"))
 CHAT_SUMMARY_KEEP_RECENT_MESSAGES = int(os.getenv("CHAT_SUMMARY_KEEP_RECENT_MESSAGES", "8"))
 CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
+MEMORY_CONSOLIDATION_MODE = os.getenv("MEMORY_CONSOLIDATION_MODE", "on-session-end").strip().lower()
+MEMORY_CONSOLIDATION_INTERVAL_SECONDS = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL_SECONDS", "86400"))
+MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
 
 
 def _load_hearth_prompt() -> str:
@@ -114,6 +118,7 @@ _session_store_lock = Lock()
 _session_store: dict[str, dict] = {}
 _code_write_lock = Lock()
 _pending_code_writes: dict[str, dict] = {}
+_consolidation_loop_task: asyncio.Task | None = None
 
 # ── Auth service (shared singleton) ───────────────────────────────────────────
 _auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
@@ -246,15 +251,26 @@ _assistant_graph = None  # type: ignore[assignment]
 
 @asynccontextmanager
 async def _graph_lifespan(_app: FastAPI):
-    global _assistant_graph
+    global _assistant_graph, _consolidation_loop_task
     async with create_assistant_graph(
         _make_graph_deps(),
         checkpoint_path=default_checkpoint_path(),
     ) as checkpointed_graph:
         _assistant_graph = checkpointed_graph
         _app.state.assistant_graph = checkpointed_graph
+        if MEMORY_CONSOLIDATION_MODE == "interval":
+            _consolidation_loop_task = asyncio.create_task(_consolidation_loop())
+            log.info(
+                "memory.consolidation.loop_started | mode=interval interval_seconds=%d",
+                max(60, MEMORY_CONSOLIDATION_INTERVAL_SECONDS),
+            )
         log.info("graph.ready | checkpointer=sqlite path=%s", default_checkpoint_path())
-        yield
+        try:
+            yield
+        finally:
+            if _consolidation_loop_task:
+                _consolidation_loop_task.cancel()
+                _consolidation_loop_task = None
 
 app = FastAPI(lifespan=_graph_lifespan)
 
@@ -502,6 +518,90 @@ def _truncate_summary(summary: str) -> str:
     if first_newline > 0:
         return tail[first_newline + 1 :]
     return tail
+
+
+def _build_episodic_record_text(session: dict) -> str:
+    session_summary = str(session.get("summary", "") or "").strip()
+    messages = list(session.get("messages", []))
+    recent = _summarize_messages_chunk(messages[-14:]) if messages else ""
+
+    if session_summary and recent:
+        merged = f"{session_summary}\n{recent}".strip()
+    else:
+        merged = session_summary or recent
+    return _truncate_summary(merged.strip())
+
+
+async def _persist_session_episodic_snapshot(session_id: str, session_snapshot: dict, reason: str) -> None:
+    user_id = str(session_snapshot.get("user_id") or "")
+    if not user_id:
+        return
+
+    summary_text = _build_episodic_record_text(session_snapshot)
+    if not summary_text:
+        return
+
+    try:
+        row_id = await asyncio.to_thread(memory_store.save_summary, user_id, session_id, summary_text)
+        log.info(
+            "memory.episodic.saved | session_id=%s user_id=%s row_id=%s reason=%s",
+            session_id,
+            user_id,
+            row_id,
+            reason,
+        )
+    except Exception as exc:
+        log.error(
+            "memory.episodic.save_failed | session_id=%s user_id=%s reason=%s error=%s",
+            session_id,
+            user_id,
+            reason,
+            exc,
+        )
+        return
+
+    if MEMORY_CONSOLIDATION_MODE != "on-session-end":
+        return
+
+    try:
+        stats = await asyncio.to_thread(
+            memory_store.consolidate_pending,
+            user_id,
+            MEMORY_CONSOLIDATION_BATCH_SIZE,
+        )
+        log.info(
+            "memory.consolidation.on_session_end | user_id=%s processed=%d promoted=%d blocked=%d",
+            user_id,
+            int(stats.get("processed", 0)),
+            int(stats.get("promoted", 0)),
+            int(stats.get("blocked", 0)),
+        )
+    except Exception as exc:
+        log.error("memory.consolidation.failed | user_id=%s error=%s", user_id, exc)
+
+
+def _spawn_episodic_persist_task(session_id: str, session_snapshot: dict, reason: str) -> None:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    loop.create_task(_persist_session_episodic_snapshot(session_id, session_snapshot, reason))
+
+
+async def _consolidation_loop() -> None:
+    interval = max(60, MEMORY_CONSOLIDATION_INTERVAL_SECONDS)
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            stats = await asyncio.to_thread(memory_store.consolidate_pending, None, MEMORY_CONSOLIDATION_BATCH_SIZE)
+            log.info(
+                "memory.consolidation.interval | processed=%d promoted=%d blocked=%d",
+                int(stats.get("processed", 0)),
+                int(stats.get("promoted", 0)),
+                int(stats.get("blocked", 0)),
+            )
+        except Exception as exc:
+            log.error("memory.consolidation.interval_failed | error=%s", exc)
 
 
 def _update_session_summary_if_needed(session_id: str) -> tuple[bool, int, int]:
@@ -1108,14 +1208,21 @@ async def reset_chat_session(http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, created = _get_or_create_session(user_id, cookie_session_id)
+    snapshot: dict | None = None
     with _session_store_lock:
         session = _session_store.get(session_id, {"messages": [], "summary": "", "summary_message_count": 0})
         cleared_messages = len(session["messages"])
+        if cleared_messages > 0 or str(session.get("summary", "") or "").strip():
+            snapshot = dict(session)
+            snapshot["messages"] = list(session.get("messages", []))
         session["messages"] = []
         session["summary"] = ""
         session["summary_message_count"] = 0
         session["updated_at"] = time.time()
         _session_store[session_id] = session
+
+    if snapshot is not None:
+        _spawn_episodic_persist_task(session_id, snapshot, "session_reset")
 
     log.info(
         "chat.session.reset | session_id=%s cleared_messages=%d was_new=%s",
@@ -1147,11 +1254,15 @@ async def delete_chat_session(session_id: str, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     active_session_id: str | None = None
+    snapshot: dict | None = None
 
     with _session_store_lock:
         session = _session_store.get(session_id)
         if not _session_owned_by(session, user_id):
             return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
+        if session and (len(session.get("messages", [])) > 0 or str(session.get("summary", "") or "").strip()):
+            snapshot = dict(session)
+            snapshot["messages"] = list(session.get("messages", []))
         del _session_store[session_id]
 
         # If the deleted session was active, prefer an existing remaining session.
@@ -1166,6 +1277,10 @@ async def delete_chat_session(session_id: str, http_request: Request):
                     owned_sessions,
                     key=lambda item: item[1]["updated_at"],
                 )[0]
+
+    if snapshot is not None:
+        _spawn_episodic_persist_task(session_id, snapshot, "session_delete")
+
     log.info("chat.session.deleted | session_id=%s user_id=%s", session_id, user_id)
 
     # If the deleted session was active and nothing remains, create a fresh session.
@@ -1185,7 +1300,23 @@ async def delete_chat_session(session_id: str, http_request: Request):
 @app.post("/chat/session/new")
 async def create_chat_session(http_request: Request):
     user_id: str = http_request.state.user_id
+    previous_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    previous_snapshot: dict | None = None
+
+    if previous_session_id:
+        with _session_store_lock:
+            prev = _session_store.get(previous_session_id)
+            if _session_owned_by(prev, user_id) and prev and (
+                len(prev.get("messages", [])) > 0 or str(prev.get("summary", "") or "").strip()
+            ):
+                previous_snapshot = dict(prev)
+                previous_snapshot["messages"] = list(prev.get("messages", []))
+
     session_id, _ = _get_or_create_session(user_id, None)
+
+    if previous_snapshot is not None and previous_session_id and previous_session_id != session_id:
+        _spawn_episodic_persist_task(previous_session_id, previous_snapshot, "session_new")
+
     response = JSONResponse({"ok": True, "session_id": session_id})
     _set_session_cookie(response, session_id)
     return response
@@ -1194,9 +1325,27 @@ async def create_chat_session(http_request: Request):
 @app.post("/chat/session/select")
 async def select_chat_session(payload: SessionSelectRequest, http_request: Request):
     user_id: str = http_request.state.user_id
+    current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    previous_snapshot: dict | None = None
+
     with _session_store_lock:
         if not _session_owned_by(_session_store.get(payload.session_id), user_id):
             return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
+
+        prev = _session_store.get(current_session_id) if current_session_id else None
+        if (
+            current_session_id
+            and current_session_id != payload.session_id
+            and _session_owned_by(prev, user_id)
+            and prev
+            and (len(prev.get("messages", [])) > 0 or str(prev.get("summary", "") or "").strip())
+        ):
+            previous_snapshot = dict(prev)
+            previous_snapshot["messages"] = list(prev.get("messages", []))
+
+    if previous_snapshot is not None and current_session_id:
+        _spawn_episodic_persist_task(current_session_id, previous_snapshot, "session_switch")
+
     response = JSONResponse({"ok": True, "session_id": payload.session_id})
     _set_session_cookie(response, payload.session_id)
     return response
@@ -1221,6 +1370,24 @@ async def get_chat_session_messages(http_request: Request):
 async def list_memory(http_request: Request, limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0)):
     user_id: str = http_request.state.user_id
     return JSONResponse(memory_store.list_items(user_id, limit=limit, offset=offset))
+
+
+@app.get("/memory/episodic")
+async def list_episodic_memory(
+    http_request: Request,
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    consolidated: bool | None = Query(default=None),
+):
+    user_id: str = http_request.state.user_id
+    return JSONResponse(memory_store.list_episodic(user_id, limit=limit, offset=offset, consolidated=consolidated))
+
+
+@app.post("/memory/consolidate")
+async def consolidate_memory(http_request: Request):
+    user_id: str = http_request.state.user_id
+    stats = await asyncio.to_thread(memory_store.consolidate_pending, user_id, MEMORY_CONSOLIDATION_BATCH_SIZE)
+    return JSONResponse({"ok": True, "stats": stats})
 
 
 @app.delete("/memory/{memory_id}")
