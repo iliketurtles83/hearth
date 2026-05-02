@@ -5,7 +5,6 @@ Acceptance criteria verified here:
 - Chat responses pass through unchanged.
 - Compression preserves all factual content (no fact drift).
 - modality field is derived correctly from request source.
-- tone field is wired as nullable; None by default.
 """
 from __future__ import annotations
 
@@ -75,9 +74,8 @@ def _make_deps(
     compressed_response: str,
 ) -> assistant_graph.AssistantGraphDependencies:
     """Build deps where stream_local calls are:
-      call 1: tone probe (returns 'calm')
-      call 2: original model response (original_chunks)
-      call 3+: compression / persona_renderer (compressed_response)
+      call 1: original model response (original_chunks)
+      call 2+: compression pass (compressed_response)
     """
     call_count = {"n": 0}
 
@@ -96,14 +94,11 @@ def _make_deps(
     async def _fake_stream_local(_request, model_name=None):
         call_count["n"] += 1
         if call_count["n"] == 1:
-            # Tone probe call (Phase 11) — return a valid label
-            yield "calm"
-        elif call_count["n"] == 2:
             # Original model response
             for chunk in original_chunks:
                 yield chunk
         else:
-            # Compression pass (voice) or persona_renderer
+            # Compression pass (voice)
             yield compressed_response
 
     async def _fake_stream_cloud(_system: str, _messages: list):
@@ -131,7 +126,6 @@ def _voice_state(**overrides) -> assistant_graph.AssistantState:
         "system": "You are a helpful assistant.",
         "source": "voice",
         "modality": "voice",
-        "tone": None,
         "history": [],
         "session_summary": "",
     }
@@ -147,7 +141,6 @@ def _chat_state(**overrides) -> assistant_graph.AssistantState:
         "system": "You are a helpful assistant.",
         "source": "text",
         "modality": "chat",
-        "tone": None,
         "history": [],
         "session_summary": "",
     }
@@ -171,20 +164,6 @@ async def test_chat_modality_response_passes_through_full_text():
 
     assert result["response_text"] == "The weather in Paris is 18°C and sunny."
     assert result["modality"] == "chat"
-
-
-@pytest.mark.asyncio
-async def test_chat_modality_tone_is_none():
-    """tone field must be a valid label after Phase 11 memory_retrieval runs."""
-    deps = _make_deps(original_chunks=["Hello!"], compressed_response="unused")
-    graph = assistant_graph.build_assistant_graph(deps)
-
-    result = await graph.ainvoke(_chat_state(message="Hi"))
-
-    _valid_labels = {"calm", "curious", "frustrated", "excited", "uncertain", "urgent"}
-    assert result.get("tone") in _valid_labels, (
-        f"Expected tone to be a valid label, got {result.get('tone')!r}"
-    )
 
 
 # ── Voice modality: compression pass must run ────────────────────────────────
@@ -319,10 +298,9 @@ async def test_voice_short_response_no_compression_model_call():
 # ── AssistantState schema: fields exist and have correct types ────────────────
 
 def test_assistant_state_has_modality_field():
-    """AssistantState TypedDict must declare modality and tone fields."""
+    """AssistantState TypedDict must declare the modality field."""
     annotations = assistant_graph.AssistantState.__annotations__
     assert "modality" in annotations, "modality field missing from AssistantState"
-    assert "tone" in annotations, "tone field missing from AssistantState"
 
 
 def test_modality_values_are_voice_or_chat():
