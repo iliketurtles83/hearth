@@ -1,27 +1,28 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query, HTTPException
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
-from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import asyncio
 import httpx
 import anthropic
+import importlib
+import importlib.util
 import os
 import json
 import logging
 import re
+import sys
 import tempfile
 import time
 from pathlib import Path
 from threading import Lock
 from uuid import uuid4
-import difflib
 import numpy as np
 from dotenv import load_dotenv
-from router import route as router_route, classify_intent, LOCAL_MODEL, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
+from router import route as router_route, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
 from memory import MemoryStore
 from graph import (
     build_assistant_graph,
@@ -30,7 +31,54 @@ from graph import (
     checkpoint_config,
     default_checkpoint_path,
 )
+from auth import AuthService
+from music_fastpath import parse_music_command, format_music_response
+from routes.auth_routes import create_auth_router
+from routes.code_file_routes import create_code_file_router
+from routes.memory_tool_routes import create_memory_tool_router
+from app_schemas import (
+    ChatRequest as BaseChatRequest,
+    TTSRequest,
+    CodeRequest as BaseCodeRequest,
+    SessionSelectRequest,
+)
 import tts
+
+_BACKEND_DIR = os.path.dirname(__file__)
+if _BACKEND_DIR not in sys.path:
+    sys.path.insert(0, _BACKEND_DIR)
+
+
+def _import_local_tools_module():
+    mod = importlib.import_module("tools")
+    if hasattr(mod, "dispatch"):
+        return mod
+
+    tools_dir = Path(_BACKEND_DIR) / "tools"
+    init_file = tools_dir / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        "assistant_backend_tools",
+        str(init_file),
+        submodule_search_locations=[str(tools_dir)],
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError("Unable to load backend tools package")
+
+    fallback = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = fallback
+    spec.loader.exec_module(fallback)
+    return fallback
+
+
+tools = _import_local_tools_module()
+ToolResult = importlib.import_module(f"{tools.__name__}.base").ToolResult
+
+
+async def _run_weather_tool(params: dict):
+    weather_tool = importlib.import_module(f"{tools.__name__}.weather")
+    return await weather_tool.run(params)
+
+
 
 _memory_db_default = os.path.join(os.path.dirname(__file__), "memory.db")
 _chroma_default = os.path.join(os.path.dirname(__file__), "chroma")
@@ -38,9 +86,6 @@ memory_store = MemoryStore(
     db_path=os.getenv("MEMORY_DB_PATH", _memory_db_default),
     chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
 )
-from auth import AuthService, AuthError
-import tools
-from tools.base import ToolResult
 
 load_dotenv()
 
@@ -79,6 +124,14 @@ def _load_hearth_prompt() -> str:
 
 
 CHAT_DEFAULT_SYSTEM_PROMPT = _load_hearth_prompt()
+
+
+class ChatRequest(BaseChatRequest):
+    system: str = CHAT_DEFAULT_SYSTEM_PROMPT
+
+
+class CodeRequest(BaseCodeRequest):
+    system: str = CHAT_DEFAULT_SYSTEM_PROMPT
 
 WAKEWORD_MODEL_FILE = os.getenv("WAKEWORD_MODEL_FILE", "computer_v2.onnx")
 OWW_MELSPEC_MODEL_FILE = os.getenv("OWW_MELSPEC_MODEL_FILE", "melspectrogram.onnx")
@@ -318,25 +371,6 @@ def get_whisper_model():
         _whisper_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
     return _whisper_model
 
-class ChatRequest(BaseModel):
-    message: str
-    system: str = CHAT_DEFAULT_SYSTEM_PROMPT
-    source: str = "text"
-
-
-class TTSRequest(BaseModel):
-    text: str
-
-
-class CodeRequest(BaseModel):
-    message: str
-    system: str = CHAT_DEFAULT_SYSTEM_PROMPT
-    source: str = "text"
-
-
-class SessionSelectRequest(BaseModel):
-    session_id: str
-
 
 def _error_response(message: str, code: str, retryable: bool, status_code: int = 400) -> JSONResponse:
     return JSONResponse({"error": message, "code": code, "retryable": retryable}, status_code=status_code)
@@ -369,6 +403,35 @@ def _tts_error_status(code: str, retryable: bool) -> int:
     if retryable:
         return 502
     return 500
+
+
+app.include_router(
+    create_auth_router(
+        auth_service=auth_service,
+        auth_cookie_name=AUTH_COOKIE_NAME,
+        session_cookie_secure=SESSION_COOKIE_SECURE,
+        extract_bearer_token=_extract_bearer_token,
+        error_response=_error_response,
+    )
+)
+
+app.include_router(
+    create_memory_tool_router(
+        memory_store=memory_store,
+        memory_consolidation_batch_size=MEMORY_CONSOLIDATION_BATCH_SIZE,
+        error_response=_error_response,
+        dispatch_tool=tools.dispatch,
+        run_weather=_run_weather_tool,
+    )
+)
+
+app.include_router(
+    create_code_file_router(
+        code_write_lock=_code_write_lock,
+        pending_code_writes=_pending_code_writes,
+        log=log,
+    )
+)
 
 
 def _normalize_chat_source(source: str | None) -> str:
@@ -807,205 +870,17 @@ _assistant_graph = build_assistant_graph(_make_graph_deps())
 log.info("graph.ready | checkpointer=none (no-checkpoint mode; Slice 5 adds AsyncSqliteSaver)")
 
 
-# ── Deterministic music pre-router ────────────────────────────────────────────
-# Maps control verbs to canonical MPD actions.
-_MUSIC_CTRL: dict[str, str] = {
-    "pause": "pause",
-    "stop": "stop",
-    "resume": "resume",
-    "continue": "resume",
-    "unpause": "resume",
-    "next": "next",
-    "skip": "next",
-}
-
-# Target phrases that are too vague to resolve without LLM help.
-_MUSIC_VAGUE: frozenset[str] = frozenset({
-    "something", "anything", "a song", "some songs", "any song",
-    "a track", "some tracks", "any track", "some music", "any music",
-    "a random song", "a random track", "a tune", "some tunes",
-})
-
-
-def _parse_music_command(prompt: str) -> dict | None:
-    """Deterministically parse a high-confidence music command.
-
-    Returns a params dict ready for ``tools.dispatch("music", ...)`` if the
-    prompt maps to a known music action with enough specificity.  Returns None
-    for anything ambiguous so it falls through to the normal LLM path.
-
-    High-confidence cases handled here (no LLM needed):
-      - Control commands: pause / stop / resume / next / skip
-      - Status queries: now-playing, queue view
-      - Explicit play/queue with a concrete target (title, artist, year/decade,
-        or "title by artist")
-
-    Deliberately NOT matched (→ LLM path):
-      - "play something chill", "play something like X"
-      - "play something" / "play anything" (too vague)
-      - Requests with no play/queue verb (no music intent confirmed)
-    """
-    pl = prompt.strip().lower().rstrip(".,!?")
-
-    # ── Control commands ──────────────────────────────────────────────────────
-    # Matches: "pause", "next track", "stop the music", "skip it", etc.
-    ctrl_m = re.match(
-        r"^(pause|stop|resume|continue|unpause|next|skip)"
-        r"(?:\s+(?:the\s+)?(?:music|song|track|playback|it))?$",
-        pl,
-    )
-    if ctrl_m:
-        action = _MUSIC_CTRL.get(ctrl_m.group(1))
-        if action:
-            return {"action": "control", "control": action}
-
-    # ── Now playing ───────────────────────────────────────────────────────────
-    if re.search(
-        r"\b(what'?s|what is)\s+(currently\s+)?(playing|on)\b"
-        r"|\bnow\s+playing\b|\bcurrent\s+(song|track)\b",
-        pl,
-    ):
-        return {"action": "now_playing"}
-
-    # ── Queue view ────────────────────────────────────────────────────────────
-    if re.search(
-        r"\b(what'?s|what is)\s+(in\s+)?(the\s+)?(queue|playlist)\b"
-        r"|\bshow\s+(me\s+)?(the\s+)?(queue|playlist)\b",
-        pl,
-    ):
-        return {"action": "queue_view"}
-
-    # ── Explicit play / queue verb required for all remaining cases ───────────
-    play_m = re.match(
-        r"^(play(?:back)?|queue|add\s+to\s+(?:the\s+)?queue|put\s+on)\s+(.+)$",
-        pl,
-    )
-    if not play_m:
-        return None  # No music verb → not a confident music command.
-
-    verb = play_m.group(1)
-    action = "queue" if re.match(r"queue|add\s+to", verb) else "play"
-    target = play_m.group(2).strip().strip(".,!?\"'")
-
-    # Reject generic / vague targets — these benefit from LLM interpretation.
-    if target in _MUSIC_VAGUE:
-        return None
-    if re.match(
-        r"^something\s+(like|similar\s+to|that\s+sounds?\s+like)",
-        target,
-        re.IGNORECASE,
-    ):
-        return None
-    if re.match(
-        r"^(something|anything)\s*(chill|relaxing|upbeat|heavy|fast|slow|random|good)?$",
-        target,
-        re.IGNORECASE,
-    ):
-        return None
-
-    # ── Decade: "80s", "80s rock", "some 90s music" ──────────────────────────
-    decade_m = re.match(r"^(?:some\s+)?(\d{2})s(?:\s+.*)?$", target, re.IGNORECASE)
-    if decade_m:
-        d = int(decade_m.group(1))
-        yr = (2000 + d) if d < 30 else (1900 + d)
-        return {"action": action, "year_range": (yr, yr + 9)}
-
-    # ── Exact year: "1994", "music from 2003" ────────────────────────────────
-    year_m = re.match(
-        r"^(?:(?:music|songs?|tracks?)\s+from\s+)?(\d{4})$", target, re.IGNORECASE
-    )
-    if year_m:
-        yr = int(year_m.group(1))
-        return {"action": action, "year_range": (yr, yr)}
-
-    # ── "title by artist" ─────────────────────────────────────────────────────
-    by_m = re.match(r"^(?P<title>.+?)\s+by\s+(?P<artist>.+)$", target, re.IGNORECASE)
-    if by_m:
-        title = by_m.group("title").strip().strip("\"'")
-        artist = by_m.group("artist").strip().strip("\"'")
-        if title.lower() in _MUSIC_VAGUE:
-            # "a song by Metallica" → artist radio
-            return {"action": action, "artist": artist}
-        return {"action": action, "query": title, "artist_filter": artist}
-
-    # ── "some/a/any [random] <artist> song/track" ─────────────────────────────
-    artist_song_m = re.match(
-        r"^(?:a|some|any)\s+(?:random\s+)?(?P<artist>.+?)\s+(?:song|track|music)s?$",
-        target,
-        re.IGNORECASE,
-    )
-    if artist_song_m:
-        return {"action": action, "artist": artist_song_m.group("artist").strip()}
-
-    # ── Bare query (title or artist name) ─────────────────────────────────────
-    return {"action": action, "query": target}
-
-
-def _format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:
-    """Format a music ToolResult as a brief plain-text sentence (no LLM needed)."""
-    if not tool_result.ok:
-        return tool_result.error or "Music command failed."
-
-    data = tool_result.data or {}
-    req_action = music_cmd.get("action", "")
-
-    if req_action in ("play", "queue"):
-        data_action = data.get("action", req_action)
-        track = data.get("track")
-        tracks = data.get("tracks")
-        verb = "Queued" if data_action == "queue" else "Now playing"
-        if tracks and len(tracks) > 1:
-            artist = tracks[0].get("artist", "unknown artist")
-            return f"{verb}: {len(tracks)} tracks by {artist}."
-        if track:
-            title = track.get("title", "unknown track")
-            artist = track.get("artist", "unknown artist")
-            return f'{verb}: "{title}" by {artist}.'
-        return "Playback started."
-
-    if req_action == "control":
-        ctrl = music_cmd.get("control", "")
-        return {
-            "pause": "Paused.",
-            "resume": "Resumed.",
-            "stop": "Stopped.",
-            "next": "Skipping to next track.",
-        }.get(ctrl, "Done.")
-
-    if req_action == "now_playing":
-        state = data.get("state", "stop")
-        track = data.get("track")
-        if state == "stop" or not track:
-            return "Nothing is playing."
-        title = track.get("title", "unknown")
-        artist = track.get("artist", "unknown")
-        verb = "Paused" if state == "pause" else "Now playing"
-        return f'{verb}: "{title}" by {artist}.'
-
-    if req_action == "queue_view":
-        queue = data.get("queue", [])
-        n = len(queue)
-        if n == 0:
-            return "The queue is empty."
-        items = ", ".join(
-            f'"{t.get("title", "?")}" by {t.get("artist", "?")}' for t in queue[:5]
-        )
-        suffix = f" +{n - 5} more" if n > 5 else ""
-        return f"Queue ({n} tracks): {items}{suffix}."
-
-    return "Done."
-
-
 @app.post("/chat")
 async def chat(request: ChatRequest, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
     chat_source = _normalize_chat_source(request.source)
+    effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
 
     # ── Deterministic music fast-path ─────────────────────────────────────────
     # Check before router_route() so clear music commands never touch the LLM.
-    music_cmd = _parse_music_command(request.message)
+    music_cmd = parse_music_command(request.message)
     if music_cmd is not None:
         music_cmd["prompt"] = request.message
         music_cmd["user_id"] = user_id
@@ -1024,7 +899,7 @@ async def chat(request: ChatRequest, http_request: Request):
                 "chat.music_fast | session_id=%s action=%s ok=%s retryable=%s",
                 session_id, music_cmd.get("action"), tool_result.ok, tool_result.retryable,
             )
-            response_text = _format_music_response(tool_result, music_cmd)
+            response_text = format_music_response(tool_result, music_cmd)
             yield f"data: {json.dumps({'text': response_text})}\n\n"
             _append_session_message(session_id, "user", request.message)
             _append_session_message(session_id, "assistant", response_text)
@@ -1051,7 +926,7 @@ async def chat(request: ChatRequest, http_request: Request):
         "user_id": user_id,
         "session_id": session_id,
         "message": request.message,
-        "system": request.system,
+        "system": effective_system,
         "source": chat_source,
         "modality": "voice" if chat_source == "voice" else "chat",
         "history": session_messages,
@@ -1366,170 +1241,24 @@ async def get_chat_session_messages(http_request: Request):
     return response
 
 
-@app.get("/memory")
-async def list_memory(http_request: Request, limit: int = Query(default=200, ge=1, le=500), offset: int = Query(default=0, ge=0)):
-    user_id: str = http_request.state.user_id
-    return JSONResponse(memory_store.list_items(user_id, limit=limit, offset=offset))
-
-
-@app.get("/memory/episodic")
+# Compatibility wrappers retained for existing unit tests that call these
+# handlers directly from the main module.
 async def list_episodic_memory(
     http_request: Request,
-    limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
-    consolidated: bool | None = Query(default=None),
+    limit: int = 200,
+    offset: int = 0,
+    consolidated: bool | None = None,
 ):
     user_id: str = http_request.state.user_id
     return JSONResponse(memory_store.list_episodic(user_id, limit=limit, offset=offset, consolidated=consolidated))
 
 
-@app.post("/memory/consolidate")
 async def consolidate_memory(http_request: Request):
     user_id: str = http_request.state.user_id
     stats = await asyncio.to_thread(memory_store.consolidate_pending, user_id, MEMORY_CONSOLIDATION_BATCH_SIZE)
     return JSONResponse({"ok": True, "stats": stats})
 
 
-@app.delete("/memory/{memory_id}")
-async def delete_memory(memory_id: str, http_request: Request):
-    user_id: str = http_request.state.user_id
-    if not memory_store.delete_item(user_id, memory_id):
-        return _error_response("Memory item not found", "MEMORY_NOT_FOUND", False, status_code=404)
-    return JSONResponse({"ok": True, "id": memory_id})
-
-
-@app.delete("/memory")
-async def clear_memory(http_request: Request):
-    user_id: str = http_request.state.user_id
-    counts = memory_store.clear_all(user_id)
-    return JSONResponse({"ok": True, "cleared": counts})
-
-
-class WeatherRequest(BaseModel):
-    location: str | None = None
-
-
-@app.post("/weather")
-async def weather(request: WeatherRequest, http_request: Request):
-    """Direct weather endpoint.
-
-    Returns the normalized weather data dict for the given location (or stored default).
-    Suitable for frontend calls and future LangGraph tool nodes.
-    """
-    user_id: str = http_request.state.user_id
-    from tools import weather as weather_tool  # type: ignore[attr-defined]
-    result = await weather_tool.run({
-        "prompt": f"weather in {request.location}" if request.location else "",
-        "user_id": user_id,
-        "memory": memory_store,
-        "location": request.location,
-    })
-    if not result.ok:
-        status = 503 if result.retryable else 422
-        return _error_response(result.error, "WEATHER_ERROR", result.retryable, status_code=status)
-    return JSONResponse(result.data)
-
-
-# ── Music endpoints (Phase 8) ──────────────────────────────────────────────────
-
-class MusicSearchRequest(BaseModel):
-    query: str
-
-
-class MusicPlayRequest(BaseModel):
-    query: str | None = None
-    song_id: int | None = None
-    artist: str | None = None
-
-
-class MusicQueueRequest(BaseModel):
-    query: str | None = None
-    song_id: int | None = None
-
-
-class MusicControlRequest(BaseModel):
-    action: str  # pause | resume | next | stop | play_pos | set_volume
-    pos: int | None = None  # required when action == "play_pos"
-    volume: int | None = None  # required when action == "set_volume"
-
-
-async def _music_run(params: dict) -> JSONResponse:
-    """Shared dispatcher for music tool calls."""
-    from tools import dispatch
-    result = await dispatch("music", params)
-    if not result.ok:
-        status = 503 if result.retryable else 422
-        return _error_response(result.error, "MUSIC_ERROR", result.retryable, status_code=status)
-    return JSONResponse(result.data)
-
-
-@app.post("/music/search")
-async def music_search(request: MusicSearchRequest):
-    """Search the Strawberry library by title, artist, or album.
-
-    Returns a ranked list of matching tracks (LIKE query, ordered by playcount).
-    """
-    return await _music_run({"action": "search", "query": request.query, "prompt": request.query})
-
-
-@app.post("/music/play")
-async def music_play(request: MusicPlayRequest):
-    """Play a track immediately (clears current queue).
-
-    Accepts a free-text query, a direct song_id (rowid), or an artist name
-    for artist-radio mode.  Auto-picks the top-ranked match and logs confidence.
-    """
-    return await _music_run({
-        "action": "play",
-        "query": request.query,
-        "song_id": request.song_id,
-        "artist": request.artist,
-        "prompt": request.query or request.artist or "",
-    })
-
-
-@app.post("/music/queue")
-async def music_queue_add(request: MusicQueueRequest):
-    """Append a track to the current MPD queue without interrupting playback."""
-    return await _music_run({
-        "action": "queue",
-        "query": request.query,
-        "song_id": request.song_id,
-        "prompt": request.query or "",
-    })
-
-
-@app.post("/music/control")
-async def music_control(request: MusicControlRequest):
-    """Send a playback control command: pause | resume | next | stop | play_pos | set_volume."""
-    if request.action not in ("pause", "resume", "next", "stop", "play_pos", "set_volume"):
-        return _error_response(
-            f"Unknown action '{request.action}'. Use: pause, resume, next, stop, play_pos, set_volume.",
-            "MUSIC_INVALID_ACTION",
-            False,
-            status_code=400,
-        )
-    return await _music_run({
-        "action": "control",
-        "control": request.action,
-        "pos": request.pos,
-        "volume": request.volume,
-        "prompt": "",
-    })
-
-
-@app.get("/music/now_playing")
-async def music_now_playing():
-    """Return current MPD playback state and track metadata."""
-    return await _music_run({"action": "now_playing", "prompt": ""})
-
-
-@app.get("/music/queue")
-async def music_queue_view():
-    """Return the current MPD playlist."""
-    return await _music_run({"action": "queue_view", "prompt": ""})
-#
-#
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -1585,96 +1314,6 @@ async def legacy_favicon():
     return Response(status_code=404)
 
 
-# ── Auth endpoints ─────────────────────────────────────────────────────────────
-
-class RegisterRequest(BaseModel):
-    username: str
-    password: str
-    device_name: str | None = None
-    persistent: bool = False
-
-
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    device_name: str | None = None
-    persistent: bool = False
-
-
-def _auth_cookie(response: Response, token: str, expires_at: float) -> None:
-    """Set the auth token as an HttpOnly cookie alongside the JSON body."""
-    max_age = max(0, int(expires_at - time.time()))
-    response.set_cookie(
-        key=AUTH_COOKIE_NAME,
-        value=token,
-        httponly=True,
-        samesite="lax",
-        secure=SESSION_COOKIE_SECURE,
-        max_age=max_age,
-    )
-
-
-@app.post("/auth/register")
-async def auth_register(payload: RegisterRequest):
-    try:
-        result = auth_service.register(
-            payload.username,
-            payload.password,
-            device_name=payload.device_name,
-            persistent=payload.persistent,
-        )
-    except AuthError as exc:
-        return _error_response(str(exc), exc.code, False, status_code=exc.status)
-    response = JSONResponse(result, status_code=201)
-    _auth_cookie(response, result["token"], result["expires_at"])
-    return response
-
-
-@app.post("/auth/login")
-async def auth_login(payload: LoginRequest):
-    try:
-        result = auth_service.login(
-            payload.username,
-            payload.password,
-            device_name=payload.device_name,
-            persistent=payload.persistent,
-        )
-    except AuthError as exc:
-        return _error_response(str(exc), exc.code, False, status_code=exc.status)
-    response = JSONResponse(result)
-    _auth_cookie(response, result["token"], result["expires_at"])
-    return response
-
-
-@app.post("/auth/logout")
-async def auth_logout(http_request: Request):
-    token = _extract_bearer_token(http_request)
-    if token:
-        auth_service.revoke_token(token)
-    response = JSONResponse({"ok": True})
-    response.delete_cookie(AUTH_COOKIE_NAME)
-    return response
-
-
-@app.post("/auth/logout/all")
-async def auth_logout_all(http_request: Request):
-    user_id: str = http_request.state.user_id
-    count = auth_service.revoke_all_tokens(user_id)
-    response = JSONResponse({"ok": True, "revoked": count})
-    response.delete_cookie(AUTH_COOKIE_NAME)
-    return response
-
-
-@app.get("/auth/me")
-async def auth_me(http_request: Request):
-    user_id: str = http_request.state.user_id
-    info = auth_service.get_user(user_id)
-    if not info:
-        return _error_response("User not found.", "USER_NOT_FOUND", False, status_code=404)
-    return JSONResponse(info)
-
-
-
 # Browser sends raw binary frames: 1280 int16 samples (80ms @ 16kHz).
 # Server replies with {"event": "wake"} when the wake word is detected.
 @app.websocket("/ws/wake")
@@ -1723,154 +1362,13 @@ async def transcribe(audio: UploadFile = File(...)):
     return JSONResponse({"text": text})
 
 
-# ── Code tool HTTP endpoints (Phase 10b) ──────────────────────────────────────
-
-def _get_code_root() -> str:
-    """Return the configured workspace root or raise HTTPException."""
-    root = os.getenv("CODE_WORKSPACE_ROOT", "")
-    if not root or not os.path.isdir(root):
-        raise HTTPException(status_code=503, detail="CODE_WORKSPACE_ROOT not configured or missing")
-    return root
-
-
-def _safe_resolve(root: str, relative: str) -> str:
-    """Resolve *relative* inside *root*.  Raises HTTPException on traversal."""
-    real_root = os.path.realpath(root)
-    candidate = os.path.realpath(os.path.join(real_root, relative))
-    if not (candidate == real_root or candidate.startswith(real_root + os.sep)):
-        raise HTTPException(status_code=400, detail="Path traversal is not allowed")
-    return candidate
-
-
-@app.get("/code/files", summary="List workspace files")
-async def list_code_files(
-    sub_path: str = "",
-):
-    """Return relative paths of all files under the workspace root (or sub-path)."""
-    root = _get_code_root()
-    base = _safe_resolve(root, sub_path) if sub_path else os.path.realpath(root)
-    _SKIP_DIRS = {"__pycache__", "node_modules", ".venv", ".git", "chroma", "models"}
-    paths: list[str] = []
-    for dirpath, dirnames, filenames in os.walk(base):
-        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")]
-        for fname in filenames:
-            full = os.path.join(dirpath, fname)
-            try:
-                paths.append(os.path.relpath(full, root))
-            except ValueError:
-                paths.append(full)
-    return JSONResponse({"files": sorted(paths)})
-
-
-@app.get("/code/files/{file_path:path}", summary="Read a workspace file")
-async def read_code_file(
-    file_path: str,
-):
-    root = _get_code_root()
-    resolved = _safe_resolve(root, file_path)
-    if not os.path.isfile(resolved):
-        raise HTTPException(status_code=404, detail=f"File not found: {file_path}")
-    try:
-        content = Path(resolved).read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return JSONResponse({"path": file_path, "content": content})
-
-
-class _WriteRequest(BaseModel):
-    content: str
-    confirm: bool = False
-    request_id: str | None = None
-
-
-def _make_unified_diff(relative_path: str, original: str, proposed: str) -> str:
-    lines = list(
-        difflib.unified_diff(
-            original.splitlines(keepends=True),
-            proposed.splitlines(keepends=True),
-            fromfile=f"a/{relative_path}",
-            tofile=f"b/{relative_path}",
-            lineterm="\n",
-        )
-    )
-    return "".join(lines) if lines else ""
-
-
-@app.put("/code/files/{file_path:path}", summary="Write a workspace file (explicit API write)")
-async def write_code_file(
-    file_path: str,
-    body: _WriteRequest,
-    request: Request,
-):
-    """Confirmation-gated direct file write.
-
-    First call with confirm=false (default) to receive diff + request_id.
-    Second call with confirm=true and the same request_id to execute the write.
-    """
-    root = _get_code_root()
-    resolved = _safe_resolve(root, file_path)
-    user_id = getattr(request.state, "user_id", "unknown")
-
-    try:
-        current = Path(resolved).read_text(encoding="utf-8", errors="replace")
-    except FileNotFoundError:
-        current = ""
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    if not body.confirm:
-        diff = _make_unified_diff(file_path, current, body.content)
-        request_id = str(uuid4())
-        with _code_write_lock:
-            _pending_code_writes[request_id] = {
-                "user_id": user_id,
-                "file_path": file_path,
-                "resolved": resolved,
-                "content": body.content,
-                "created_at": time.time(),
-            }
-        summary = "No changes detected." if not diff else "Diff generated. Confirmation required before write."
-        return JSONResponse(
-            {
-                "status": "pending_confirmation",
-                "request_id": request_id,
-                "path": file_path,
-                "summary": summary,
-                "diff": diff,
-            }
-        )
-
-    if not body.request_id:
-        raise HTTPException(status_code=400, detail="request_id is required when confirm=true")
-
-    with _code_write_lock:
-        pending = _pending_code_writes.get(body.request_id)
-        if not pending:
-            raise HTTPException(status_code=404, detail="Pending write not found or expired")
-        if str(pending.get("user_id", "")) != str(user_id):
-            raise HTTPException(status_code=403, detail="Pending write belongs to another user")
-        if pending.get("file_path") != file_path:
-            raise HTTPException(status_code=400, detail="request_id does not match file_path")
-
-        content_to_write = str(pending.get("content", ""))
-        del _pending_code_writes[body.request_id]
-
-    try:
-        Path(resolved).parent.mkdir(parents=True, exist_ok=True)
-        Path(resolved).write_text(content_to_write, encoding="utf-8")
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    log.info("code.write_file | path=%s | user=%s | confirmed=true", file_path, user_id)
-    return JSONResponse({"status": "written", "written": file_path})
-
-
 @app.post("/code", summary="Stream code generation/editing via graph code_tool")
 async def code(request: CodeRequest, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
     code_source = _normalize_chat_source(request.source)
+    effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
 
     with _session_store_lock:
         session = _session_store[session_id]
@@ -1881,7 +1379,7 @@ async def code(request: CodeRequest, http_request: Request):
         "user_id": user_id,
         "session_id": session_id,
         "message": request.message,
-        "system": request.system,
+        "system": effective_system,
         "source": code_source,
         "history": session_messages,
         "session_summary": session_summary,
