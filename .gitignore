@@ -1,7 +1,9 @@
 .env
-__pycache__/
+__pycache__
+.pytest_cache
 *.pyc
 .venv/
+.vscode
 *.onnx
 *.bin
 *.db
@@ -9,7 +11,6 @@ __pycache__/
 *.sqlite3
 mpd/mpdstate
 mpd.pid
-backend/memory.db
 graph_checkpoints.*
 # Chroma persistence (all generated files/subdirs)
 backend/chroma/
