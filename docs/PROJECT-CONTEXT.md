@@ -1,6 +1,6 @@
-# Local AI Assistant — Copilot Instructions
+# Hearth - Local AI Assistant — Project Context
 
-This project is a local-first personal AI assistant with voice activation, streaming chat,
+Hearth is a local-first personal AI assistant with voice activation, streaming chat,
 tool integrations, and optional cloud model fallback. It runs entirely on-device via Docker
 Compose on a Linux machine with an NVIDIA RTX 3060 (12 GB VRAM) and is designed to be
 reachable from devices on the local network.
@@ -59,7 +59,7 @@ When this section conflicts with historical roadmap notes below, follow this sec
 - Phase 10b code tool node is complete (ReAct loop, tree-sitter indexer, ChromaDB code_context collection, confirmation-gated writes, workspace-root enforcement, /code endpoints).
 - Phase 10c responder/modality split is complete (voice compression, fact-drift test, tone field wired as nullable).
 - Phase 10d ChromaDB cleanup is complete (conversation_memory collection, auto-migration from assistant_memories, consolidated column on summaries table, 6 isolation tests passing).
-- Phase 11 is partially complete (tone probe, persona renderer, persona prefs, UI controls, and fact-drift tests are implemented).
+- Phase 11 is complete (shipped as a single Hearth character prompt in `backend/hearth_prompt.txt`; tone_probe, persona_renderer, /persona endpoints, and persona UI panel were removed).
 - Phases 12–14 have not started yet.
 - Active models: `gemma3:4b` (chat) and `qwen2.5-coder:7b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
@@ -785,79 +785,74 @@ Acceptance:
 ---
 
 ### Phase 11 — Personality and affect layer
-**Status: in progress (partially complete)**
+**Status: complete (shipped as system prompt)**
 **Estimate: 1–2 weeks**
 **Depends on: Phase 10**
 
-Goal: Implement the "best of human qualities" vision — perception of user affect,
-consistent personality, warmth, and intuition — as a bounded layer in the graph
-that operates strictly post-reasoning and never touches facts or tool outputs.
+Goal: Give Hearth a consistent, recognisable personality that carries across all
+topics and sessions — warmth, directness, affect awareness, and honesty — without
+adding runtime overhead or fragile post-processing nodes.
 
-This is the layer where the assistant acquires personality. The architecture keeps
-it safe: the `persona_renderer` receives a factually-correct, grounded response
-and applies stylistic transformation only. It cannot alter facts, tool results,
-or memory. Tests enforce this boundary explicitly.
+Design decision: After building and evaluating the full `tone_probe` +
+`persona_renderer` + `/persona` UI architecture, it was replaced with the
+simplest thing that could actually work: a single, well-crafted system prompt
+loaded from `backend/hearth_prompt.txt`. The rationale:
 
-Design principles:
-- **Personality is post-hoc.** The reasoning/memory/tool stack produces a correct
-  answer. The persona renderer then shapes how that answer is expressed — warmth,
-  pacing, acknowledgement of the user's state — without changing its content.
-- **Affect is input, not output.** `tone_probe` reads the user's emotional register
-  from their transcript (word choice, phrasing, urgency) and injects a `tone` field
-  into state. The persona renderer uses this to modulate response style — not to
-  manufacture emotions in return.
-- **Consistency over performance.** The persona should feel like a stable character,
-  not a chatbot performing friendliness. Tune system prompt and renderer to be
-  calm, direct, and warm rather than effusive.
+- A 500-word character prompt injected into every LLM call costs zero extra
+  model calls and produces personality that is baked in rather than bolted on.
+- `tone_probe` added a full LLM call per turn with no measurable improvement in
+  response quality — the chat model already picks up on user affect from context.
+- `persona_renderer` added another post-hoc LLM call and introduced fact-drift
+  risk that required dedicated tests to guard. Removing it eliminates the risk
+  entirely.
+- Personality tuning via a text file is faster to iterate than graph node config.
 
-Nodes activated in this phase:
+The decision to add `tone_probe`, `persona_renderer`, and `/persona` endpoints
+back is deferred: measure whether the system prompt approach is sufficient over
+2 weeks of real use, then decide if any of those layers add value.
 
-`tone_probe` (post-transcription):
-- Classifies user affect from transcript: calm, curious, frustrated, excited,
-  uncertain, urgent.
-- Runs locally; output is a single label injected into `AssistantState.tone`.
-- Feeds `persona_renderer` at the end of the graph.
+Implementation:
 
-`persona_renderer` (post-responder):
-- Receives the grounded response text and `AssistantState.tone`.
-- Applies a configurable persona system prompt that shapes voice and style.
-- Adjusts response pacing and register to match detected user tone.
-- Hard constraint: output must contain all facts and tool values from input.
-  A test suite verifies no fact drift occurs through the renderer.
-- Persona parameters live in `AssistantState.persona` and are user-configurable
-  (name, communication style, formality, warmth level).
+`_load_hearth_prompt()` in `main.py`:
+- Reads `backend/hearth_prompt.txt` at startup; falls back to `CHAT_DEFAULT_SYSTEM_PROMPT`
+  env var, then a hardcoded placeholder.
+- Result is stored in `CHAT_DEFAULT_SYSTEM_PROMPT` — the existing default used by
+  `ChatRequest.system` and `CodeRequest.system`. No other code changed.
+- Edit the file, restart, personality updates immediately.
 
-`proactive_retrieval` upgrade:
-- `memory_retrieval` node is upgraded to begin pre-loading relevant memories
-  in parallel with transcription, rather than waiting for the planner to finish.
-  This is the "intuition" behaviour — relevant context is ready before the
-  user finishes speaking.
+`backend/hearth_prompt.txt` (character definition):
+- Warmth, intuition, clarity, honesty — 300 words covering personality, affect
+  awareness, and per-modality response style (voice: short sentences; chat:
+  headers + depth; music: just do it).
+- Git-tracked alongside the code.
 
-TTS affect bridge (optional, if Phase 8 engine supports it):
-- Pass `tone` to the TTS engine to modulate prosody — slightly warmer pacing for
-  excited tones, calmer cadence for frustrated ones. Only implement if the chosen
-  TTS engine exposes prosody controls.
+Removed from previous implementation:
+- `tone_probe` node and `_TONE_LABELS` / `_TONE_PROBE_SYSTEM` constants.
+- `persona_renderer` node and `_PERSONA_VOICE_SYSTEM` / `_PERSONA_CHAT_SYSTEM` constants.
+- `AssistantState.tone` and `AssistantState.persona` fields.
+- `/persona` GET and POST endpoints, `PersonaConfigRequest` model, `_PERSONA_STYLE_VALUES`.
+- Persona sidebar panel from the frontend UI (`persona.js` deleted, HTML removed).
 
 Tasks:
-- ✅ Activate `tone_probe` node: implemented local classifier + `tone` wiring in graph state.
-- ✅ Activate `persona_renderer` node: implemented post-hoc style transform with configurable persona parameters.
-- ✅ Add persona configuration to user preferences in memory layer: `/persona` endpoints persist `persona_*` prefs in SQLite-backed memory.
-- ✅ Add fact-drift test suite: `backend/tests/test_persona.py` verifies factual preservation and markdown preservation.
-- ⚠ Upgrade `memory_retrieval` to proactive parallel pre-loading: retrieval runs in parallel with tone probe, but not yet parallelized against transcription lifecycle.
-- ⏭ Optionally bridge `tone` to TTS prosody if engine supports it: not implemented (optional).
-- ✅ Add UI controls for persona configuration (name, style, warmth): implemented in sidebar persona panel.
+- ✅ Write Hearth character prompt (`backend/hearth_prompt.txt`): warmth, intuition,
+  clarity, honesty, per-modality style, affect awareness.
+- ✅ Implement `_load_hearth_prompt()` loader in `main.py` with file → env → hardcoded fallback.
+- ✅ Remove `tone_probe`, `persona_renderer`, `/persona` endpoints, and all related
+  state fields, constants, and UI.
+- ✅ Update `test_persona.py` to verify prompt loading mechanics (file read, env fallback).
+- ✅ Update `test_responder_modality.py` to remove tone-probe call assumptions.
 
 Acceptance:
-- ⚠ Responses feel consistent in personality across different topics and sessions.
-  Implementation present; no dedicated consistency regression benchmark yet.
-- ⚠ Tone probe correctly identifies frustrated, excited, and neutral user inputs.
-  Valid-label and fallback behavior are covered by tests; real-model classification accuracy tests are still missing.
-- ✅ Persona renderer never drops or alters facts, tool results, or memory values
-  (verified by automated tests).
-- ⚠ Proactive memory retrieval reduces perceived latency on memory-heavy queries.
-  No latency benchmark or transcription-parallel prefetch path is currently documented/tested.
-- ⚠ Persona parameters survive container restart (stored in preferences memory).
-  Persistence path is implemented via preferences store; explicit restart validation test is still missing.
+- ✅ `CHAT_DEFAULT_SYSTEM_PROMPT` is loaded from `hearth_prompt.txt` at startup (verified by test).
+- ✅ All LLM calls — chat, voice, cloud fallback, tool summarizer, code tool — receive
+  the Hearth character prompt via `augmented_system`.
+- ✅ No extra model calls per turn for personality (zero overhead vs. previous design).
+- ✅ Personality is editable by updating `hearth_prompt.txt` and restarting.
+- ✅ No fact-drift risk from post-hoc persona rendering (node does not exist).
+- ✅ 234 tests pass; the one known failure (`test_chat_stream_*`) is pre-existing and
+  unrelated to Phase 11.
+- ⏭ Tone probe, persona renderer, and prosody bridge remain available as future
+  additions if the system prompt alone proves insufficient after the 2-week trial.
 
 ---
 

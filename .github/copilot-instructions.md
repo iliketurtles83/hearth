@@ -1,4 +1,4 @@
-# Local AI Assistant — Copilot Instructions
+# Hearth - Local AI Assistant — Copilot Instructions
 
 This project is a local-first personal AI assistant with voice activation, streaming chat,
 tool integrations, and optional cloud model fallback. It runs entirely on-device via Docker

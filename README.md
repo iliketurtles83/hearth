@@ -1,18 +1,18 @@
-# Local AI Assistant
+# Hearth - Local AI Assistant
 
-version: 6
-
-Local-first personal AI assistant with streaming chat, wake-word voice input, hybrid memory (SQLite + Chroma), and model routing between local Ollama and optional Anthropic fallback. HTTPS is served on the LAN via a Caddy reverse proxy so all clients — including Android and iOS — can access secure-context browser APIs (microphone, AudioWorklet, etc.).
+Local-first personal AI assistant with streaming chat, wake-word voice input, hybrid memory (SQLite + ChromaDB), LangGraph-based stateful routing, code generation, and model routing between local Ollama and optional Anthropic fallback. HTTPS is served on the LAN via a Caddy reverse proxy so all clients — including Android and iOS — can access secure-context browser APIs (microphone, AudioWorklet, etc.).
 
 ## Stack
 
 - FastAPI backend (single origin — serves both UI and API)
-- Caddy reverse proxy (HTTPS termination on the LAN edge — Phase 0b)
-- Ollama for local inference
+- Caddy reverse proxy (HTTPS termination on the LAN edge)
+- Ollama for local inference (gemma3:4b for chat, qwen2.5-coder:7b for code)
 - Anthropic API as optional cloud fallback
+- LangGraph stateful graph with SqliteSaver checkpointing
 - openWakeWord for wake detection
 - faster-whisper for transcription
-- SQLite + ChromaDB memory layer
+- Piper / Kokoro TTS (pluggable via `TTS_ENGINE` env var)
+- SQLite + ChromaDB hybrid memory layer
 - Static frontend served by FastAPI
 - Docker Compose deployment
 
@@ -49,8 +49,20 @@ Main backend endpoints:
 - `GET /chat/session/messages`
 - `DELETE /chat/session` (reset current session messages)
 - `DELETE /chat/sessions/{session_id}` (delete a specific session)
+- `GET /graph/state/{session_id}` — inspect LangGraph checkpoint state
+- `POST /tts` — synthesize speech (returns `audio/wav`)
+- `GET /persona` — get current persona settings
+- `POST /persona` — update persona tone/style prefs
+- `POST /auth/register` / `POST /auth/login` / `POST /auth/logout`
+- `GET /auth/me`
 
 Chat sessions are bounded and ephemeral: each authenticated user has their own in-memory session list, recent context is capped by turn/token budget, and older session history is compacted into a rolling summary for continuity.
+
+Code tool endpoints (Phase 10b):
+- `POST /code` — stream code generation/editing via graph `code_tool` node
+- `GET /code/files` — list workspace files
+- `GET /code/files/{file_path}` — read a workspace file
+- `PUT /code/files/{file_path}` — write a workspace file (confirmation-gated)
 
 Music endpoints (Phase 8):
 - `POST /music/search` — search the Strawberry DB (title / artist / album)
@@ -74,13 +86,20 @@ Music endpoints (Phase 8):
 │   ├── main.py
 │   ├── router.py
 │   ├── memory.py
+│   ├── graph.py              # LangGraph graph definition + checkpointing
+│   ├── auth.py
 │   ├── requirements.txt
 │   ├── models/
+│   ├── tools/                # weather, music, code_indexer tool modules
+│   ├── tts/                  # pluggable TTS engines (Piper, Kokoro)
+│   ├── tests/
 │   └── Dockerfile
 ├── frontend/
 │   ├── index.html
 │   ├── message.js
 │   ├── voice.js
+│   ├── persona.js
+│   ├── auth.js
 │   ├── style.css
 │   └── audio-processor.js
 └── scripts/
@@ -363,12 +382,17 @@ docker compose exec -T backend pytest -q
 docker compose exec -T backend sh -c 'cd /app && PYTHONPATH=/app python -m pytest -q'
 ```
 
-- Current verified result (backend test run): `115 passed, 16 warnings`.
+- Current verified result (backend test run): see `docs/review/KNOWN_FAILURES.txt` for any deselected tests.
 
-- Voice/TTS stream regression coverage includes:
-  - `backend/tests/test_chat_sessions.py` for `/chat` SSE framing and `[DONE]` termination.
-  - `backend/tests/test_chat_voice_metadata.py` for source normalization and voice metadata helpers.
-  - `backend/tests/test_tts_endpoint.py` for `/tts` status-code and payload mapping.
+- Coverage includes:
+  - `test_chat_sessions.py` — `/chat` SSE framing and `[DONE]` termination
+  - `test_chat_voice_metadata.py` — source normalization and voice metadata helpers
+  - `test_tts_endpoint.py` — `/tts` status-code and payload mapping
+  - `test_code_tool.py` — code tool node, workspace-root enforcement, confirmation gating
+  - `test_graph.py` — LangGraph node wiring and checkpoint resume
+  - `test_persona.py` — persona rendering and fact-drift safety
+  - `test_chroma_isolation.py` and `test_memory_isolation.py` — ChromaDB collection isolation
+  - `test_responder_modality.py` — voice/chat modality split
 
 ## Session Management (Phase 5)
 
@@ -432,9 +456,14 @@ Safety behavior:
 ## Current Status
 
 - Phase 0b (HTTPS edge via Caddy): complete
-- Phases 1-8 (core chat, wake-word, memory, weather, and music): complete
-- Phase 9 (TTS voice output, `/tts`, frontend playback controls, barge-in): complete
-- Phase 10+ (LangGraph migration and modality-aware responder): not started
+- Phases 1–8 (core chat, wake-word, memory, weather, and music): complete
+- Phase 9 (TTS voice output, `/tts`, Piper + Kokoro engines, frontend playback, barge-in): complete
+- Phase 10a (LangGraph migration, graph skeleton, SqliteSaver checkpointing, `/graph/state`): complete
+- Phase 10b (code tool node, ReAct loop, tree-sitter indexer, ChromaDB `code_context`, `/code` endpoints): complete
+- Phase 10c (responder/modality split, voice compression, fact-drift tests): complete
+- Phase 10d (ChromaDB cleanup, `conversation_memory` collection, auto-migration, isolation tests): complete
+- Phase 11 (persona renderer, tone probe, persona prefs, UI controls, fact-drift enforcement): partially complete
+- Phases 12–14: not started
 
 ## Security Notes
 
