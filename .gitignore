@@ -8,6 +8,7 @@ __pycache__/
 *.sqlite
 *.sqlite3
 mpd/mpdstate
+mpd.pid
 backend/memory.db
 graph_checkpoints.*
 # Chroma persistence (all generated files/subdirs)
