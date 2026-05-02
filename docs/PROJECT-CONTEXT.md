@@ -52,14 +52,15 @@ runtime code.
 
 When this section conflicts with historical roadmap notes below, follow this section.
 
-- Phases 1–11 are complete.
+- Phases 1–10d are complete.
 - Phase 8 includes the deterministic music pre-router (`_parse_music_command`) that bypasses the LLM for clear music commands, compound title+artist search, and year/decade range playback.
 - Phase 9 TTS is complete (Piper + Kokoro engines, `/tts` endpoint, barge-in, voice SSE metadata).
 - Phase 10a LangGraph migration is complete (graph skeleton, checkpointing, all nodes wired, `/graph/state` endpoint, checkpoint resume test passing).
 - Phase 10b code tool node is complete (ReAct loop, tree-sitter indexer, ChromaDB code_context collection, confirmation-gated writes, workspace-root enforcement, /code endpoints).
 - Phase 10c responder/modality split is complete (voice compression, fact-drift test, tone field wired as nullable).
 - Phase 10d ChromaDB cleanup is complete (conversation_memory collection, auto-migration from assistant_memories, consolidated column on summaries table, 6 isolation tests passing).
-- Phases 11–14 have not started yet.
+- Phase 11 is partially complete (tone probe, persona renderer, persona prefs, UI controls, and fact-drift tests are implemented).
+- Phases 12–14 have not started yet.
 - Active models: `gemma3:4b` (chat) and `qwen2.5-coder:7b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
@@ -784,6 +785,7 @@ Acceptance:
 ---
 
 ### Phase 11 — Personality and affect layer
+**Status: in progress (partially complete)**
 **Estimate: 1–2 weeks**
 **Depends on: Phase 10**
 
@@ -837,24 +839,25 @@ TTS affect bridge (optional, if Phase 8 engine supports it):
   TTS engine exposes prosody controls.
 
 Tasks:
-- Activate `tone_probe` node: implement affect classifier (local model, ~50 token
-  output), wire `tone` into state.
-- Activate `persona_renderer` node: implement post-hoc style transform with
-  configurable persona parameters.
-- Add persona configuration to user preferences in memory layer.
-- Add fact-drift test suite: verify persona renderer output contains all factual
-  content from responder output.
-- Upgrade `memory_retrieval` to proactive parallel pre-loading.
-- Optionally bridge `tone` to TTS prosody if engine supports it.
-- Add UI controls for persona configuration (name, style, warmth).
+- ✅ Activate `tone_probe` node: implemented local classifier + `tone` wiring in graph state.
+- ✅ Activate `persona_renderer` node: implemented post-hoc style transform with configurable persona parameters.
+- ✅ Add persona configuration to user preferences in memory layer: `/persona` endpoints persist `persona_*` prefs in SQLite-backed memory.
+- ✅ Add fact-drift test suite: `backend/tests/test_persona.py` verifies factual preservation and markdown preservation.
+- ⚠ Upgrade `memory_retrieval` to proactive parallel pre-loading: retrieval runs in parallel with tone probe, but not yet parallelized against transcription lifecycle.
+- ⏭ Optionally bridge `tone` to TTS prosody if engine supports it: not implemented (optional).
+- ✅ Add UI controls for persona configuration (name, style, warmth): implemented in sidebar persona panel.
 
 Acceptance:
-- Responses feel consistent in personality across different topics and sessions.
-- Tone probe correctly identifies frustrated, excited, and neutral user inputs.
-- Persona renderer never drops or alters facts, tool results, or memory values
+- ⚠ Responses feel consistent in personality across different topics and sessions.
+  Implementation present; no dedicated consistency regression benchmark yet.
+- ⚠ Tone probe correctly identifies frustrated, excited, and neutral user inputs.
+  Valid-label and fallback behavior are covered by tests; real-model classification accuracy tests are still missing.
+- ✅ Persona renderer never drops or alters facts, tool results, or memory values
   (verified by automated tests).
-- Proactive memory retrieval reduces perceived latency on memory-heavy queries.
-- Persona parameters survive container restart (stored in preferences memory).
+- ⚠ Proactive memory retrieval reduces perceived latency on memory-heavy queries.
+  No latency benchmark or transcription-parallel prefetch path is currently documented/tested.
+- ⚠ Persona parameters survive container restart (stored in preferences memory).
+  Persistence path is implemented via preferences store; explicit restart validation test is still missing.
 
 ---
 
