@@ -109,29 +109,34 @@ MEMORY_CONSOLIDATION_INTERVAL_SECONDS = int(os.getenv("MEMORY_CONSOLIDATION_INTE
 MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
 
 
-def _load_hearth_prompt() -> str:
+def _load_hearth_prompt(filename: str, env_var: str, fallback: str) -> str:
     """Load Hearth's character prompt from file, with env-var and hardcoded fallbacks."""
-    prompt_path = os.path.join(os.path.dirname(__file__), "hearth_prompt.txt")
+    prompt_path = os.path.join(os.path.dirname(__file__), filename)
     if os.path.exists(prompt_path):
         with open(prompt_path, encoding="utf-8") as _f:
             text = _f.read().strip()
         if text:
             return text
-    return os.getenv(
-        "CHAT_DEFAULT_SYSTEM_PROMPT",
-        "You are a helpful personal assistant. Be concise and accurate.",
-    )
+    return os.getenv(env_var, fallback)
 
 
-CHAT_DEFAULT_SYSTEM_PROMPT = _load_hearth_prompt()
-
+CHAT_DEFAULT_SYSTEM_PROMPT = _load_hearth_prompt(
+    "hearth_prompt.txt",
+    "CHAT_DEFAULT_SYSTEM_PROMPT",
+    "You are a helpful personal assistant. Be concise and accurate.",
+)
+CODE_DEFAULT_SYSTEM_PROMPT = _load_hearth_prompt(
+    "hearth_coder_prompt.txt",
+    "CODE_DEFAULT_SYSTEM_PROMPT",
+    "You are a helpful coding assistant. Be concise and accurate.",
+)
 
 class ChatRequest(BaseChatRequest):
     system: str = CHAT_DEFAULT_SYSTEM_PROMPT
 
 
 class CodeRequest(BaseCodeRequest):
-    system: str = CHAT_DEFAULT_SYSTEM_PROMPT
+    system: str = CODE_DEFAULT_SYSTEM_PROMPT
 
 WAKEWORD_MODEL_FILE = os.getenv("WAKEWORD_MODEL_FILE", "computer_v2.onnx")
 OWW_MELSPEC_MODEL_FILE = os.getenv("OWW_MELSPEC_MODEL_FILE", "melspectrogram.onnx")
@@ -1368,7 +1373,7 @@ async def code(request: CodeRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
     code_source = _normalize_chat_source(request.source)
-    effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
+    effective_system = request.system or CODE_DEFAULT_SYSTEM_PROMPT
 
     with _session_store_lock:
         session = _session_store[session_id]
