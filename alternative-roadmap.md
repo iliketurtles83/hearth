@@ -1,3 +1,7 @@
+# response from qwen3.6
+
+## when giving qwen3.6 the intro part of project-context, it generated the following breakdown.
+
 
 🔹 Phase 1: Infrastructure & Containerization
 
