@@ -60,7 +60,8 @@ When this section conflicts with historical roadmap notes below, follow this sec
 - Phase 10c responder/modality split is complete (voice compression, fact-drift test, tone field wired as nullable).
 - Phase 10d ChromaDB cleanup is complete (conversation_memory collection, auto-migration from assistant_memories, consolidated column on summaries table, 6 isolation tests passing).
 - Phase 11 is complete (shipped as a single Hearth character prompt in `backend/hearth_prompt.txt`; tone_probe, persona_renderer, /persona endpoints, and persona UI panel were removed).
-- Phases 12–14 have not started yet.
+- Phase 12 is complete (three-tier memory: working/episodic/semantic; consolidation worker; tiered retrieval; `GET /memory/episodic`, `POST /memory/consolidate`; tier badges in memory panel).
+- Phases 12b–14 have not started yet.
 - Active models: `gemma3:4b` (chat) and `qwen2.5-coder:7b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
@@ -844,6 +845,7 @@ Tasks:
 
 Acceptance:
 - ✅ `CHAT_DEFAULT_SYSTEM_PROMPT` is loaded from `hearth_prompt.txt` at startup (verified by test).
+- ✅ `CODE_DEFAULT_SYSTEM_PROMPT` is loaded from `hearth_coder_prompt.txt` at startup
 - ✅ All LLM calls — chat, voice, cloud fallback, tool summarizer, code tool — receive
   the Hearth character prompt via `augmented_system`.
 - ✅ No extra model calls per turn for personality (zero overhead vs. previous design).
@@ -857,6 +859,7 @@ Acceptance:
 ---
 
 ### Phase 12 — Tiered memory and automatic consolidation
+**Status: complete**
 **Estimate: 1–2 weeks**
 **Depends on: Phase 11**
 
@@ -897,24 +900,65 @@ Consolidation process:
 
 This replaces the Phase 3 summarization stub (⏳) with a proper tiered design.
 
+Implementation notes:
+- Episodic tier backed by the existing `summaries` table (columns: `id, user_id, session_id, summary, created_at, consolidated`). No separate table needed.
+- `_build_episodic_record_text()` in `main.py` uses `_summarize_messages_chunk()` to format recent messages as structured text (no LLM call — avoids blocking session-end path).
+- `consolidate_pending()` in `MemoryStore` uses regex-based `_extract_candidates()` to extract facts/preferences from episodic text, enforces sensitivity matrix, writes to SQLite + ChromaDB, marks row `consolidated=1`.
+- Background consolidation is non-blocking: `asyncio.to_thread` + `loop.create_task`.
+- `MEMORY_CONSOLIDATION_MODE` env var: `on-session-end` (default), `interval`, or `manual`.
+- `MEMORY_CONSOLIDATION_INTERVAL_SECONDS` and `MEMORY_CONSOLIDATION_BATCH_SIZE` are configurable.
+- `retrieve()` queries all three tiers and ranks results; episodic scores capped at 0.85× to let high-confidence semantic facts rank above raw summaries.
+- Episodic records deletable via `DELETE /memory/summaries:{id}` (same endpoint as facts/preferences).
+- Memory viewer tier badges implemented in `frontend/message.js`.
+- Routes in `backend/routes/memory_tool_routes.py`: `GET /memory/episodic`, `POST /memory/consolidate`.
+
 Tasks:
-- Add `episodic` table to SQLite schema: `(id, session_id, summary, created_at, consolidated)`.
-- Implement end-of-session summarization: local model compresses session into
-  episodic record.
-- Implement consolidation task: extracts semantic facts from episodic records,
+- ✅ Add `episodic` table to SQLite schema: `(id, session_id, summary, created_at, consolidated)`.
+- ✅ Implement end-of-session summarization: session messages compressed into episodic record.
+- ✅ Implement consolidation task: extracts semantic facts from episodic records,
   filters through sensitivity matrix, writes to facts + ChromaDB.
-- Add consolidation schedule (configurable: on session end, daily, or manual).
-- Expose episodic records in the memory viewer UI alongside facts.
-- Add `GET /memory/episodic` endpoint.
-- Upgrade `memory_retrieval` node to query all three tiers and rank results.
+- ✅ Add consolidation schedule (configurable: on session end, daily, or manual).
+- ✅ Expose episodic records in the memory viewer UI alongside facts.
+- ✅ Add `GET /memory/episodic` endpoint.
+- ✅ Upgrade `memory_retrieval` node to query all three tiers and rank results.
 
 Acceptance:
-- Facts stated in session A are retrievable by semantic search in session B
+- ✅ Facts stated in session A are retrievable by semantic search in session B
   without the user restating them.
-- Sensitive items are not auto-consolidated (sensitivity matrix enforced).
-- User can view episodic records and delete them individually.
-- Consolidation task runs without blocking the main request path.
-- Memory viewer shows tier labels (working / episodic / semantic) for each item.
+- ✅ Sensitive items are not auto-consolidated (sensitivity matrix enforced).
+- ✅ User can view episodic records and delete them individually.
+- ✅ Consolidation task runs without blocking the main request path.
+- ✅ Memory viewer shows tier labels (working / episodic / semantic) for each item.
+
+---
+
+### Phase 12b - Hearth memory
+**Estimate: 1 week**
+**Depends on: Phase 12**
+
+Goal: 
+
+Draft text:
+Query pattern: "What patterns/rules have I learned?"
+Context window role: Secondary—inform decisions, not dominate context
+Ranking priority: Confidence + generalization + consistency
+Staleness handling:Deprecate weak patterns gradually
+
+consolidation:
+  user:
+    promotion_threshold: 3
+    decay_rate_days: 30
+    importance_multipliers: { explicit: 5, frequent: 2 }
+  hearth:
+    promotion_threshold: 10
+    decay_rate_days: 90
+    importance_multipliers: { consistent: 3, successful: 4 }
+
+Bottom line: Separate retrieval logic (it's cheap and clarifying), unified storage and consolidation (it's where the complexity lives, so don't duplicate it). This gives you isolation where it matters (what gets asked) and reuse where it counts (how answers are filtered and promoted).
+
+Tasks:
+
+Acceptance:
 
 ---
 

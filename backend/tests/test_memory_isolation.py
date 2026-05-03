@@ -152,3 +152,52 @@ def test_consolidate_pending_promotes_summary_facts(store):
 
     hits = store.retrieve("alice", "where do I live")
     assert any("tallinn" in str(hit.get("text", "")).lower() for hit in hits)
+
+
+def test_consolidate_blocks_sensitive_candidates(store):
+    """Sensitive items in episodic summaries must not be promoted to semantic facts."""
+    # Store a summary that contains a sensitive item (password/credential pattern).
+    store.save_summary(
+        "alice",
+        "sess-4",
+        "- User: My password is hunter2",
+    )
+
+    stats = store.consolidate_pending("alice", limit=10)
+    assert stats["processed"] == 1
+    # The sensitive candidate should be blocked, not promoted.
+    assert stats["blocked"] >= 1 or stats["promoted"] == 0
+
+    # No fact or preference containing the credential should exist.
+    items = store.list_items("alice")["items"]
+    semantic_items = [i for i in items if i.get("tier") == "semantic"]
+    values = " ".join(str(i.get("value", "")) for i in semantic_items).lower()
+    assert "hunter2" not in values
+
+
+def test_delete_episodic_record(store):
+    """Deleting a summaries row via delete_item removes it for that user."""
+    row_id = store.save_summary("alice", "sess-5", "- User: I work on a robotics project")
+
+    # Confirm it's visible.
+    episodic = store.list_episodic("alice")
+    assert any(item["id"] == f"summaries:{row_id}" for item in episodic["items"])
+
+    # Delete it.
+    deleted = store.delete_item("alice", f"summaries:{row_id}")
+    assert deleted is True
+
+    # Confirm it's gone.
+    episodic_after = store.list_episodic("alice")
+    assert not any(item["id"] == f"summaries:{row_id}" for item in episodic_after["items"])
+
+
+def test_delete_episodic_cross_user_denied(store):
+    """Bob must not be able to delete Alice's episodic record."""
+    row_id = store.save_summary("alice", "sess-6", "- User: I enjoy hiking")
+
+    denied = store.delete_item("bob", f"summaries:{row_id}")
+    assert denied is False
+
+    episodic = store.list_episodic("alice")
+    assert any(item["id"] == f"summaries:{row_id}" for item in episodic["items"])
