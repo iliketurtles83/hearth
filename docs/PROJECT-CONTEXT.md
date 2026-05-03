@@ -11,7 +11,7 @@ ChromaDB · LangGraph · Browser UI
 
 ---
 
-## Architecture overview
+## Architecture overviewd
 
 ```
 Browser / LAN client
@@ -31,12 +31,12 @@ FastAPI backend
   ├── memory.py                       SQLite + ChromaDB tiered memory layer
   ├── tools/weather.py                weather adapter
   ├── tools/music.py                  media indexer + playback
-  ├── tools/code.py                   code generation + file read/write
+  ├── tools/code.py                   code generation / file read (questions only, no writes)
   └── tts/                            pluggable TTS package (engines + loader)
 
 Ollama (container)                    local model inference (GPU)
   ├── gemma3:4b                       general conversation, voice responses, persona anchor
-  └── qwen2.5-coder:7b                code-specialized model for all code intents
+  └── qwen2.5-coder:7b                code-specialized model for code questions
 Anthropic API (external)              cloud fallback for complex queries
 
 Reverse proxy / HTTPS edge            enabled when LAN/mobile deployment requires it
@@ -52,38 +52,42 @@ runtime code.
 
 When this section conflicts with historical roadmap notes below, follow this section.
 
-- Phases 1–10d are complete.
+- Phases 1–12 are complete.
 - Phase 8 includes the deterministic music pre-router (`_parse_music_command`) that bypasses the LLM for clear music commands, compound title+artist search, and year/decade range playback.
 - Phase 9 TTS is complete (Piper + Kokoro engines, `/tts` endpoint, barge-in, voice SSE metadata).
 - Phase 10a LangGraph migration is complete (graph skeleton, checkpointing, all nodes wired, `/graph/state` endpoint, checkpoint resume test passing).
-- Phase 10b code tool node is complete (ReAct loop, tree-sitter indexer, ChromaDB code_context collection, confirmation-gated writes, workspace-root enforcement, /code endpoints).
+- Phase 10b code tool node is complete (ReAct loop, tree-sitter indexer, ChromaDB code_context collection, confirmation-gated writes, workspace-root enforcement, /code endpoints). The code tool is now scoped to voice-driven code *questions* only — file writes are frozen pending an external coding agent integration (see Phase 13b).
 - Phase 10c responder/modality split is complete (voice compression, fact-drift test, tone field wired as nullable).
 - Phase 10d ChromaDB cleanup is complete (conversation_memory collection, auto-migration from assistant_memories, consolidated column on summaries table, 6 isolation tests passing).
 - Phase 11 is complete (shipped as a single Hearth character prompt in `backend/hearth_prompt.txt`; tone_probe, persona_renderer, /persona endpoints, and persona UI panel were removed).
-- Phase 12 is complete (three-tier memory: working/episodic/semantic; consolidation worker; tiered retrieval; `GET /memory/episodic`, `POST /memory/consolidate`; tier badges in memory panel).
-- Phases 12b–14 have not started yet.
+- Phase 12 is complete (three-tier memory: working/episodic/semantic; consolidation worker; tiered retrieval; `GET /memory/episodic`, `POST /memory/consolidate`; tier badges in memory panel). The consolidation worker currently uses regex-based candidate extraction — this is the known gap addressed in Phase 12b.
+- Phase 12b is the active next phase.
 - Active models: `gemma3:4b` (chat) and `qwen2.5-coder:7b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
 ## Model setup
 
 - `OLLAMA_CHAT_MODEL=gemma3:4b` for general conversation, voice responses, and persona anchoring. Chosen for its natural prose quality and ability to hold a system-prompt persona. Acceptable reasoning at 4B; complex tasks fall through to cloud.
-- `OLLAMA_CODER_MODEL=qwen2.5-coder:14b` for all code intents. Do not route code tasks to cloud by default.
+- `OLLAMA_CODER_MODEL=qwen2.5-coder:7b` for code questions and explanation. Do not route code tasks to cloud by default.
 - Anthropic is fallback only when local confidence is low or the task exceeds local capability.
 - Both local models hot-swap inside one Ollama container. Simultaneous residency is not realistic on 12 GB VRAM, so routing and UX must account for swap latency.
-- Measured swap latency (2026-04-28, RTX 3060 NVMe): median 0.2–0.3 s after first load. Ollama keeps weights in system RAM after GPU eviction so repeat swaps are RAM to GPU re-pin only. First cold load from disk is about 2 s. Overall impact is imperceptible, so loading-state UX in Phase 10b is optional and low priority.
+- Measured swap latency (2026-04-28, RTX 3060 NVMe): median 0.2–0.3 s after first load. Ollama keeps weights in system RAM after GPU eviction so repeat swaps are RAM to GPU re-pin only. First cold load from disk is about 2 s. Overall impact is imperceptible, so loading-state UX is low priority.
+- **Upgrade candidate:** `gemma3:4b` may be replaced with `gemma4:E4B` (mixture-of-experts, similar VRAM, stronger reasoning). Evaluate by running memory consolidation extraction quality tests with both models before committing. Do not change `OLLAMA_CHAT_MODEL` in source — it is env-var controlled.
 
 ## Locked architecture decisions
 
-- The coding assistant lives inside the LangGraph graph as a `code_tool` node, not as a VS Code extension.
-- The code node uses a ReAct loop via LangGraph `create_react_agent`; do not implement code generation as a single-shot completion path.
-- Use prebuilt `langchain-community` tools for the code node: `ShellTool`, `ReadFileTool`, `WriteFileTool`, and `PythonREPLTool`.
-- Build codebase context with tree-sitter summaries, signatures, and import graphs stored in ChromaDB. Inject retrieved slices into coder prompts as `code_context`.
-- File writes require explicit confirmation before touching disk. For voice flows, summarize the planned write first, then wait for confirmation.
-- Enforce workspace-root boundaries for all file operations.
-- Ignore terminal-only Ollama launch wrappers such as Claude Code, Codex, OpenCode, Hermes, and OpenClaw for this project. They do not participate in wake-word, graph-state, or voice flows.
-- The `code_tool` node inherits memory, session state, voice input, and tool access from the graph; keep designs aligned with that shared state model.
-- On code intents, memory retrieval injects relevant tree-sitter and import-graph slices into the coder prompt as `code_context`; this retrieval layer is part of what makes the local coder viable.
+- **Hearth does not implement its own coding agent.** The `code_tool` node handles voice-driven code *questions* (explain, describe, answer) but does not write files. File generation is deferred to an external coding agent service (Aider, Continue.dev, or similar) that Hearth will call as a thin tool adapter in a future phase.
+- The `code_tool` node stays in the graph for code question routing. Do not remove it. Do not expand it with new file-write capability. The ReAct loop and tree-sitter indexer built in Phase 10b remain in place — they are the context-retrieval foundation for code questions and for the future external agent adapter.
+- The tree-sitter indexer in `code_context` ChromaDB collection is frozen at current capability. Do not invest in improving it until the external agent integration path is decided.
+- The coding assistant is NOT a VS Code extension. Future voice-activated coding connects to an external service via HTTP, not through IDE plugin APIs.
+- Sub-agent architecture (previously Phase 14) is shelved indefinitely. Do not implement task decomposer, critic, or synthesizer subgraphs. A single well-prompted agent with tool access is sufficient for Hearth's use cases.
+- The deterministic music pre-router (`_parse_music_command()` in the HTTP handler) stays in place, by design. It guards the graph invocation for high-confidence music commands and is never moved into the graph.
+- All frontend API calls use relative paths. No hardcoded hosts or ports in runtime code.
+- New tools are modules under `backend/tools/` with interface: `async def run(params: dict) -> dict`.
+- `OLLAMA_CHAT_MODEL` and `OLLAMA_CODER_MODEL` are separate env vars. Never hardcode model names in source.
+- Structured logs for every routing decision, model selected, tool call, and error.
+- Cloud fallback degrades gracefully with a user-visible notice, never silent failure.
+- Android/mobile voice requires HTTPS-capable LAN edge support before it should be considered complete.
 
 ## Target LangGraph shape
 
@@ -91,21 +95,24 @@ When this section conflicts with historical roadmap notes below, follow this sec
 input → intent_classifier → memory_retrieval → tool_router
   ├── weather_tool
   ├── music_tool
-  ├── code_tool        (ReAct loop, qwen2.5-coder:7b, langchain-community tools)
+  ├── code_tool        (code questions only; qwen2.5-coder:7b; no file writes)
   └── chat_fallback
         └── responder → output
 ```
 
-State shape for the graph should include: `messages`, `intent`, `memories`, `tool_result`, `user_prefs`, `session_id`, `active_files`, and `code_context`.
-
-## Key constraints and rules
-
-- All frontend API calls use relative paths. No hardcoded hosts or ports in runtime code.
-- New tools are modules under `backend/tools/` with interface: `async def run(params: dict) -> dict`.
-- `OLLAMA_CHAT_MODEL` and `OLLAMA_CODER_MODEL` are separate env vars. Never hardcode model names in source.
-- Structured logs for every routing decision, model selected, tool call, and error.
-- Cloud fallback degrades gracefully with a user-visible notice, never silent failure.
-- Android/mobile voice requires HTTPS-capable LAN edge support before it should be considered complete.
+State shape:
+```python
+class AssistantState(TypedDict):
+    messages: list[dict]
+    intent: str
+    memories: list[str]
+    tool_result: str
+    user_prefs: dict
+    session_id: str
+    active_files: list[str]
+    code_context: str
+    modality: str          # "voice" or "chat"
+```
 
 ---
 
@@ -170,7 +177,7 @@ Implementation notes (decisions made during build):
   `channelCount: 1`, processing disabled) to `getUserMedia` to prevent PipeWire/ALSA
   from opening the device twice.
 - **Android / mobile HTTPS**: `navigator.mediaDevices` is `undefined` on plain HTTP in
-  mobile browsers. Unblocked by Phase 0b (Caddy HTTPS).
+  mobile browsers. Unblocked by Phase 3 (Caddy HTTPS).
 
 Tasks — all complete:
 - ✅ Startup validation: log clearly if ONNX model files are missing.
@@ -184,7 +191,7 @@ Tasks — all complete:
 - ✅ Secure-context check with user-friendly message on non-HTTPS clients.
 - ✅ Reconnect backoff on frontend WebSocket.
 - ✅ Utterance capture via RMS threshold on existing worklet frames (no vad-web).
-- ✅ Android voice — validated after Phase 0b (Caddy HTTPS).
+- ✅ Android voice — validated after Phase 3 (Caddy HTTPS).
 
 Acceptance:
 - ✅ Clicking mic enters stable sleeping state.
@@ -202,9 +209,7 @@ Acceptance:
 **Depends on: Phase 1**
 
 Goal: Terminate HTTPS on the LAN so that all clients — including Android and iOS —
-can access microphone and other secure-context browser APIs. This also unblocks
-several tightening browser API restrictions (AudioWorklet, WebAuthn, etc.) and
-should be done before any further mobile work.
+can access microphone and other secure-context browser APIs.
 
 Tasks — all complete:
 - ✅ Add a `caddy` service to `docker-compose.yml` that reverse-proxies to FastAPI on
@@ -241,7 +246,7 @@ Tasks — all complete:
 - ✅ Add bounded-context controls: max turns, token cap, and truncation strategy.
 - ✅ Summarize older in-session messages once history grows beyond thresholds,
   and include that summary in context. This is the seed of the episodic memory
-  tier introduced formally in Phase 9.5.
+  tier introduced formally in Phase 12.
 - ✅ Store session context in memory or a lightweight session store (no SQLite
   requirement in this phase).
 - ✅ Emit lightweight telemetry: context length, estimated token usage,
@@ -262,15 +267,9 @@ Acceptance:
 
 Goal: Replace single-step intent classification with a brief inner-monologue
 reasoning pass before routing. The model thinks out loud about what the user
-needs before committing to a route. This is how state-of-the-art agentic systems
-(o3, Claude extended thinking, Gemini 2.5) handle routing — not by classifying
-into a fixed category, but by reasoning about the request first.
+needs before committing to a route.
 
 Design:
-
-The inner monologue is a short chain-of-thought prompt (run locally) that produces
-a structured routing decision. It is not the full response — it is a deliberate
-pre-step that runs before model selection or tool dispatch.
 
 ```
 User input
@@ -286,24 +285,22 @@ User input
 ```
 
 The `reasoning` field is logged for observability but never shown to the user.
-The structured decision drives all subsequent dispatch.
 
 Intent categories (produced by monologue, not hardcoded):
 - `quick-local` — factual, short, conversational
 - `reasoning-heavy` — multi-step planning, analysis, architecture
-- `code` — code generation, debugging, explanation, file editing
+- `code` — code questions, debugging, explanation (not file writes — see locked decisions)
 - `external-data-needed` — weather, news, live data (tool path, not cloud)
 - `memory-needed` — references to prior facts or user preferences
 
-Tasks:
+Tasks — all complete:
 - ✅ Replace keyword heuristics in `router.py` with a lightweight intent classifier
   (prompt-based using the local model itself).
-- ✅ Add a confidence: if local model confidence is below threshold,
+- ✅ Add a confidence threshold: if local model confidence is below threshold,
   escalate to cloud.
 - ✅ Upgrade classifier to a full inner-monologue reasoning pass that outputs a
   structured routing JSON rather than a single intent label.
-- ✅ Route `code` intent to the local coder model (see Phase 10) rather than the
-  general chat model or cloud. Code tasks almost never need cloud escalation.
+- ✅ Route `code` intent to the local coder model rather than the general chat model or cloud.
 - ✅ Emit structured telemetry per request: route chosen, model used, first-token
   latency, completion latency, error/fallback count.
 - ✅ Keep a visible model badge in the UI showing which model handled the response.
@@ -325,8 +322,6 @@ Acceptance:
 **Depends on: Phase 5**
 
 Goal: Assistant remembers user preferences and relevant facts across restarts.
-This is the foundation for personalization, weather defaults, music preferences,
-and conversational continuity.
 
 Schema (start minimal, extend as needed):
 ```sql
@@ -335,7 +330,7 @@ preferences  (id, key, value, updated_at)
 summaries    (id, session_id, summary, created_at)
 ```
 
-Tasks:
+Tasks — all complete:
 - ✅ Implement write policy: save only high-value facts — explicit user statements,
   stated preferences, recurring intents. Never store secrets unless explicitly
   approved by the user.
@@ -357,8 +352,6 @@ Tasks:
 - ✅ Surface basic memory viewer in UI.
 - ✅ Surface memory write outcomes in UI and logs (`saved`, `blocked-sensitive`, `needs-confirmation`).
 - ✅ Add lightweight chat sessions sidebar (new/switch/reset) before weather-tool work.
-- ✅ Keep a strict memory boundary for future persona work: memory extraction and retrieval
-  must be fact/policy-driven and not modified by stylistic "human side" rendering.
 
 Acceptance:
 - ✅ Stated preferences survive container restart.
@@ -367,7 +360,6 @@ Acceptance:
 - ✅ Explicit save/forget commands behave deterministically and return clear status.
 - ✅ Sensitive and confirm-first classes follow policy matrix consistently.
 - ✅ Sessions sidebar supports starting and switching chat sessions.
-- ✅ Persona/tone customization (future phase) cannot alter stored facts or tool-derived values.
 
 ---
 
@@ -379,9 +371,8 @@ Acceptance:
 Goal: First external tool integration. Validates the tool-routing architecture
 cleanly before adding more complex tools.
 
-Tasks:
-- ✅ Build a weather provider adapter with a normalized response schema (do not
-  leak provider-specific field names into the rest of the codebase).
+Tasks — all complete:
+- ✅ Build a weather provider adapter with a normalized response schema.
 - ✅ Route weather intents directly to the tool endpoint, then summarize through
   the model — do not pass raw API JSON to the user.
 - ✅ Use the remembered default location from memory; support inline override
@@ -415,7 +406,7 @@ Goal: Provide backend music search and playback integration using MPD and the
 Strawberry music database, exposing HTTP endpoints and voice and text commands
 so users can search, queue, and control playback from the UI or via voice.
 
-Implementation notes (decisions made during review):
+Implementation notes (decisions made during build):
 - **Strawberry DB schema**: no `id` column; use `rowid` as integer primary key.
   File paths are stored in the `url` column as `file://` URIs with URL encoding.
   No `songs_fts` FTS table in production databases — use LIKE queries only.
@@ -431,8 +422,7 @@ Implementation notes (decisions made during review):
   (read-only URI mode). Wrap all reads in `try/except sqlite3.OperationalError`
   and return `retryable=True` when locked (Strawberry holds write lock during scans).
 - **Artist radio**: implemented in Phase 8 core as weighted-random by `playcount`,
-  seeded for determinism. This is the Phase 8b fallback entry point — 8b calls
-  `artist_radio()` directly when the rec engine is unavailable.
+  seeded for determinism. This is the Phase 8b fallback entry point.
 - **Deterministic music pre-router**: `_parse_music_command()` in `main.py` fires
   BEFORE `router_route()` in the `/chat` endpoint. High-confidence music commands
   (control, now-playing, queue-view, explicit play/queue with concrete target) bypass
@@ -513,37 +503,34 @@ Acceptance:
 
 ---
 
-### Phase 8b (1–2 days, do it when rec engine MVP is ready)
+### Phase 8b — Music recommendations via external engine
 **Estimate: 1–2 days**
-**Depends on: Phase 8, recommendation engine MVP**
+**Depends on: Phase 8, external recommendation engine MVP**
 
-Goal: Add a music recommendation tool that integrates with the recommendation engine
+Goal: Add a music recommendation tool that integrates with an external recommendation
+engine as a thin adapter. This is the same pattern as the future coding agent
+integration — Hearth calls the service, formats the result, nothing more.
 
 Tasks:
 - Recommend intent route: "play something like X" or "play songs similar to X"
-- Thin adapter: call rec engine HTTP endpoint → resolve results against Strawberry DB → queue in MPD
-- Graceful fallback if rec engine is unavailable (queue artist radio from Strawberry instead)
+- Thin adapter in `backend/tools/music_rec.py`: call rec engine HTTP endpoint →
+  resolve results against Strawberry DB → queue in MPD
+- Graceful fallback if rec engine is unavailable: queue artist radio from Strawberry instead
+- Follow the same `async def run(params: dict) -> dict` tool interface
 
 Acceptance:
 - "Play something like <song/artist>" returns relevant recommendations and queues them in MPD.
+- If rec engine is unreachable, falls back to artist radio with a user-visible note.
 
 ---
 
 ### Phase 9 — TNG-style voice output (TTS)
-**Status: not started**
+**Status: complete**
 **Estimate: 2–3 days**
 **Depends on: Phases 2, 4**
 
 Goal: Implement a pluggable TTS engine and wire end-to-end audio playback with
-barge-in support. Voice response quality (brevity, tone, pacing) will be polished
-in Phase 10 once the LangGraph responder node can shape output by modality.
-
-Design rationale: Attempting to retrofit spoken brevity into the current
-procedural code path creates a scattered maintenance burden — every tool response
-and responder prompt would need separate versions. The LangGraph responder node
-(Phase 10) provides the right architectural home for modality-aware response
-shaping. Phase 9 builds the foundation (TTS engine + playback + barge-in);
-Phase 10 polishes it (modality-aware responder that compresses for voice).
+barge-in support.
 
 TTS engine interface:
 - Pluggable engines live in `backend/tts/engines/` with a common
@@ -551,7 +538,7 @@ TTS engine interface:
 - `backend/tts.py` selects engine by `TTS_ENGINE` env var.
 - Engines handle speaker/voice selection internally (via env vars or config).
 
-Tasks:
+Tasks — all complete:
 - ✅ Implement `backend/tts/` package with pluggable engine loader and common `synthesize()` method.
 - ✅ Implement a Piper TTS engine in `backend/tts/engines/piper.py`.
 - ✅ Implement a Kokoro TTS engine in `backend/tts/engines/kokoro.py`.
@@ -571,12 +558,6 @@ Acceptance:
 - ✅ Swapping `TTS_ENGINE` in `.env` changes the engine without code changes.
 - ✅ Browser autoplay constraints are handled (auto-play muted, manual enable fallback).
 
-**Known gap (Phase 10):** Voice responses currently use the full chat text,
-which is verbose for spoken output. This will be addressed in Phase 10's
-responder node, which will have modality awareness and produce concise output
-for voice, full markdown for chat. Phase 9 intentionally does not attempt to
-retrofit brevity into the current procedural code path.
-
 ---
 
 ### Phase 10a — Graph skeleton and router migration
@@ -585,8 +566,8 @@ retrofit brevity into the current procedural code path.
 **Depends on: all prior phases**
 
 Goal: Introduce LangGraph with durable checkpointing and migrate existing router
-logic into a stateful graph. This phase establishes the graph foundation with zero
-feature additions — all behavior must pass through the graph with no regression.
+logic into a stateful graph. Zero feature additions — all behavior must pass
+through the graph with no regression.
 
 Design notes:
 - The deterministic music pre-router (`_parse_music_command()` in the HTTP handler)
@@ -595,33 +576,8 @@ Design notes:
 - Pin LangGraph version immediately in `requirements.txt` — the checkpointer
   interface changed significantly between v0.1 and v0.2.
 - Use `SqliteSaver` for durable session state.
-- Graph skeleton mirrors the target shape but with no advanced features yet:
-  it simply routes to existing tools and the simple responder.
 
-Target graph shape (Phase 10a):
-```
-input → intent_classifier → memory_retrieval → tool_router
-  ├── weather_tool
-  ├── music_tool
-  └── chat_fallback
-        └── responder → output
-```
-
-State shape (fields added incrementally in future phases):
-```python
-class AssistantState(TypedDict):
-    messages: list[dict]
-    intent: str
-    memories: list[str]
-    tool_result: str
-    user_prefs: dict
-    session_id: str
-    active_files: list[str]           # added in Phase 10b for code context
-    code_context: str                 # added in Phase 10b for code context
-    modality: str                     # added in Phase 10c (voice or chat)
-```
-
-Tasks:
+Tasks — all complete:
 - ✅ Create `backend/graph.py` with LangGraph StateGraph definition and SqliteSaver checkpointer.
 - ✅ Pin LangGraph version in `requirements.txt` (v0.2+) and document the version constraint.
 - ✅ Migrate `router.py` intent classification logic into the `intent_classifier` node.
@@ -647,26 +603,23 @@ Acceptance:
 ---
 
 ### Phase 10b — Code tool node
-**Status: complete**
+**Status: complete (scoped to code questions only — file writes frozen)**
 **Estimate: 1 week**
 **Depends on: Phase 10a**
 
 Goal: Add a dedicated code assistant node to the graph with a ReAct loop, tree-sitter
-summaries, ChromaDB code context injection, and confirmation-gated file writes.
+summaries, ChromaDB code context injection. File-write capability was built and is
+frozen pending external agent integration decision.
 
 Design notes:
-- The `code_tool` node is self-contained once the graph exists.
-- Use LangGraph's `create_react_agent` to implement the ReAct loop.
-- Use prebuilt `langchain-community` tools: `ShellTool`, `ReadFileTool`, `WriteFileTool`, `PythonREPLTool`.
-- Tree-sitter summaries (function signatures, class hierarchies, import graphs) are
-  stored in ChromaDB under a dedicated `code_context` collection. Retrieval is injected
-  into coder prompts as `code_context` state field.
-- File writes require explicit confirmation from the user. For voice flows, summarize
-  the planned write aloud, then wait for verbal approval before touching disk.
-- Enforce workspace-root boundaries on all file operations — no path traversal.
-- A loading-state badge
+- The `code_tool` node answers voice-driven code questions using project context
+  retrieved from tree-sitter summaries stored in ChromaDB `code_context` collection.
+- File writes are NOT expanded further. The confirmation-gated write flow built in
+  this phase is frozen in place — do not invest in improving or extending it.
+- The ReAct loop, tree-sitter indexer, and code_context ChromaDB collection remain
+  as the context-retrieval foundation for the future external agent adapter (Phase 13b).
 
-Tasks:
+Tasks — all complete:
 - ✅ Add `active_files: list[str]` and `code_context: str` to `AssistantState`.
 - ✅ Build tree-sitter summary extraction (function signatures, class hierarchies, import graphs).
 - ✅ Create a ChromaDB `code_context` collection separate from conversation memory.
@@ -679,14 +632,11 @@ Tasks:
   (with confirmation requirement).
 
 Acceptance:
-- ✅ "Computer, write a function that does X" generates code with relevant project context
-  injected from tree-sitter summaries.
-- ✅ "Computer, continue that function from yesterday" resolves via checkpointed graph state.
-- ✅ File writes present a diff/summary to the user and require explicit approval.
-- ✅ Workspace-root boundary is enforced on every file operation.
-- ✅ Code intents are routed to the local coder model (`OLLAMA_CODER_MODEL`) and do not
-  silently route to cloud unless unavailable.
+- ✅ Code questions ("explain this function", "how does X work") are answered using
+  tree-sitter context retrieved from ChromaDB.
+- ✅ Code intents are routed to the local coder model (`OLLAMA_CODER_MODEL`).
 - ✅ Tree-sitter summaries are indexed and retrievable; context injection is working.
+- ✅ Workspace-root boundary is enforced on every file operation.
 
 ---
 
@@ -696,8 +646,7 @@ Acceptance:
 **Depends on: Phase 10a, Phase 9**
 
 Goal: Add the responder node with modality-aware output shaping. Voice responses
-are compressed and natural; chat responses are full and detailed. This is where
-the TTS brevity work deferred from Phase 9 is properly solved.
+are compressed and natural; chat responses are full and detailed.
 
 Design notes:
 - The responder node receives a factual, tool-grounded response and shapes it
@@ -705,24 +654,17 @@ Design notes:
 - For `modality="voice"`: compress to brief, natural spoken output; optimize for
   ear (not eye). Hand off to TTS engine.
 - For `modality="chat"`: return full markdown with proper formatting, details, and links.
-- The `tone` field is wired into state as a nullable field — Phase 11's tone_probe
-  will populate it, but for now it remains null and has no effect.
-- This node closes the design gap from Phase 9: voice responses now have the right
-  architectural home for proper brevity and pacing.
 
-Tasks:
-- ✅ Add `modality: str` (values: "voice" or "chat") and `tone: str | None` to `AssistantState`.
-- ✅ Add logic to the `/chat` endpoint to set `modality` based on request source
-  (voice call vs. text chat).
+Tasks — all complete:
+- ✅ Add `modality: str` (values: "voice" or "chat") to `AssistantState`.
+- ✅ Add logic to the `/chat` endpoint to set `modality` based on request source.
 - ✅ Implement the `responder` node with modality-aware response shaping:
-  - For voice: use a compression prompt to extract key points and naturalize phrasing.
-    Aim for 20-30% of original length while preserving facts.
+  - For voice: compression prompt extracts key points, aims for 20-30% of original length
+    while preserving facts.
   - For chat: return the full response as-is with markdown formatting.
 - ✅ Wire the responder node into the graph flow (comes after tool_router).
 - ✅ For voice responses, pipe the shaped output to the TTS engine (`/tts` endpoint).
 - ✅ Return both text and audio to the frontend for voice flows.
-- ✅ Document speaking rate, pitch, and prosody tuning used for TNG computer style
-  (this was benchmarked in Phase 9; reuse those settings).
 - ✅ Add a test that verifies voice responses contain all factual content from the
   original response (no fact drift through compression).
 
@@ -732,10 +674,7 @@ Acceptance:
 - ✅ Voice response compression preserves all factual content (verified by test).
 - ✅ TTS integration works end-to-end: response text is compressed, synthesized,
   and returned with audio stream.
-- ✅ The `tone` field is wired into state as nullable; Phase 11 will populate it,
-  but Phase 10c leaves it as null without breaking behavior.
-- ✅ Audio playback in frontend works for voice flows; barge-in stops playback and
-  resumes listening (feature from Phase 9) still works with graph-based responses.
+- ✅ Audio playback in frontend works for voice flows; barge-in stops playback.
 
 ---
 
@@ -745,8 +684,7 @@ Acceptance:
 **Depends on: Phase 10b, Phase 10c**
 
 Goal: Separate conversation memory collections from code context collections
-in ChromaDB. Verify no retrieval cross-contamination. Handle the summaries table
-migration question from Phase 6.
+in ChromaDB. Verify no retrieval cross-contamination.
 
 Design notes:
 - Two ChromaDB collections: `conversation_memory` (facts, episodic summaries,
@@ -754,25 +692,21 @@ Design notes:
   import graphs).
 - Retrieval for code intents queries only `code_context`.
 - Retrieval for general intents queries only `conversation_memory`.
-- No cross-contamination: code context never pollutes chat memory retrieval.
-- The summaries table from Phase 6 is formalized here: it's the backing store
-  for episodic memory and the input to Phase 12's consolidation process.
 
-Tasks:
+Tasks — all complete:
 - ✅ Audit existing ChromaDB usage and identify all stored collections and metadata schemas.
 - ✅ Create a separate `code_context` collection for tree-sitter summaries (done in 10b; confirmed isolated).
 - ✅ Ensure `conversation_memory` collection stores only facts, preferences, and episodic summaries.
 - ✅ Update `memory_retrieval` node to query only `conversation_memory` (with structured log per collection).
 - ✅ Update `code_context_retrieval()` to query only `code_context`.
 - ✅ Write tests that verify cross-intent queries do not contaminate results.
-- ✅ Formalize the summaries table (`id, session_id, summary, created_at, consolidated`) as the backing store for episodic memory tier (Phase 12 prerequisite).
+- ✅ Formalize the summaries table (`id, session_id, summary, created_at, consolidated`) as the backing store for episodic memory tier.
 - ✅ Document the ChromaDB schema and migration path for existing instances.
 
 Implementation notes:
-- `assistant_memories` → `conversation_memory` rename with non-destructive auto-migration on startup (copy all documents, then delete old collection).
+- `assistant_memories` → `conversation_memory` rename with non-destructive auto-migration on startup.
 - Live-instance migration for `consolidated` column: `ALTER TABLE summaries ADD COLUMN` wrapped in `try/except OperationalError`.
 - `save_summary(user_id, session_id, summary) -> int` helper added to `MemoryStore` as Phase 12 hook.
-- Structured log lines in `memory_retrieval` node explicitly name which collection was queried (`collection=conversation_memory` or `collection=code_context`).
 - 6 new tests in `backend/tests/test_chroma_isolation.py` (all passing).
 
 Acceptance:
@@ -790,27 +724,18 @@ Acceptance:
 **Estimate: 1–2 weeks**
 **Depends on: Phase 10**
 
-Goal: Give Hearth a consistent, recognisable personality that carries across all
-topics and sessions — warmth, directness, affect awareness, and honesty — without
-adding runtime overhead or fragile post-processing nodes.
+Goal: Give Hearth a consistent, recognisable personality without adding runtime
+overhead or fragile post-processing nodes.
 
-Design decision: After building and evaluating the full `tone_probe` +
-`persona_renderer` + `/persona` UI architecture, it was replaced with the
-simplest thing that could actually work: a single, well-crafted system prompt
-loaded from `backend/hearth_prompt.txt`. The rationale:
+Design decision: Replaced the full `tone_probe` + `persona_renderer` + `/persona` UI
+architecture with a single, well-crafted system prompt loaded from `backend/hearth_prompt.txt`.
 
+Rationale:
 - A 500-word character prompt injected into every LLM call costs zero extra
   model calls and produces personality that is baked in rather than bolted on.
-- `tone_probe` added a full LLM call per turn with no measurable improvement in
-  response quality — the chat model already picks up on user affect from context.
-- `persona_renderer` added another post-hoc LLM call and introduced fact-drift
-  risk that required dedicated tests to guard. Removing it eliminates the risk
-  entirely.
+- `tone_probe` added a full LLM call per turn with no measurable improvement.
+- `persona_renderer` added another post-hoc LLM call and introduced fact-drift risk.
 - Personality tuning via a text file is faster to iterate than graph node config.
-
-The decision to add `tone_probe`, `persona_renderer`, and `/persona` endpoints
-back is deferred: measure whether the system prompt approach is sufficient over
-2 weeks of real use, then decide if any of those layers add value.
 
 Implementation:
 
@@ -834,27 +759,21 @@ Removed from previous implementation:
 - `/persona` GET and POST endpoints, `PersonaConfigRequest` model, `_PERSONA_STYLE_VALUES`.
 - Persona sidebar panel from the frontend UI (`persona.js` deleted, HTML removed).
 
-Tasks:
-- ✅ Write Hearth character prompt (`backend/hearth_prompt.txt`): warmth, intuition,
-  clarity, honesty, per-modality style, affect awareness.
+Tasks — all complete:
+- ✅ Write Hearth character prompt (`backend/hearth_prompt.txt`).
 - ✅ Implement `_load_hearth_prompt()` loader in `main.py` with file → env → hardcoded fallback.
 - ✅ Remove `tone_probe`, `persona_renderer`, `/persona` endpoints, and all related
   state fields, constants, and UI.
-- ✅ Update `test_persona.py` to verify prompt loading mechanics (file read, env fallback).
+- ✅ Update `test_persona.py` to verify prompt loading mechanics.
 - ✅ Update `test_responder_modality.py` to remove tone-probe call assumptions.
 
 Acceptance:
 - ✅ `CHAT_DEFAULT_SYSTEM_PROMPT` is loaded from `hearth_prompt.txt` at startup (verified by test).
-- ✅ `CODE_DEFAULT_SYSTEM_PROMPT` is loaded from `hearth_coder_prompt.txt` at startup
-- ✅ All LLM calls — chat, voice, cloud fallback, tool summarizer, code tool — receive
-  the Hearth character prompt via `augmented_system`.
-- ✅ No extra model calls per turn for personality (zero overhead vs. previous design).
+- ✅ `CODE_DEFAULT_SYSTEM_PROMPT` is loaded from `hearth_coder_prompt.txt` at startup.
+- ✅ All LLM calls receive the Hearth character prompt via `augmented_system`.
+- ✅ No extra model calls per turn for personality.
 - ✅ Personality is editable by updating `hearth_prompt.txt` and restarting.
-- ✅ No fact-drift risk from post-hoc persona rendering (node does not exist).
-- ✅ 234 tests pass; the one known failure (`test_chat_stream_*`) is pre-existing and
-  unrelated to Phase 11.
-- ⏭ Tone probe, persona renderer, and prosody bridge remain available as future
-  additions if the system prompt alone proves insufficient after the 2-week trial.
+- ✅ No fact-drift risk from post-hoc persona rendering.
 
 ---
 
@@ -864,9 +783,7 @@ Acceptance:
 **Depends on: Phase 11**
 
 Goal: Upgrade the flat SQLite memory layer to a three-tier memory architecture
-that automatically promotes important information from ephemeral session context
-into durable long-term facts. This mirrors how human memory works — frequent,
-important, or explicitly stated things become durable; the rest fades.
+that automatically promotes important information into durable long-term facts.
 
 Memory tiers:
 
@@ -877,8 +794,7 @@ Tier 1 — Working memory (in-context)
   Lifetime: single turn
 
 Tier 2 — Episodic memory (session summaries)
-  Compressed summaries of past sessions. When a session ends or grows beyond
-  the token budget, the model summarises the key points into an episodic record.
+  Compressed summaries of past sessions.
   Managed by: SQLite summaries table
   Lifetime: until explicitly forgotten or consolidated
 
@@ -889,30 +805,17 @@ Tier 3 — Semantic memory (long-term facts)
   Lifetime: indefinite (user-deletable)
 ```
 
-Consolidation process:
-- A background task runs after each session ends (or on a schedule).
-- It reads recent episodic records and extracts candidate facts using a local
-  model prompt: "What stable facts about the user or their preferences can be
-  extracted from this session?"
-- Candidates are filtered through the sensitivity matrix (Phase 5) before write.
-- Extracted facts are embedded into ChromaDB for semantic retrieval.
-- The episodic record is retained for a configurable period then pruned.
-
-This replaces the Phase 3 summarization stub (⏳) with a proper tiered design.
-
 Implementation notes:
-- Episodic tier backed by the existing `summaries` table (columns: `id, user_id, session_id, summary, created_at, consolidated`). No separate table needed.
-- `_build_episodic_record_text()` in `main.py` uses `_summarize_messages_chunk()` to format recent messages as structured text (no LLM call — avoids blocking session-end path).
-- `consolidate_pending()` in `MemoryStore` uses regex-based `_extract_candidates()` to extract facts/preferences from episodic text, enforces sensitivity matrix, writes to SQLite + ChromaDB, marks row `consolidated=1`.
+- Episodic tier backed by the existing `summaries` table (columns: `id, user_id, session_id, summary, created_at, consolidated`).
+- `_build_episodic_record_text()` in `main.py` uses `_summarize_messages_chunk()` to format recent messages as structured text (no LLM call).
+- `consolidate_pending()` in `MemoryStore` uses regex-based `_extract_candidates()` to extract facts/preferences from episodic text, enforces sensitivity matrix, writes to SQLite + ChromaDB, marks row `consolidated=1`. **The regex extractor is the known gap fixed in Phase 12b.**
 - Background consolidation is non-blocking: `asyncio.to_thread` + `loop.create_task`.
 - `MEMORY_CONSOLIDATION_MODE` env var: `on-session-end` (default), `interval`, or `manual`.
 - `MEMORY_CONSOLIDATION_INTERVAL_SECONDS` and `MEMORY_CONSOLIDATION_BATCH_SIZE` are configurable.
 - `retrieve()` queries all three tiers and ranks results; episodic scores capped at 0.85× to let high-confidence semantic facts rank above raw summaries.
-- Episodic records deletable via `DELETE /memory/summaries:{id}` (same endpoint as facts/preferences).
-- Memory viewer tier badges implemented in `frontend/message.js`.
 - Routes in `backend/routes/memory_tool_routes.py`: `GET /memory/episodic`, `POST /memory/consolidate`.
 
-Tasks:
+Tasks — all complete:
 - ✅ Add `episodic` table to SQLite schema: `(id, session_id, summary, created_at, consolidated)`.
 - ✅ Implement end-of-session summarization: session messages compressed into episodic record.
 - ✅ Implement consolidation task: extracts semantic facts from episodic records,
@@ -923,8 +826,7 @@ Tasks:
 - ✅ Upgrade `memory_retrieval` node to query all three tiers and rank results.
 
 Acceptance:
-- ✅ Facts stated in session A are retrievable by semantic search in session B
-  without the user restating them.
+- ✅ Facts stated in session A are retrievable by semantic search in session B.
 - ✅ Sensitive items are not auto-consolidated (sensitivity matrix enforced).
 - ✅ User can view episodic records and delete them individually.
 - ✅ Consolidation task runs without blocking the main request path.
@@ -932,135 +834,166 @@ Acceptance:
 
 ---
 
-### Phase 12b - Hearth memory
-**Estimate: 1 week**
+### Phase 12b — LLM-based memory extraction
+**Status: not started**
+**Estimate: 3–5 days**
 **Depends on: Phase 12**
 
-Goal: 
+Goal: Replace the regex-based `_extract_candidates()` in the consolidation worker
+with a proper LLM call. This is the highest-value memory improvement available —
+regex pattern matching misses implied facts, paraphrased preferences, and anything
+the user states indirectly. A well-prompted local model handles all of these.
 
-Draft text:
-Query pattern: "What patterns/rules have I learned?"
-Context window role: Secondary—inform decisions, not dominate context
-Ranking priority: Confidence + generalization + consistency
-Staleness handling:Deprecate weak patterns gradually
+Design:
 
-consolidation:
-  user:
-    promotion_threshold: 3
-    decay_rate_days: 30
-    importance_multipliers: { explicit: 5, frequent: 2 }
-  hearth:
-    promotion_threshold: 10
-    decay_rate_days: 90
-    importance_multipliers: { consistent: 3, successful: 4 }
+The consolidation worker already runs in a background thread after session end.
+The only change is what happens inside `consolidate_pending()`: replace
+`_extract_candidates(episodic_text)` with a local model call that returns
+structured JSON candidates.
 
-Bottom line: Separate retrieval logic (it's cheap and clarifying), unified storage and consolidation (it's where the complexity lives, so don't duplicate it). This gives you isolation where it matters (what gets asked) and reuse where it counts (how answers are filtered and promoted).
+Prompt contract (send to `OLLAMA_CHAT_MODEL`):
+```
+System: You are a memory extraction assistant. Given a summary of a conversation,
+extract stable facts and preferences about the user. Return ONLY valid JSON with
+no preamble. Format:
+{
+  "candidates": [
+    { "key": "string", "value": "string", "type": "fact|preference", "confidence": 0.0–1.0 }
+  ]
+}
+
+Rules:
+- Extract only things that are stable and generalize beyond this conversation.
+- Do not extract things said by the assistant, only about the user.
+- Do not extract sensitive data (passwords, exact addresses, financial details).
+- If nothing stable can be extracted, return { "candidates": [] }.
+```
+
+The returned candidates are then passed through the existing sensitivity matrix
+filter before any write. The sensitivity matrix is not changing — only the
+extraction step.
+
+Implementation notes:
+- Call `OLLAMA_CHAT_MODEL` via the existing Ollama client. Keep the token budget
+  small (~300 output tokens) — extraction is a structured task, not a prose response.
+- Parse the JSON response with `try/except`. On parse failure, log and skip the
+  record (do not crash the consolidation worker).
+- Set a confidence threshold: only write candidates with `confidence >= 0.7`.
+- The existing `_extract_candidates()` function can be kept as a fallback or deleted.
+  Delete it if the LLM path is stable after one week of real use.
+- Consolidation is non-blocking — this change does not affect that. The LLM call
+  runs inside `asyncio.to_thread` as before.
+
+Model upgrade note:
+- If `gemma4:E4B` is being evaluated as a replacement for `gemma3:4b`, run the
+  extraction quality comparison here: same episodic records, both models, compare
+  candidate quality and JSON parse success rate. This is the right test because
+  extraction is a structured reasoning task where the MoE advantage is measurable.
+- Do not hard-code the model name. Use `OLLAMA_CHAT_MODEL` env var throughout.
 
 Tasks:
+- Replace `_extract_candidates(text)` in `memory.py` with `_llm_extract_candidates(text)`
+  that calls `OLLAMA_CHAT_MODEL` and parses JSON response.
+- Add `confidence` threshold filter: skip candidates below 0.7.
+- Add `try/except` around JSON parse with structured error log and graceful skip.
+- Keep sensitivity matrix filter in place downstream — it still applies.
+- Add a test with a realistic episodic summary and assert that the LLM extractor
+  returns valid structured candidates (mock the Ollama call in CI).
+- Add a test that verifies parse failure is handled gracefully (does not crash
+  consolidation worker, logs the error, continues to next record).
+- If evaluating `gemma4:E4B`: run extraction on 10 real episodic records with both
+  models, log candidate counts and confidence scores, document findings before
+  switching `OLLAMA_CHAT_MODEL`.
 
 Acceptance:
+- Consolidation worker produces richer, more accurate memory candidates than the
+  regex extractor for the same episodic records.
+- Parse failures are handled gracefully — consolidation worker never crashes on
+  a bad LLM response.
+- Confidence threshold is enforced: low-confidence extractions are not written.
+- Sensitivity matrix still applies downstream of extraction — no regressions.
+- Existing consolidation schedule and non-blocking behavior are unchanged.
+- Tests pass in CI (Ollama call mocked).
 
 ---
 
-### Phase 13 — Local code assistant on LangGraph
-**Estimate: 1–2 weeks**
-**Depends on: Phase 12**
+### Phase 13 — Voice-activated external coding agent integration
+**Status: not started**
+**Estimate: 3–5 days**
+**Depends on: Phase 12b**
 
-Goal: Add a dedicated code assistant node to the LangGraph flow so code tasks use
-the local coder model with project context, explicit write confirmation, and
-voice-friendly interaction.
+Goal: Connect Hearth to an external coding agent (Aider, Continue.dev, or similar)
+via a thin HTTP adapter. Hearth handles voice activation, intent routing, and
+response formatting. The external agent handles all code generation, file editing,
+and agentic reasoning. Hearth does not implement any of that logic itself.
 
-The core `code_tool` architecture is established in Phase 10. This phase is for
-refining that capability after tiered memory exists, especially around retrieval
-quality, voice confirmation flows, and UI polish.
+Design rationale:
+Hearth's `code_tool` node handles code *questions* well using tree-sitter context.
+Actual code generation and file editing is a specialized problem that mature tools
+(Aider, Continue.dev) have solved better than a hand-rolled ReAct loop can. The
+correct architecture is Hearth as a voice-activated orchestrator that delegates to
+the best available tool, not Hearth as a coding agent itself.
 
-Code tool refinement decisions:
-- Keep `qwen2.5-coder:14b` as the default local coder path.
-- Preserve workspace-root enforcement on every file operation.
-- Deepen tree-sitter and ChromaDB-backed `code_context` retrieval for code intents.
-- Keep voice ergonomics confirmation-first: summarize generated changes aloud, then write only after explicit approval.
-
-Tool interface (consistent with other tools):
-```python
-# backend/tools/code.py
-async def run(params: dict) -> dict:
-    # params: { "task": str, "files": list[str], "context": str, "write": bool }
-    # returns: { "code": str, "language": str, "written_to": str | None }
+Architecture:
+```
+Voice → Hearth intent_classifier (code-write intent detected)
+  → tool_router → coding_agent_tool
+      → POST http://localhost:{CODING_AGENT_PORT}/task
+          { "task": str, "context": str, "session_id": str }
+      ← { "result": str, "files_changed": list[str], "status": str }
+  → responder (voice: summarize changes; chat: full diff/result)
+  → TTS (for voice flows)
 ```
 
-Endpoints:
+The external coding agent runs as a separate service on the local machine. Hearth
+does not manage its lifecycle — it is started independently by the user.
+
+Implementation notes:
+- New tool module: `backend/tools/coding_agent.py` following the standard
+  `async def run(params: dict) -> dict` interface.
+- `CODING_AGENT_URL` env var (default: `http://localhost:8001`). Never hardcode.
+- If the coding agent is unreachable: return a clear user-visible error, suggest
+  starting the agent service. Never silent failure.
+- Voice confirmation flow: for any task that modifies files, Hearth reads back a
+  summary of planned changes and waits for verbal confirmation before sending the
+  request. This mirrors the pattern from Phase 10b but now the confirmation gates
+  an HTTP call rather than a local file write.
+- The `code_context` ChromaDB collection built in Phase 10b can be used to inject
+  relevant project context into the task payload, improving agent results without
+  the agent needing to re-index the codebase.
+- Keep the existing `code_tool` node for code *questions*. The `coding_agent_tool`
+  is a separate node for code *write* intents. The intent classifier distinguishes
+  between them.
+
+Intent routing:
 ```
-POST /code               — generate or edit code (streaming)
-GET  /code/files         — list workspace files
-GET  /code/files/{path}  — read a file
-PUT  /code/files/{path}  — write a file (requires confirmation flag)
+"explain how this function works"  → code_tool (existing, question)
+"write a function that does X"     → coding_agent_tool (new, write)
+"fix the bug in music.py"          → coding_agent_tool (new, write)
 ```
+
+The inner monologue routing decision should distinguish between `code-question`
+and `code-write` intents. Update the intent classifier prompt accordingly.
 
 Tasks:
-- Improve code context retrieval quality for multi-file and follow-up tasks.
-- Refine confirmation-gated write flows for chat and voice usage.
-- Add voice confirmation flow for file writes.
-- Update UI with syntax highlighting, copy button, and save-to-disk actions.
+- Add `CODING_AGENT_URL` env var to `.env.example` and document.
+- Implement `backend/tools/coding_agent.py` with `async def run(params: dict) -> dict`.
+  Params: `{ "task": str, "context": str }`. Returns: `{ "result": str, "files_changed": list[str], "status": str }`.
+- Inject relevant `code_context` from ChromaDB into the task payload before sending.
+- Add `coding_agent_tool` node to the graph, wired from `tool_router` on `code-write` intent.
+- Update intent classifier prompt to distinguish `code-question` from `code-write`.
+- Implement voice confirmation gate: for `code-write`, summarize the task aloud and
+  wait for "yes / confirm / go ahead" before dispatching to the agent.
+- Handle unreachable agent: structured error log + user-visible message suggesting
+  to start the agent service.
+- Update responder node: for voice flows, compress the agent's result to a brief
+  summary of what changed; for chat flows, return the full result with file diffs.
 
 Acceptance:
-- "Computer, write a function that does X" generates code with relevant project context.
-- "Computer, continue that function from yesterday" resolves via checkpointed graph state.
-- File writes require explicit confirmation before touching disk.
-- Code tasks do not silently route to cloud unless local coder model is unavailable.
-
----
-
-### Phase 14 — Sub-agent architecture
-**Estimate: 2–4 weeks**
-**Depends on: Phase 13**
-
-Goal: For complex multi-step tasks, the assistant spawns specialist sub-agents
-rather than handling everything in a single monolithic response. This enables
-parallel execution, specialization, and self-correction through a critic loop.
-
-This is the natural evolution once Phase 10 (code agent) is stable: the planner
-node can decompose a complex request into sub-tasks and assign each to a specialist.
-
-Sub-agent roles (initial set):
-- `researcher` — retrieves information from memory, tools, and web search
-- `coder` — generates, reviews, and edits code using the coder model
-- `critic` — reviews proposed responses or code for correctness and completeness
-- `summarizer` — compresses long content for injection into working memory
-
-Orchestration pattern:
-```
-planner
-  └── task_decomposer         breaks complex request into sub-tasks
-        ├── researcher         runs in parallel
-        ├── coder              runs in parallel
-        └── critic             reviews outputs from other agents
-              └── synthesizer  assembles final response from sub-agent outputs
-```
-
-Design principles:
-- Sub-agents are LangGraph subgraphs, not separate processes. They share the
-  parent graph's state and checkpointer.
-- Each sub-agent has a maximum turn budget to prevent runaway loops.
-- The critic agent can reject and re-run another agent's output, but only once
-  per sub-task to prevent infinite loops.
-- All sub-agent reasoning is logged and inspectable.
-- Sub-agents do not have direct user-facing output — only the synthesizer does.
-
-Tasks:
-- Design sub-agent state schema and parent↔child state passing contract.
-- Implement `task_decomposer` node: local model decomposes request into typed
-  sub-tasks with assigned agent roles.
-- Implement `researcher`, `coder`, and `critic` sub-agent subgraphs.
-- Implement `synthesizer` node: assembles final response, resolves conflicts
-  between sub-agent outputs.
-- Add sub-agent observability: turn counts, agent assignments, critic rejections
-  visible in debug endpoint.
-- Add `MAX_AGENT_TURNS` env var; default to a safe low value (e.g. 5).
-
-Acceptance:
-- "Research X, then write a Python script that does Y based on what you find"
-  executes researcher and coder in parallel then synthesizes.
-- Critic rejects and re-runs a sub-task at most once.
-- Sub-agent turn budget is enforced; runaway loops are impossible.
-- Simple queries that don't need decomposition skip straight to the single-agent
-  path without overhead.
+- "Computer, write a function that does X" routes to the external coding agent,
+  not to the local ReAct loop.
+- "Computer, explain how this function works" still routes to `code_tool` (no regression).
+- Voice confirmation is required before any file-modifying task is dispatched.
+- If the coding agent service is not running, Hearth returns a clear error message.
+- The `code_context` ChromaDB slices are injected into the agent task payload.
+- Agent results are summarized for voice and returned in full for chat.
