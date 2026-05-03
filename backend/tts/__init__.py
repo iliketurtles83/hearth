@@ -148,6 +148,8 @@ def _validate_text(text: str) -> str:
 
 async def synthesize(text: str, engine_name: str | None = None) -> bytes:
     payload = _validate_text(text)
+    from tts.normalise import normalise_for_speech  # local import to keep module lightweight
+    payload = normalise_for_speech(payload) or payload
     engine = get_engine(engine_name)
     try:
         audio = await engine.synthesize(payload)
