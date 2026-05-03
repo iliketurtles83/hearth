@@ -5,17 +5,11 @@
 
   let voiceState = 'off';
 
-  const STATUS_LABELS = {
-    off: '',
-    sleeping: 'listening for "Computer,"',
-    recording: 'recording...',
-    transcribing: 'transcribing...',
-  };
-
   function setVoiceState(state) {
     voiceState = state;
-    voiceStatus.className = state === 'off' ? '' : state === 'sleeping' ? 'sleeping' : state === 'recording' ? 'recording' : 'transcribing';
-    voiceStatus.textContent = STATUS_LABELS[state] ?? '';
+    if (voiceStatus) {
+      voiceStatus.className = state === 'off' ? '' : state === 'sleeping' ? 'sleeping' : state === 'recording' ? 'recording' : 'transcribing';
+    }
     micBtn.classList.toggle('active', state !== 'off');
   }
 

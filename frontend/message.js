@@ -3,27 +3,24 @@
   const messagesInner = document.getElementById('messages-inner');
   const input = document.getElementById('message-input');
   const sendBtn = document.getElementById('send-btn');
-  const newChatBtn = document.getElementById('new-chat-btn');
   const sessionListEl = document.getElementById('session-list');
   const sessionNewBtn = document.getElementById('session-new-btn');
   const memoryListEl = document.getElementById('memory-list');
   const memoryClearBtn = document.getElementById('memory-clear-btn');
   const sidebar = document.getElementById('sidebar');
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
-  const ttsStatusEl = document.getElementById('tts-status');
   const ttsEnableBtn = document.getElementById('tts-enable-btn');
   const ttsStopBtn = document.getElementById('tts-stop-btn');
 
-  window.appUi = { messagesEl, messagesInner, input, sendBtn, newChatBtn };
+  window.appUi = { messagesEl, messagesInner, input, sendBtn };
   let currentSessionId = null;
   let creatingNewSession = false;
   let ttsAudio = null;
   let pendingVoicePlayback = null;
   let currentQueuePos = null;
 
-  function setTtsStatus(text) {
-    if (ttsStatusEl) ttsStatusEl.textContent = text;
-  }
+  // eslint-disable-next-line no-unused-vars
+  function setTtsStatus(_text) { /* text removed; mic colour conveys state */ }
 
   function stopVoicePlayback() {
     pendingVoicePlayback = null;
@@ -157,14 +154,12 @@
   });
 
   sendBtn.addEventListener('click', send);
-  newChatBtn.addEventListener('click', startNewChat);
   sessionNewBtn?.addEventListener('click', startNewChat);
   memoryClearBtn?.addEventListener('click', clearAllMemory);
 
   function setLocked(locked) {
     sendBtn.disabled = locked;
     input.disabled = locked;
-    newChatBtn.disabled = locked;
     if (sessionNewBtn) sessionNewBtn.disabled = locked;
     if (memoryClearBtn) memoryClearBtn.disabled = locked;
   }
@@ -683,7 +678,6 @@
       if (creatingNewSession) return;
 
       creatingNewSession = true;
-      if (newChatBtn) newChatBtn.disabled = true;
       if (sessionNewBtn) sessionNewBtn.disabled = true;
       setLocked(true);
       closeSidebar();
@@ -702,7 +696,6 @@
       } finally {
         creatingNewSession = false;
         setLocked(false);
-        if (newChatBtn) newChatBtn.disabled = false;
         if (sessionNewBtn) sessionNewBtn.disabled = false;
         input.focus();
       }
