@@ -122,7 +122,7 @@ MUSIC_PLAYLIST_MIN_N: int = int(os.getenv("MUSIC_PLAYLIST_MIN_N", "12"))
 MUSIC_PLAYLIST_MAX_N: int = int(os.getenv("MUSIC_PLAYLIST_MAX_N", "24"))
 MUSIC_GENRE_TREE_PATH: str = os.getenv(
     "MUSIC_GENRE_TREE_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "genre-tree.txt"),
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "genres.txt"),
 )
 
 

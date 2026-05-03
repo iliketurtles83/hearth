@@ -1,0 +1,256 @@
+Rock
+Alternative Rock
+Art Rock
+Britpop
+Dream Pop
+Emo
+Garage Rock
+Glam Rock
+Gothic Rock
+Grunge
+Hard Rock
+Indie Rock
+Krautrock
+Lo-Fi
+Math Rock
+New Wave
+Noise Pop
+Noise Rock
+Post-Punk
+Post-Rock
+Power Pop
+Progressive Rock
+Psychedelic Rock
+Punk Rock
+Shoegaze
+Soft Rock
+Southern Rock
+Space Rock
+Stoner Rock
+Surf Rock
+Symphonic Rock
+Electronic
+Ambient
+Breakbeat
+Chillwave
+Dance
+Downtempo
+Drum & Bass
+Dubstep
+Electro
+Electronica
+Experimental Electronic
+Future Bass
+Glitch
+House
+IDM
+Industrial Electronic
+Jungle
+Minimal
+Synthpop
+Synthwave
+Techno
+Trance
+Trip-Hop
+UK Garage
+Vaporwave
+Jazz
+Acid Jazz
+Avant-Garde Jazz
+Bebop
+Big Band
+Cool Jazz
+Free Jazz
+Fusion
+Hard Bop
+Jazz Funk
+Modal Jazz
+Nu Jazz
+Smooth Jazz
+Soul Jazz
+Swing
+Vocal Jazz
+Blues
+Acoustic Blues
+Chicago Blues
+Classic Blues
+Country Blues
+Delta Blues
+Electric Blues
+Jump Blues
+Modern Blues
+Piano Blues
+Texas Blues
+R&B
+Contemporary R&B
+Doo Wop
+Funk
+Gospel
+Motown
+Neo-Soul
+New Jack Swing
+Quiet Storm
+Soul
+Urban
+Hip-Hop
+Alternative Hip-Hop
+Boom Bap
+Conscious Hip-Hop
+Crunk
+Dirty South
+East Coast Hip-Hop
+Gangsta Rap
+G-Funk
+Instrumental Hip-Hop
+Jazz Rap
+Lo-Fi Hip-Hop
+Rap
+Trap
+Trip-Hop Hip-Hop
+Underground Hip-Hop
+West Coast Hip-Hop
+Pop
+Adult Contemporary
+Bubblegum Pop
+Chamber Pop
+Dance Pop
+Dream Pop Pop
+Electropop
+Europop
+Indie Pop
+J-Pop
+K-Pop
+Power Pop Pop
+Sophisti-Pop
+Synth-Pop
+Teen Pop
+Vocal Pop
+Classical
+Avant-Garde Classical
+Baroque
+Chamber Music
+Choral
+Contemporary Classical
+Early Music
+Minimalism
+Modern Classical
+Opera
+Orchestral
+Renaissance
+Romantic
+Symphony
+Folk
+Americana
+Celtic
+Contemporary Folk
+Folk Rock
+Indie Folk
+Neofolk
+Singer-Songwriter
+Traditional Folk
+World Folk
+Country
+Alt-Country
+Bluegrass
+Classic Country
+Contemporary Country
+Country Pop
+Country Rock
+Honky Tonk
+Outlaw Country
+Western Swing
+Metal
+Black Metal
+Death Metal
+Doom Metal
+Folk Metal
+Glam Metal
+Gothic Metal
+Grindcore
+Heavy Metal
+Melodic Death Metal
+Metalcore
+Nu Metal
+Post-Metal
+Power Metal
+Progressive Metal
+Sludge Metal
+Speed Metal
+Stoner Metal
+Symphonic Metal
+Thrash Metal
+Punk
+Anarcho-Punk
+Crust Punk
+Hardcore Punk
+Horror Punk
+Oi!
+Pop Punk
+Post-Punk Punk
+Psychobilly
+Ska Punk
+Skate Punk
+Street Punk
+Reggae
+Dancehall
+Dub
+Lovers Rock
+Ragga
+Reggaeton
+Roots Reggae
+Ska
+Rocksteady
+Latin
+Bachata
+Bolero
+Bossa Nova
+Cumbia
+Latin Jazz
+Latin Pop
+Mariachi
+Merengue
+Salsa
+Samba
+Tango
+Tejano
+Tropicalia
+African
+Afrobeat
+Afropop
+Highlife
+Juju
+Kwaito
+Mbalax
+Soukous
+Soundtrack
+Film Score
+Game Soundtrack
+Musical
+TV Soundtrack
+Spoken
+Audiobook
+Comedy
+Poetry
+Spoken Word
+Industrial
+Dark Ambient
+EBM
+Industrial Metal
+Industrial Rock
+Noise
+Power Electronics
+World
+Bhangra
+Fado
+Flamenco
+Klezmer
+Polka
+Qawwali
+Raga
+Tuvan Throat Singing
+Zydeco
+50s
+60s
+70s
+80s
+90s
