@@ -276,9 +276,7 @@ Open UI:
 
 This repository includes baseline review controls for security and correctness:
 
-- CI workflow: `.github/workflows/review-gates.yml`
 - Local baseline script: `scripts/review_baseline.sh`
-- PR checklist: `.github/pull_request_template.md`
 - Review checklist: `docs/review/SECURITY_CORRECTNESS_CHECKLIST.md`
 - Enforcement guide: `docs/review/ENFORCEMENT.md`
 
