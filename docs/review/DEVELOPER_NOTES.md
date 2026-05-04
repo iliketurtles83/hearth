@@ -2,29 +2,10 @@
 
 ### security
 - bring out system specific variables from code to .env
-- bring out referred folders from code to .env
+- bring out hardcoded folders from code to .env
 
 ### test files
 - get model values from .env as opposed to being declared explicitly
-
-### on android the top bar is crowded. from left to right there is
-x remove assistant text and icon
-x remove new chat. the button exists in the sidebar
-x microphone button still top right: red when active, green when transcribing, gray when idle.
-x this means that Computer, transcribing text will be removed, only microphone status.
-
-### microphone status indicator
-- currently not working properly.
-- colors for following states:
--- grey/no color when idle
--- red when recording
--- blue when actively listening
--- green when transcribing
-
-### voice
-x there has got to be an already built function that processes the text that goes to voice to fix/clean issues like:
-x spelling out 40,075 properly - e.g. forty thousand seventy five as opposed to forty, zero seven five
-x voice output text should be processed to a text that is talkable
 
 ### music playback
 - review strawberry access as opposed to mpd's own library management
@@ -34,25 +15,38 @@ x voice output text should be processed to a text that is talkable
 - i have the genres.txt and also the artist names, 'play 50s' should go through genres list first and if the genre doesnt exist it looks for artist
 
 ### Tool calls
-- when writing i could use / to trigger
-- but how would voice trigger a tool call?
+- write json for weather tool call
+- write json for music tool call
+
+## UI
+
+### microphone status indicator
+x currently not working properly. just goes to red when clicked and stays there.
+x should be colors for following states:
+x grey/no color when idle
+x red when recording
+x blue when actively listening
+x green when transcribing
+x clicking on it toggles between idle and recording
+- add one for voice generation as well, maybe yellow? or orange? 
+
 
 ### sidebar
-- hide/show sidebar: works for phone, also implement for desktop
+x hide/show sidebar: works for phone, also implement for desktop
 
 ### chats window
-- clicking on new in chat window still spawns a new session each time (still happening)
-- review how each chat title should be generated. last chat is no longer feasible.
-- delete is the letter x not delete
+x clicking on new in chat window still spawns a new session each time (still happening)
+x review how each chat title should be generated. last chat is no longer feasible.
+x delete is the letter x not delete
 - future: delete moves to chat settings menu
 - future: rename chat, also from chat settings menu
 - future: chat settings menu will pop up from a vertical three dot menu on the right of each chat title.
 - future: chat settings menu will include delete, rename, and future features like pin to top, archive, etc.
 
 ### message window
-- stop chat feature
+x stop chat feature
 
 ### music window
-- display format in artist - song, not song - artist
-- artist - song no more than one line
-- future: music could be a top or bottom bar?
+x display format in artist - song, not song - artist
+- artist - song on one line
+- future: music could be a top or bottom bar? whats the industry standard in this case? perhaps an expandable that shows queue when clicked?

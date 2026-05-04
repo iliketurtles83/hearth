@@ -168,9 +168,10 @@ Create `.env` in the repo root. Example:
 
 ```bash
 # Model routing
-MODEL_LOCAL=llama3.2
+ANTHROPIC_API_KEY=your_key_here
+OLLAMA_CHAT_MODEL=gemma4:e4b
+OLLAMA_CODER_MODEL=qwen2.5-coder:14b
 MODEL_CLOUD=claude-sonnet-4-20250514
-ROUTE_CONFIDENCE_THRESHOLD=0.55
 
 # Chat / coder model split (Phase 4b)
 # OLLAMA_CHAT_MODEL overrides MODEL_LOCAL for general chat.
