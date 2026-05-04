@@ -365,6 +365,7 @@ def artist_radio(
     weights = [max(s["playcount"], 1) for s in songs]
     rng = random.Random(seed if seed is not None else int(time.time()))
     pick_count = _playlist_pick_count(len(songs), requested_n=n)
+    log.info("artist_radio | artist=%r pool=%d picking=%d", artist, len(songs), pick_count)
 
     # Weighted sample with de-duplication.
     seen: set[int] = set()
@@ -609,6 +610,7 @@ _GENERIC_TITLE_RE = re.compile(
 def _load_genre_terms() -> tuple[str, ...]:
     """Load canonical genre terms from the taxonomy file."""
     if not os.path.isfile(MUSIC_GENRE_TREE_PATH):
+        log.warning("music.genre_terms_missing | path=%s", MUSIC_GENRE_TREE_PATH)
         return ()
 
     terms: list[str] = []
@@ -620,7 +622,9 @@ def _load_genre_terms() -> tuple[str, ...]:
             terms.append(s.lower())
 
     # Longer tokens first so "progressive rock" wins over "rock".
-    return tuple(sorted(set(terms), key=len, reverse=True))
+    resolved = tuple(sorted(set(terms), key=len, reverse=True))
+    log.info("music.genre_terms_loaded | path=%s terms=%d", MUSIC_GENRE_TREE_PATH, len(resolved))
+    return resolved
 
 
 def _normalize_music_query(text: str) -> str:
@@ -864,6 +868,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
         try:
             await asyncio.to_thread(_sync_play_tracks, tracks)
+        except FileNotFoundError as exc:
+            log.warning("music.artist_radio | library_miss=%s", exc)
+            return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
         except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
             log.warning("music.artist_radio | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -898,6 +905,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 else:
                     await asyncio.to_thread(_sync_play, top["url"])
                     return ToolResult(ok=True, data={"action": "play", "track": top, "tracks": None, "confidence": confidence, "picked_from": len(results)})
+            except FileNotFoundError as exc:
+                log.warning("music.title_artist_play | library_miss=%s", exc)
+                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.title_artist_play | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -913,6 +923,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
         if tracks:
             try:
                 await asyncio.to_thread(_sync_play_tracks, tracks)
+            except FileNotFoundError as exc:
+                log.warning("music.title_artist_radio_fallback | library_miss=%s", exc)
+                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.title_artist_radio_fallback | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -943,6 +956,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
         )
         try:
             await asyncio.to_thread(_sync_play_tracks, tracks)
+        except FileNotFoundError as exc:
+            log.warning("music.year_range_play | library_miss=%s", exc)
+            return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
         except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
             log.warning("music.year_range_play | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -975,6 +991,22 @@ async def run(params: dict[str, Any]) -> ToolResult:
 
     # Genre-first resolver path for ambiguous playback requests.
     genre_match = _resolve_genre_query(q)
+    if not genre_match and action != "queue":
+        # Safety-net: if taxonomy matching misses, probe DB genre column directly.
+        try:
+            probe_genre_tracks = await asyncio.to_thread(_sync_genre_songs, q)
+        except sqlite3.OperationalError:
+            return ToolResult.failure(
+                "Music library is temporarily locked (scan in progress). Please retry.",
+                retryable=True,
+            )
+        if probe_genre_tracks:
+            genre_match = q
+            log.info(
+                "music.play | genre_db_probe_hit query=%r matches=%d",
+                q,
+                len(probe_genre_tracks),
+            )
     if genre_match and action != "queue":
         log.info("music.play | genre_first query=%r genre=%r", q, genre_match)
         try:
@@ -987,6 +1019,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
         if tracks:
             try:
                 await asyncio.to_thread(_sync_play_tracks, tracks)
+            except FileNotFoundError as exc:
+                log.warning("music.genre_radio | library_miss=%s", exc)
+                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.genre_radio | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -997,6 +1032,42 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 "confidence": 0.9,
                 "picked_from": len(tracks),
             })
+        # Genre returned nothing — for decade terms, fall back to year column.
+        _decade_m = re.match(r"^(\d{2})s$", genre_match)
+        if _decade_m:
+            _d = int(_decade_m.group(1))
+            _yr = (2000 + _d) if _d < 30 else (1900 + _d)
+            _yr_start, _yr_end = _yr, _yr + 9
+            log.info(
+                "music.play | genre_miss decade=%r falling_back_to_year range=%d-%d",
+                genre_match, _yr_start, _yr_end,
+            )
+            try:
+                _year_tracks = await asyncio.to_thread(_sync_search_by_year_range, _yr_start, _yr_end)
+            except sqlite3.OperationalError:
+                return ToolResult.failure(
+                    "Music library is temporarily locked (scan in progress). Please retry.",
+                    retryable=True,
+                )
+            if _year_tracks:
+                _rng = random.Random(int(time.time()))
+                _n_pick = _playlist_pick_count(len(_year_tracks), requested_n=None)
+                tracks = _rng.sample(_year_tracks, _n_pick)
+                try:
+                    await asyncio.to_thread(_sync_play_tracks, tracks)
+                except FileNotFoundError as exc:
+                    log.warning("music.decade_year_fallback | library_miss=%s", exc)
+                    return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+                except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+                    log.warning("music.decade_year_fallback | mpd_error=%s", exc)
+                    return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+                return ToolResult(ok=True, data={
+                    "action": "play",
+                    "track": tracks[0],
+                    "tracks": tracks,
+                    "confidence": 0.9,
+                    "picked_from": len(_year_tracks),
+                })
 
     try:
         results = await asyncio.to_thread(_sync_search, q)
@@ -1022,6 +1093,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
         try:
             await asyncio.to_thread(_sync_play_tracks, tracks)
+        except FileNotFoundError as exc:
+            log.warning("music.artist_radio_fallback | library_miss=%s", exc)
+            return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
         except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
             log.warning("music.artist_radio_fallback | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -1038,16 +1112,20 @@ async def run(params: dict[str, Any]) -> ToolResult:
     # single-picking the top LIKE result.
     #
     # Criteria (both must be true):
-    #   1. The normalised query doesn't appear in any of the top-5 result titles
-    #      (i.e. no title match → the LIKE hit was on artist/album, not title).
+    #   1. The normalised query doesn't appear in the top result's title
+    #      (i.e. no title match → the LIKE hit was on artist, not title).
     #   2. The normalised query does appear in the top result's artist field
     #      (confirms it's an artist search, not e.g. an album search).
     #
     # Strip common genre suffixes ("music", "songs", "tracks") before comparing
     # so "classical music" matches artist "Classical".
     _q_norm = _normalize_music_query(q)
-    _title_miss = not any(_q_norm in r["title"].lower() for r in results[:5])
+    _title_miss = _q_norm not in results[0]["title"].lower()
     _artist_hit = _q_norm in results[0]["artist"].lower()
+    log.info(
+        "music.play | heuristic_check query_norm=%r title_miss=%s artist_hit=%s action=%s | top_title=%r top_artist=%r",
+        _q_norm, _title_miss, _artist_hit, action, results[0]["title"].lower(), results[0]["artist"].lower(),
+    )
     if _title_miss and _artist_hit and action != "queue":
         log.info(
             "music.play | artist_radio_heuristic query=%r artist=%r candidates=%d",
@@ -1063,6 +1141,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
         if tracks:
             try:
                 await asyncio.to_thread(_sync_play_tracks, tracks)
+            except FileNotFoundError as exc:
+                log.warning("music.artist_radio_heuristic | library_miss=%s", exc)
+                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.artist_radio_heuristic | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -1076,33 +1157,64 @@ async def run(params: dict[str, Any]) -> ToolResult:
         # artist_radio returned nothing (shouldn't happen if LIKE found results,
         # but fall through to single-pick as safety net).
 
-    # Auto-pick: top-ranked LIKE result.  Confidence logged server-side.
-    top = results[0]
-    confidence = top.get("score", 0.9)
-    log.info(
-        "music.auto_pick | query=%r picked=%r artist=%r confidence=%.3f candidates=%d",
-        q, top["title"], top["artist"], confidence, len(results),
-    )
+    # Auto-pick with availability fallback:
+    # try ranked candidates in order, skipping stale Strawberry rows that MPD
+    # no longer serves.
+    first_missing: Exception | None = None
+    for i, candidate in enumerate(results, start=1):
+        confidence = candidate.get("score", 0.9)
+        try:
+            if action == "queue":
+                await asyncio.to_thread(_sync_queue, candidate["url"])
+                log.info(
+                    "music.auto_pick | query=%r picked=%r artist=%r confidence=%.3f candidates=%d index=%d",
+                    q,
+                    candidate["title"],
+                    candidate["artist"],
+                    confidence,
+                    len(results),
+                    i,
+                )
+                return ToolResult(ok=True, data={
+                    "action": "queue", "track": candidate, "tracks": None,
+                    "confidence": confidence, "picked_from": len(results),
+                })
+            await asyncio.to_thread(_sync_play, candidate["url"])
+            log.info(
+                "music.auto_pick | query=%r picked=%r artist=%r confidence=%.3f candidates=%d index=%d",
+                q,
+                candidate["title"],
+                candidate["artist"],
+                confidence,
+                len(results),
+                i,
+            )
+            return ToolResult(ok=True, data={
+                "action": "play", "track": candidate, "tracks": None,
+                "confidence": confidence, "picked_from": len(results),
+            })
+        except FileNotFoundError as exc:
+            if first_missing is None:
+                first_missing = exc
+            log.warning(
+                "music.auto_pick_skip_missing | query=%r index=%d title=%r error=%s",
+                q,
+                i,
+                candidate.get("title", ""),
+                exc,
+            )
+            continue
+        except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+            log.warning("music.play | mpd_error=%s", exc)
+            return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+        except Exception as exc:
+            log.error("music.play | unexpected=%s", exc)
+            return ToolResult.failure(str(exc), retryable=False)
 
-    try:
-        if action == "queue":
-            await asyncio.to_thread(_sync_queue, top["url"])
-            return ToolResult(ok=True, data={
-                "action": "queue", "track": top, "tracks": None,
-                "confidence": confidence, "picked_from": len(results),
-            })
-        else:
-            await asyncio.to_thread(_sync_play, top["url"])
-            return ToolResult(ok=True, data={
-                "action": "play", "track": top, "tracks": None,
-                "confidence": confidence, "picked_from": len(results),
-            })
-    except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
-        log.warning("music.play | mpd_error=%s", exc)
-        return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
-    except Exception as exc:
-        log.error("music.play | unexpected=%s", exc)
-        return ToolResult.failure(str(exc), retryable=False)
+    if first_missing is not None:
+        log.warning("music.play | library_miss=%s", first_missing)
+        return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+    return ToolResult.failure(f"No tracks or artists found matching '{q}'.", retryable=False)
 
 
 # Self-register when the module is imported.
