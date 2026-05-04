@@ -3,6 +3,7 @@
   const messagesInner = document.getElementById('messages-inner');
   const input = document.getElementById('message-input');
   const sendBtn = document.getElementById('send-btn');
+  const stopBtn = document.getElementById('stop-btn');
   const sessionListEl = document.getElementById('session-list');
   const sessionNewBtn = document.getElementById('session-new-btn');
   const memoryListEl = document.getElementById('memory-list');
@@ -18,6 +19,7 @@
   let ttsAudio = null;
   let pendingVoicePlayback = null;
   let currentQueuePos = null;
+  let _currentAbortController = null;
 
   // eslint-disable-next-line no-unused-vars
   function setTtsStatus(_text) { /* text removed; mic colour conveys state */ }
@@ -119,9 +121,13 @@
   }
 
   function toggleSidebar() {
-    if (!isMobileLayout()) return;
-    const isOpen = document.body.classList.toggle('sidebar-open');
-    sidebarToggleBtn?.setAttribute('aria-expanded', String(isOpen));
+    if (isMobileLayout()) {
+      const isOpen = document.body.classList.toggle('sidebar-open');
+      sidebarToggleBtn?.setAttribute('aria-expanded', String(isOpen));
+    } else {
+      const isCollapsed = document.body.classList.toggle('sidebar-collapsed');
+      sidebarToggleBtn?.setAttribute('aria-expanded', String(!isCollapsed));
+    }
   }
 
   sidebarToggleBtn?.addEventListener('click', (e) => {
@@ -162,7 +168,13 @@
     input.disabled = locked;
     if (sessionNewBtn) sessionNewBtn.disabled = locked;
     if (memoryClearBtn) memoryClearBtn.disabled = locked;
+    if (stopBtn) stopBtn.style.display = locked ? 'flex' : 'none';
+    sendBtn.style.display = locked ? 'none' : 'flex';
   }
+
+  stopBtn?.addEventListener('click', () => {
+    _currentAbortController?.abort();
+  });
 
   ttsEnableBtn?.addEventListener('click', async () => {
     const pending = pendingVoicePlayback;
@@ -310,7 +322,7 @@
       item.innerHTML = `
         <div class="session-row">
           <div class="list-item-title session-title">${_esc((session.preview || 'New session').slice(0, 80))}</div>
-          <button class="memory-delete-btn session-delete-btn" data-sid="${session.session_id}">Delete</button>
+          <button class="memory-delete-btn session-delete-btn" data-sid="${session.session_id}" title="Delete session">&times;</button>
         </div>
       `;
       item.addEventListener('click', () => selectSession(session.session_id));
@@ -400,7 +412,7 @@
       currentQueuePos = Number.isInteger(data.pos) ? data.pos : null;
       if (data.track && data.state !== 'stop') {
         const t = data.track;
-        const parts = [t.title, t.artist].filter(Boolean);
+        const parts = [t.artist, t.title].filter(Boolean);
         label.textContent = parts.join(' — ');
         label.classList.remove('now-playing-idle');
         if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
@@ -432,7 +444,7 @@
         return;
       }
       list.innerHTML = items.map(item => {
-        const label = [item.title, item.artist].filter(Boolean).join(' — ') || 'Unknown track';
+        const label = [item.artist, item.title].filter(Boolean).join(' — ') || 'Unknown track';
         const active = currentQueuePos === item.pos ? ' active-track' : '';
         return `<div class="list-item list-item-clickable${active}" data-pos="${item.pos}" title="Play this track"><span class="list-item-title">${_esc(label)}</span></div>`;
       }).join('');
@@ -589,12 +601,15 @@
 
     let accumulated = '';
     let voiceMeta = null;
+    const abortController = new AbortController();
+    _currentAbortController = abortController;
 
     try {
       const resp = await (window.apiFetch || fetch)('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
+        signal: abortController.signal,
         body: JSON.stringify({ message: text, source }),
       });
 
@@ -661,8 +676,13 @@
         });
       }
     } catch (err) {
-      bubble.textContent = `⚠ ${err.message}`;
+      if (err.name === 'AbortError') {
+        // user stopped generation — leave partial response as-is
+      } else {
+        bubble.textContent = `⚠ ${err.message}`;
+      }
     } finally {
+      _currentAbortController = null;
       cursor.remove();
       setLocked(false);
       input.focus();
@@ -676,6 +696,15 @@
       event?.preventDefault?.();
       event?.stopPropagation?.();
       if (creatingNewSession) return;
+
+      // If the current session is already empty, don't create a duplicate.
+      const isEmpty = messagesInner.querySelector('#empty-state') !== null &&
+                      messagesInner.children.length === 1;
+      if (isEmpty) {
+        closeSidebar();
+        input.focus();
+        return;
+      }
 
       creatingNewSession = true;
       if (sessionNewBtn) sessionNewBtn.disabled = true;

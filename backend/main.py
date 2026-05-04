@@ -773,7 +773,7 @@ def _should_inject_memory(decision_intent: str, memory_hits: list[dict], user_me
 
 
 def _session_preview_text(messages: list[dict]) -> str:
-    for msg in reversed(messages):
+    for msg in messages:
         if msg.get("role") == "user":
             return msg.get("content", "")[:80]
     return ""

@@ -587,6 +587,23 @@ header h1 {
 #send-btn:disabled { opacity: 0.35; cursor: not-allowed; }
 #send-btn svg { width: 17px; height: 17px; }
 
+#stop-btn {
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  width: 42px;
+  height: 42px;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+#stop-btn:hover { color: #fa5252; border-color: #fa5252; background: rgba(250, 82, 82, 0.08); }
+#stop-btn svg { width: 14px; height: 14px; }
+
 #mic-btn {
   background: none;
   border: 1px solid var(--border);
@@ -604,7 +621,9 @@ header h1 {
 }
 
 #mic-btn:hover { color: var(--text); border-color: var(--text-muted); }
-#mic-btn.active { color: #fa5252; border-color: #fa5252; background: rgba(250, 82, 82, 0.1); }
+#mic-btn.state-sleeping { color: var(--accent); border-color: var(--accent); background: rgba(108, 138, 255, 0.1); }
+#mic-btn.state-recording { color: #fa5252; border-color: #fa5252; background: rgba(250, 82, 82, 0.1); }
+#mic-btn.state-transcribing { color: var(--model-local); border-color: var(--model-local); background: rgba(64, 192, 87, 0.1); }
 #mic-btn svg { width: 15px; height: 15px; }
 
 #new-chat-btn {
@@ -669,6 +688,16 @@ header h1 {
 #sidebar-toggle-btn svg {
   width: 15px;
   height: 15px;
+}
+
+@media (min-width: 901px) {
+  #sidebar-toggle-btn {
+    display: inline-flex;
+  }
+
+  body.sidebar-collapsed #sidebar {
+    display: none;
+  }
 }
 
 @media (max-width: 900px) {

@@ -7,10 +7,8 @@
 
   function setVoiceState(state) {
     voiceState = state;
-    if (voiceStatus) {
-      voiceStatus.className = state === 'off' ? '' : state === 'sleeping' ? 'sleeping' : state === 'recording' ? 'recording' : 'transcribing';
-    }
-    micBtn.classList.toggle('active', state !== 'off');
+    micBtn.classList.remove('state-sleeping', 'state-recording', 'state-transcribing');
+    if (state !== 'off') micBtn.classList.add(`state-${state}`);
   }
 
   function encodeWAV(samples) {
