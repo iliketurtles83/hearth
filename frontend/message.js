@@ -8,6 +8,11 @@
   const sessionNewBtn = document.getElementById('session-new-btn');
   const memoryListEl = document.getElementById('memory-list');
   const memoryClearBtn = document.getElementById('memory-clear-btn');
+  const memoryPanel = document.getElementById('memory-panel');
+  const memoryCollapseBtn = document.getElementById('memory-collapse-btn');
+  const musicPanel = document.getElementById('music-panel');
+  const musicCollapseBtn = document.getElementById('music-collapse-btn');
+  const musicCollapsedNowPlayingEl = document.getElementById('music-collapsed-now-playing');
   const sidebar = document.getElementById('sidebar');
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
   const ttsEnableBtn = document.getElementById('tts-enable-btn');
@@ -113,6 +118,28 @@
 
   function isMobileLayout() {
     return window.matchMedia('(max-width: 900px)').matches;
+  }
+
+  function setPanelCollapsed(panelEl, collapseBtnEl, collapsed) {
+    if (!panelEl || !collapseBtnEl) return;
+    panelEl.classList.toggle('is-collapsed', collapsed);
+    collapseBtnEl.textContent = collapsed ? '▸' : '▾';
+    collapseBtnEl.setAttribute('aria-expanded', String(!collapsed));
+    collapseBtnEl.title = `${collapsed ? 'Expand' : 'Collapse'} ${panelEl.id === 'music-panel' ? 'music' : 'memory'} section`;
+  }
+
+  function _bindCollapsiblePanels() {
+    memoryCollapseBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const collapsed = !memoryPanel?.classList.contains('is-collapsed');
+      setPanelCollapsed(memoryPanel, memoryCollapseBtn, collapsed);
+    });
+
+    musicCollapseBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const collapsed = !musicPanel?.classList.contains('is-collapsed');
+      setPanelCollapsed(musicPanel, musicCollapseBtn, collapsed);
+    });
   }
 
   function closeSidebar() {
@@ -413,12 +440,17 @@
       if (data.track && data.state !== 'stop') {
         const t = data.track;
         const parts = [t.artist, t.title].filter(Boolean);
-        label.textContent = parts.join(' — ');
+        const nowPlayingText = parts.join(' — ');
+        label.textContent = nowPlayingText;
+        if (musicCollapsedNowPlayingEl) musicCollapsedNowPlayingEl.textContent = nowPlayingText;
         label.classList.remove('now-playing-idle');
+        musicCollapsedNowPlayingEl?.classList.remove('now-playing-idle');
         if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
       } else {
         label.textContent = 'Nothing playing';
+        if (musicCollapsedNowPlayingEl) musicCollapsedNowPlayingEl.textContent = 'Nothing playing';
         label.classList.add('now-playing-idle');
+        musicCollapsedNowPlayingEl?.classList.add('now-playing-idle');
         if (btn) btn.textContent = '▶';
       }
       if (volumeInput && Number.isFinite(data.volume)) {
@@ -731,6 +763,7 @@
   }
 
   async function bootstrap() {
+    _bindCollapsiblePanels();
     await Promise.all([refreshSessions(), refreshMemory()]);
     await loadCurrentSessionMessages();
     refreshNowPlaying();

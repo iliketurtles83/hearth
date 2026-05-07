@@ -2,12 +2,12 @@
 Tests for backend/tools/music.py — Phase 8.
 
 Covers:
-  - Strawberry scan-lock handling (sqlite3.OperationalError → retryable ToolResult)
+  - Beets DB lock handling (sqlite3.OperationalError → retryable ToolResult)
   - MPD reconnect-once policy (first connect fails, retry succeeds)
   - MPD total connection failure → retryable ToolResult
-  - Search returns ranked results (ordered by playcount)
+  - Search returns ranked results (ordered by rating)
   - Artist radio: weighted-random selection seeded for determinism
-  - Path rewrite (_url_to_mpd_path)
+  - Path rewrite (_url_to_mpd_path, Beets filesystem paths)
   - Standardized error shape from music endpoints (/music/control, /music/now_playing, etc.)
   - Auto-pick: top-ranked result is selected when multiple matches exist
   - Artist radio fallback when no LIKE results found
@@ -120,10 +120,10 @@ sys.modules["tools.base"] = _fake_base
 import importlib
 import os
 
-os.environ.setdefault("STRAWBERRY_DB_PATH", "/nonexistent/test.db")
+os.environ.setdefault("BEETS_DB_PATH", "/nonexistent/test.db")
 os.environ.setdefault("MPD_HOST", "localhost")
 os.environ.setdefault("MPD_PORT", "6600")
-os.environ.setdefault("MUSIC_PATH_HOST", "/media/jack/buffer/audio")
+os.environ.setdefault("MUSIC_ROOT", "/media/jack/buffer/audio")
 
 import tools.music as music  # noqa: E402  (must come after stubs)
 
@@ -144,20 +144,21 @@ def _make_rows(records: list[dict]) -> list[sqlite3.Row]:
 # ── Path rewrite tests ─────────────────────────────────────────────────────────
 
 def test_url_to_mpd_path_standard():
-    url = "file:///media/jack/buffer/audio/rock/artist/song.mp3"
+    url = "/media/jack/buffer/audio/rock/artist/song.mp3"
     assert music._url_to_mpd_path(url) == "rock/artist/song.mp3"
 
 
-def test_url_to_mpd_path_percent_encoded():
-    url = "file:///media/jack/buffer/audio/rock/The%20Band/My%20Song.mp3"
-    assert music._url_to_mpd_path(url) == "rock/The Band/My Song.mp3"
+def test_url_to_mpd_path_bytes_path():
+    """Beets items.path may be stored as bytes; decoded path strips MUSIC_ROOT."""
+    path_bytes = b"/media/jack/buffer/audio/rock/The Band/My Song.mp3"
+    assert music._url_to_mpd_path(path_bytes) == "rock/The Band/My Song.mp3"
 
 
 def test_url_to_mpd_path_no_prefix_match():
-    """Paths that don't match MUSIC_PATH_HOST are returned as-is after stripping file://."""
-    url = "file:///other/path/song.mp3"
-    result = music._url_to_mpd_path(url)
-    assert result == "other/path/song.mp3"
+    """Paths that don't match MUSIC_ROOT are returned stripped of leading slash."""
+    path = "/other/root/song.mp3"
+    result = music._url_to_mpd_path(path)
+    assert result == "other/root/song.mp3"
 
 
 def test_url_to_mpd_path_no_file_prefix():
@@ -167,7 +168,15 @@ def test_url_to_mpd_path_no_file_prefix():
     assert result == "song.mp3"
 
 
-# ── Strawberry scan-lock handling ──────────────────────────────────────────────
+def test_url_to_mpd_path_strips_host_root_when_container_root_differs(monkeypatch):
+    """When Beets stores host paths, strip MUSIC_PATH_HOST if MUSIC_ROOT does not match."""
+    monkeypatch.setattr(music, "MUSIC_ROOT", "/music")
+    monkeypatch.setattr(music, "MUSIC_PATH_HOST", "/media/jack/buffer/audio")
+    url = "/media/jack/buffer/audio/metal/Metallica/Battery.mp3"
+    assert music._url_to_mpd_path(url) == "metal/Metallica/Battery.mp3"
+
+
+# ── DB lock handling ──────────────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_search_db_locked_returns_retryable():
@@ -176,7 +185,7 @@ async def test_search_db_locked_returns_retryable():
         result = await music.run({"action": "search", "query": "test", "prompt": "test"})
     assert not result.ok
     assert result.retryable
-    assert "locked" in result.error.lower()
+    assert "unavailable" in result.error.lower() or "retry" in result.error.lower()
 
 
 @pytest.mark.asyncio
@@ -223,7 +232,7 @@ def test_mpd_connect_raises_after_two_failures():
 @pytest.mark.asyncio
 async def test_play_mpd_total_failure_returns_retryable():
     """MPD connection failure during play → retryable ToolResult."""
-    fake_track = {"id": 1, "title": "T", "artist": "A", "album": "B", "url": "file:///media/jack/buffer/audio/t.mp3", "score": 0.9}
+    fake_track = {"id": 1, "title": "T", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/t.mp3", "score": 0.9}
     with (
         patch.object(music, "_sync_search", return_value=[fake_track]),
         patch.object(music, "_sync_play", side_effect=ConnectionRefusedError("mpd down")),
@@ -237,10 +246,10 @@ async def test_play_mpd_total_failure_returns_retryable():
 
 @pytest.mark.asyncio
 async def test_search_returns_ranked_results():
-    """Search results are returned in playcount-descending order."""
+    """Search results are returned in rating-descending order."""
     ranked = [
-        {"id": 1, "title": "Popular Song", "artist": "Artist", "album": "Album", "url": "file:///media/jack/buffer/audio/a.mp3", "score": 0.9},
-        {"id": 2, "title": "Obscure Song", "artist": "Artist", "album": "Album", "url": "file:///media/jack/buffer/audio/b.mp3", "score": 0.76},
+        {"id": 1, "title": "Popular Song", "artist": "Artist", "album": "Album", "url": "/media/jack/buffer/audio/a.mp3", "score": 0.9},
+        {"id": 2, "title": "Obscure Song", "artist": "Artist", "album": "Album", "url": "/media/jack/buffer/audio/b.mp3", "score": 0.76},
     ]
     with patch.object(music, "_sync_search", return_value=ranked):
         result = await music.run({"action": "search", "query": "artist", "prompt": "artist"})
@@ -255,7 +264,7 @@ def test_artist_radio_seeded_determinism():
     """Same seed always returns the same track list."""
     songs = [
         {"id": i, "title": f"Song {i}", "artist": "TestBand", "album": "A",
-         "url": f"file:///media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "playcount": i * 10}
+         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "rating": i * 10}
         for i in range(1, 20)
     ]
     with patch.object(music, "_sync_artist_songs", return_value=songs):
@@ -269,7 +278,7 @@ def test_artist_radio_no_duplicates():
     """Artist radio never returns the same song twice."""
     songs = [
         {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
-         "url": f"file:///media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "playcount": 1}
+         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "rating": 1}
         for i in range(1, 8)
     ]
     with patch.object(music, "_sync_artist_songs", return_value=songs):
@@ -294,7 +303,7 @@ def test_artist_radio_default_target_is_adaptive(monkeypatch):
     monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
     songs = [
         {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
-         "url": f"file:///media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "playcount": i}
+         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "rating": i}
         for i in range(1, 41)
     ]
     with patch.object(music, "_sync_artist_songs", return_value=songs):
@@ -324,8 +333,8 @@ def test_resolve_genre_query_matches_taxonomy_term(monkeypatch):
 @pytest.mark.asyncio
 async def test_play_prefers_genre_first_when_query_matches_known_genre(monkeypatch):
     tracks = [
-        {"id": 1, "title": "Track 1", "artist": "Band", "album": "A", "url": "file:///media/jack/buffer/audio/t1.mp3", "score": 0.0, "playcount": 10},
-        {"id": 2, "title": "Track 2", "artist": "Band", "album": "A", "url": "file:///media/jack/buffer/audio/t2.mp3", "score": 0.0, "playcount": 8},
+        {"id": 1, "title": "Track 1", "artist": "Band", "album": "A", "url": "/media/jack/buffer/audio/t1.mp3", "score": 0.0, "rating": 10},
+        {"id": 2, "title": "Track 2", "artist": "Band", "album": "A", "url": "/media/jack/buffer/audio/t2.mp3", "score": 0.0, "rating": 8},
     ]
     monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: "metal")
 
@@ -345,16 +354,17 @@ async def test_play_prefers_genre_first_when_query_matches_known_genre(monkeypat
 @pytest.mark.asyncio
 async def test_play_michael_jackson_uses_artist_heuristic_when_not_genre(monkeypatch):
     search_results = [
-        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "file:///media/jack/buffer/audio/bj.mp3", "score": 0.9},
-        {"id": 11, "title": "Beat It", "artist": "Michael Jackson", "album": "Thriller", "url": "file:///media/jack/buffer/audio/bi.mp3", "score": 0.8},
+        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "/media/jack/buffer/audio/bj.mp3", "score": 0.9},
+        {"id": 11, "title": "Beat It", "artist": "Michael Jackson", "album": "Thriller", "url": "/media/jack/buffer/audio/bi.mp3", "score": 0.8},
     ]
     radio_tracks = [
-        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "file:///media/jack/buffer/audio/bj.mp3", "score": 0.0, "playcount": 100},
+        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "/media/jack/buffer/audio/bj.mp3", "score": 0.0, "rating": 100},
     ]
     monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: None)
 
     with (
         patch.object(music, "_sync_search", return_value=search_results),
+        patch.object(music, "_sync_genre_songs", return_value=[]),
         patch.object(music, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
         patch.object(music, "_sync_play_tracks", return_value=None),
     ):
@@ -366,7 +376,7 @@ async def test_play_michael_jackson_uses_artist_heuristic_when_not_genre(monkeyp
 
 
 def test_sync_play_tracks_skips_missing_mpd_paths():
-    """Artist radio should skip stale Strawberry rows instead of aborting playback."""
+    """Tracks with missing MPD paths are skipped rather than aborting playback."""
 
     class ClientWithMissingPath(_FakeMPDClient):
         def __init__(self):
@@ -383,9 +393,9 @@ def test_sync_play_tracks_skips_missing_mpd_paths():
 
     client = ClientWithMissingPath()
     tracks = [
-        {"url": "file:///media/jack/buffer/audio/ok/song1.mp3"},
-        {"url": "file:///media/jack/buffer/audio/missing/song.mp3"},
-        {"url": "file:///media/jack/buffer/audio/ok/song2.mp3"},
+        {"url": "/media/jack/buffer/audio/ok/song1.mp3"},
+        {"url": "/media/jack/buffer/audio/missing/song.mp3"},
+        {"url": "/media/jack/buffer/audio/ok/song2.mp3"},
     ]
 
     with patch.object(music, "_mpd_connect", return_value=client):
@@ -400,10 +410,11 @@ async def test_play_falls_back_to_artist_radio():
     """When LIKE search returns nothing, fall back to artist radio."""
     tracks = [
         {"id": 1, "title": "Song", "artist": "Band", "album": "A",
-         "url": "file:///media/jack/buffer/audio/s.mp3", "score": 0.0, "playcount": 1}
+         "url": "/media/jack/buffer/audio/s.mp3", "score": 0.0, "rating": 1}
     ]
     with (
         patch.object(music, "_sync_search", return_value=[]),
+        patch.object(music, "_sync_genre_songs", return_value=[]),
         patch.object(music, "artist_radio", return_value=tracks),
         patch.object(music, "_sync_play_tracks", return_value=None),
     ):
@@ -412,17 +423,94 @@ async def test_play_falls_back_to_artist_radio():
     assert result.data["action"] == "play"
 
 
+@pytest.mark.asyncio
+async def test_queue_artist_param_uses_queue_tracks_not_play_tracks():
+    tracks = [
+        {"id": 1, "title": "Song", "artist": "Band", "album": "A",
+         "url": "/media/jack/buffer/audio/s.mp3", "score": 0.0, "rating": 1}
+    ]
+    with (
+        patch.object(music, "artist_radio", return_value=tracks),
+        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+    ):
+        result = await music.run({"action": "queue", "artist": "Band", "prompt": "queue band"})
+    assert result.ok
+    assert result.data["action"] == "queue"
+    queue_tracks_mock.assert_called_once_with(tracks)
+
+
+@pytest.mark.asyncio
+async def test_queue_title_artist_miss_falls_back_to_queue_tracks():
+    tracks = [
+        {"id": 3, "title": "Song 3", "artist": "Band", "album": "A",
+         "url": "/media/jack/buffer/audio/s3.mp3", "score": 0.0, "rating": 1}
+    ]
+    with (
+        patch.object(music, "_sync_search_by_title_artist", return_value=[]),
+        patch.object(music, "artist_radio", return_value=tracks),
+        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+    ):
+        result = await music.run({
+            "action": "queue",
+            "query": "missing title",
+            "artist_filter": "Band",
+            "prompt": "queue missing title by band",
+        })
+    assert result.ok
+    assert result.data["action"] == "queue"
+    queue_tracks_mock.assert_called_once_with(tracks)
+
+
+@pytest.mark.asyncio
+async def test_queue_year_range_uses_queue_tracks_not_play_tracks():
+    pool = [
+        {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
+         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.9}
+        for i in range(1, 7)
+    ]
+    with (
+        patch.object(music, "_sync_search_by_year_range", return_value=pool),
+        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+    ):
+        result = await music.run({"action": "queue", "year_range": (1990, 1999), "prompt": "queue 90s"})
+    assert result.ok
+    assert result.data["action"] == "queue"
+    assert queue_tracks_mock.called
+
+
+@pytest.mark.asyncio
+async def test_queue_no_results_falls_back_to_queue_tracks():
+    tracks = [
+        {"id": 2, "title": "Song", "artist": "Band", "album": "A",
+         "url": "/media/jack/buffer/audio/s2.mp3", "score": 0.0, "rating": 1}
+    ]
+    with (
+        patch.object(music, "_sync_search", return_value=[]),
+        patch.object(music, "artist_radio", return_value=tracks),
+        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+    ):
+        result = await music.run({"action": "queue", "query": "Band", "prompt": "queue band"})
+    assert result.ok
+    assert result.data["action"] == "queue"
+    queue_tracks_mock.assert_called_once_with(tracks)
+
+
 # ── Auto-pick: top-ranked result ───────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_auto_pick_selects_first_result():
     """Multiple search results → auto-pick first (highest ranked)."""
     results = [
-        {"id": 10, "title": "Hit Song", "artist": "A", "album": "B", "url": "file:///media/jack/buffer/audio/hit.mp3", "score": 0.9},
-        {"id": 11, "title": "Other Song", "artist": "A", "album": "B", "url": "file:///media/jack/buffer/audio/other.mp3", "score": 0.76},
+        {"id": 10, "title": "Hit Song", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/hit.mp3", "score": 0.9},
+        {"id": 11, "title": "Other Song", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/other.mp3", "score": 0.76},
     ]
     with (
         patch.object(music, "_sync_search", return_value=results),
+        patch.object(music, "_sync_genre_songs", return_value=[]),
         patch.object(music, "_sync_play", return_value=None),
     ):
         result = await music.run({"action": "play", "query": "hit", "prompt": "play hit"})
@@ -495,8 +583,8 @@ def test_sync_now_playing_includes_pos_and_volume():
 
 @pytest.mark.asyncio
 async def test_song_id_resolution():
-    """Direct song_id lookup bypasses search and plays by rowid."""
-    track = {"id": 42, "title": "Direct Track", "artist": "A", "album": "B", "url": "file:///media/jack/buffer/audio/d.mp3", "score": 1.0}
+    """Direct song_id lookup bypasses search and plays by id."""
+    track = {"id": 42, "title": "Direct Track", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/d.mp3", "score": 1.0}
     with (
         patch.object(music, "_sync_get_by_id", return_value=track),
         patch.object(music, "_sync_play", return_value=None),
@@ -509,7 +597,7 @@ async def test_song_id_resolution():
 
 @pytest.mark.asyncio
 async def test_song_id_not_found():
-    """Missing rowid → non-retryable error."""
+    """Missing id → non-retryable error."""
     with patch.object(music, "_sync_get_by_id", return_value=None):
         result = await music.run({"action": "play", "song_id": 9999, "prompt": ""})
     assert not result.ok

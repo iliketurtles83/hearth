@@ -3,13 +3,19 @@ import re
 import sqlite3
 import hashlib
 import time
+import json
+import asyncio
+import logging
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
 
 import chromadb
+import httpx
 import numpy as np
 from chromadb.api.types import Documents, EmbeddingFunction
+
+log = logging.getLogger("assistant.memory")
 
 
 @dataclass
@@ -18,6 +24,28 @@ class MemoryCandidate:
     key: str
     value: str
     source: str
+
+
+# ── LLM-based memory extraction (Phase 12b) ──────────────────────────────────────
+# System prompt for memory extraction LLM. Instructs the model to extract stable
+# facts and preferences from episodic summaries, returning structured JSON with
+# confidence scores. Low-confidence extractions (< 0.7) are filtered downstream.
+MEMORY_EXTRACTOR_SYSTEM = """You are a memory extraction assistant specialized in identifying
+stable facts and user preferences from conversation summaries.
+
+Extract only information that is:
+- Stable and generalizable (not ephemeral chat content)
+- About the user (not the assistant)
+- Non-sensitive (no passwords, exact addresses, financial details, identifiers)
+
+Return ONLY valid JSON with no preamble or explanation. Format:
+{
+  "candidates": [
+    { "key": "string", "value": "string", "type": "fact|preference", "confidence": 0.0–1.0 }
+  ]
+}
+
+If nothing stable can be extracted, return { "candidates": [] }."""
 
 
 @dataclass
@@ -265,6 +293,144 @@ class MemoryStore:
         for c in out:
             unique[(c.table, c.key, c.value)] = c
         return list(unique.values())
+
+    async def _llm_extract_candidates(self, text: str, source: str) -> list[MemoryCandidate]:
+        """Extract memory candidates using LLM-based reasoning (Phase 12b).
+
+        Calls OLLAMA_CHAT_MODEL with structured prompt, parses JSON response,
+        and filters by confidence >= 0.7. Gracefully handles parse failures and
+        Ollama unreachability by returning empty list and logging error.
+
+        Args:
+            text: Episodic summary or conversation text to extract from.
+            source: Origin label for audit trail ("consolidation", "ingest", etc).
+
+        Returns:
+            List of MemoryCandidate objects meeting confidence threshold.
+        """
+        if not text or not text.strip():
+            return []
+
+        # Truncate very long summaries to reduce token cost (last 1500 chars typically
+        # contain the most recent, highest-value facts).
+        text = text.strip()[-1500:] if len(text.strip()) > 1500 else text.strip()
+
+        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+        chat_model = (
+            os.getenv("OLLAMA_CHAT_MODEL")
+            or os.getenv("MODEL_LOCAL")
+            or "llama3.2"
+        )
+
+        payload = {
+            "model": chat_model,
+            "prompt": text,
+            "system": MEMORY_EXTRACTOR_SYSTEM,
+            "stream": False,
+            "format": "json",
+            "options": {
+                "num_predict": 400,  # Budget for structured extraction output
+                "temperature": 0.1,  # Low temp for deterministic extraction
+            },
+        }
+
+        try:
+            timeout = 10.0  # Generous timeout; consolidation is non-blocking
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(f"{ollama_url}/api/generate", json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                raw_response = data.get("response", "{}")
+        except httpx.ConnectError as e:
+            log.warning(
+                "memory.llm_extract | extraction_failed=ollama_unreachable error=%s",
+                str(e),
+            )
+            return []
+        except (httpx.TimeoutException, httpx.RequestError) as e:
+            log.warning(
+                "memory.llm_extract | extraction_failed=network_error error=%s",
+                str(e),
+            )
+            return []
+        except Exception as e:
+            log.error(
+                "memory.llm_extract | extraction_failed=unexpected error=%s",
+                str(e),
+            )
+            return []
+
+        # Parse JSON response with graceful error handling
+        try:
+            parsed = json.loads(raw_response)
+            candidates_raw = parsed.get("candidates", [])
+        except (json.JSONDecodeError, ValueError) as e:
+            log.warning(
+                "memory.llm_extract | extraction_failed=json_parse_error raw=%s error=%s",
+                raw_response[:200],
+                str(e),
+            )
+            return []
+
+        # Convert JSON dicts to MemoryCandidate objects, filtering by confidence
+        candidates: list[MemoryCandidate] = []
+        confidence_threshold = 0.7
+
+        for item in candidates_raw:
+            if not isinstance(item, dict):
+                continue
+
+            confidence = float(item.get("confidence", 0.0))
+            if confidence < confidence_threshold:
+                continue  # Skip low-confidence extractions
+
+            item_type = str(item.get("type", "fact")).lower()
+            table = "preferences" if item_type == "preference" else "facts"
+            key = str(item.get("key", "")).strip()
+            value = str(item.get("value", "")).strip()
+
+            if key and value:
+                candidates.append(MemoryCandidate(
+                    table=table,
+                    key=key[:48],  # Truncate keys
+                    value=value[:240],  # Truncate values
+                    source=source,
+                ))
+
+        log.debug(
+            "memory.llm_extract | extracted=%d confidence_threshold=%.2f",
+            len(candidates),
+            confidence_threshold,
+        )
+        return candidates
+
+    def _extract_candidates_llm_sync(self, text: str, source: str) -> list[MemoryCandidate]:
+        """Synchronous wrapper for _llm_extract_candidates().
+
+        Runs the async LLM extraction in the current event loop (or creates one).
+        Used by consolidate_pending() which runs in asyncio.to_thread().
+
+        Args:
+            text: Episodic summary to extract from.
+            source: Origin label for audit trail.
+
+        Returns:
+            List of MemoryCandidate objects, or empty list on error.
+        """
+        try:
+            # Try to get the running loop; if we're in a thread, this raises RuntimeError.
+            loop = asyncio.get_running_loop()
+            # If we got here, we're in an async context; create a task and wait for it.
+            # This is uncommon but supported.
+            return loop.run_until_complete(self._llm_extract_candidates(text, source))
+        except RuntimeError:
+            # We're in a sync context (thread); create a new event loop.
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self._llm_extract_candidates(text, source))
+            finally:
+                loop.close()
 
     def _upsert_chroma(self, memory_id: str, text: str, metadata: dict[str, Any]) -> None:
         self._collection.upsert(ids=[memory_id], documents=[text], metadatas=[metadata])
@@ -614,7 +780,8 @@ class MemoryStore:
                 summary_id = int(row["id"])
                 summary_text = str(row["summary"] or "")
                 summary_user_id = str(row["user_id"])
-                candidates = self._extract_candidates(summary_text, source="consolidation")
+                # Phase 12b: Use LLM-based extraction instead of regex for richer candidates
+                candidates = self._extract_candidates_llm_sync(summary_text, source="consolidation")
 
                 for c in candidates:
                     text = f"{c.key}: {c.value}"

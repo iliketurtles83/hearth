@@ -154,6 +154,50 @@ body {
   justify-content: space-between;
 }
 
+.panel-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.panel-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0.45rem;
+}
+
+.collapse-btn {
+  min-width: 1.8rem;
+  padding-inline: 0.25rem;
+}
+
+.collapsed-now-playing {
+  display: none;
+  max-width: 10.8rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 0.74rem;
+  color: var(--text-muted);
+}
+
+.panel.is-collapsed .panel-body {
+  display: none;
+}
+
+#memory-panel.is-collapsed #memory-clear-btn {
+  display: none;
+}
+
+#music-panel.is-collapsed .music-controls {
+  display: none;
+}
+
+#music-panel.is-collapsed .collapsed-now-playing {
+  display: block;
+}
+
 .panel-header h2 {
   font-size: 0.85rem;
   text-transform: uppercase;
@@ -346,6 +390,12 @@ body {
 #music-panel .panel-btn {
   font-size: 0.65rem;
   padding: 0.15rem 0.3rem;
+}
+
+#music-panel .collapse-btn,
+#memory-panel .collapse-btn {
+  font-size: 0.78rem;
+  line-height: 1;
 }
 
 

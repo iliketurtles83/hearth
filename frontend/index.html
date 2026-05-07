@@ -87,35 +87,46 @@
           <div id="session-list" class="list"></div>
         </section>
 
-        <section class="panel">
-          <div class="panel-header">
-            <h2>Memory</h2>
-            <button id="memory-clear-btn" class="panel-btn danger" title="Clear all memory">Clear</button>
-          </div>
-          <div id="memory-list" class="list"></div>
-        </section>
-
         <!-- Music panel (Phase 8): now-playing + queue -->
         <section class="panel" id="music-panel">
           <div class="panel-header">
             <h2>Music</h2>
-            <div class="music-controls" id="music-controls">
-              <button id="music-prev-btn" class="panel-btn" title="Previous / Restart">&#9664;&#9664;</button>
-              <button id="music-play-pause-btn" class="panel-btn" title="Play / Pause">&#9654;</button>
-              <button id="music-next-btn" class="panel-btn" title="Next track">&#9654;&#9654;</button>
-              <button id="music-stop-btn" class="panel-btn" title="Stop">&#9632;</button>
+            <div class="panel-header-actions">
+              <span id="music-collapsed-now-playing" class="collapsed-now-playing now-playing-idle" aria-live="polite">Nothing playing</span>
+              <div class="music-controls" id="music-controls">
+                <button id="music-prev-btn" class="panel-btn" title="Previous / Restart">&#9664;&#9664;</button>
+                <button id="music-play-pause-btn" class="panel-btn" title="Play / Pause">&#9654;</button>
+                <button id="music-next-btn" class="panel-btn" title="Next track">&#9654;&#9654;</button>
+                <button id="music-stop-btn" class="panel-btn" title="Stop">&#9632;</button>
+              </div>
+              <button id="music-collapse-btn" class="panel-btn collapse-btn" title="Collapse music section" aria-expanded="true" aria-controls="music-panel-body">▾</button>
             </div>
           </div>
-          <div id="now-playing-bar">
-            <span id="now-playing-label" class="now-playing-idle">Nothing playing</span>
+          <div id="music-panel-body" class="panel-body">
+            <div id="now-playing-bar">
+              <span id="now-playing-label" class="now-playing-idle">Nothing playing</span>
+            </div>
+            <div id="music-volume-row">
+              <label for="music-volume" id="music-volume-label">Volume</label>
+              <input id="music-volume" type="range" min="0" max="100" step="1" value="60" />
+              <span id="music-volume-value">60%</span>
+            </div>
+            <div class="queue-header">Queue</div>
+            <div id="queue-list" class="list"></div>
           </div>
-          <div id="music-volume-row">
-            <label for="music-volume" id="music-volume-label">Volume</label>
-            <input id="music-volume" type="range" min="0" max="100" step="1" value="60" />
-            <span id="music-volume-value">60%</span>
+        </section>
+
+        <section class="panel is-collapsed" id="memory-panel">
+          <div class="panel-header">
+            <h2>Memory</h2>
+            <div class="panel-header-actions">
+              <button id="memory-clear-btn" class="panel-btn danger" title="Clear all memory">Clear</button>
+              <button id="memory-collapse-btn" class="panel-btn collapse-btn" title="Expand memory section" aria-expanded="false" aria-controls="memory-panel-body">▸</button>
+            </div>
           </div>
-          <div class="queue-header">Queue</div>
-          <div id="queue-list" class="list"></div>
+          <div id="memory-panel-body" class="panel-body">
+            <div id="memory-list" class="list"></div>
+          </div>
         </section>
       </div>
 

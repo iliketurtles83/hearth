@@ -137,21 +137,47 @@ def test_list_episodic_returns_only_summaries(store):
 
 
 def test_consolidate_pending_promotes_summary_facts(store):
-    store.save_summary(
-        "alice",
-        "sess-3",
-        "- User: My name is Alice\n- User: I live in Tallinn",
-    )
+    """LLM extraction should promote facts from episodic summaries (Phase 12b)."""
+    import json
+    from unittest.mock import patch, AsyncMock, MagicMock
 
-    stats = store.consolidate_pending("alice", limit=10)
-    assert stats["processed"] == 1
-    assert stats["promoted"] >= 1
+    # Mock Ollama response with extracted facts
+    mock_response = {
+        "response": json.dumps({
+            "candidates": [
+                {"key": "name", "value": "Alice", "type": "fact", "confidence": 0.95},
+                {"key": "location", "value": "Tallinn", "type": "fact", "confidence": 0.90},
+            ]
+        })
+    }
 
-    episodic_pending = store.list_episodic("alice", consolidated=False)
-    assert episodic_pending["total"] == 0
+    async def mock_post_fn(*args, **kwargs):
+        resp = MagicMock()
+        resp.json = MagicMock(return_value=mock_response)
+        resp.raise_for_status = MagicMock()
+        return resp
 
-    hits = store.retrieve("alice", "where do I live")
-    assert any("tallinn" in str(hit.get("text", "")).lower() for hit in hits)
+    async_client_mock = MagicMock()
+    async_client_mock.post = mock_post_fn
+    async_client_mock.__aenter__ = AsyncMock(return_value=async_client_mock)
+    async_client_mock.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=async_client_mock):
+        store.save_summary(
+            "alice",
+            "sess-3",
+            "- User: My name is Alice\n- User: I live in Tallinn",
+        )
+
+        stats = store.consolidate_pending("alice", limit=10)
+        assert stats["processed"] == 1
+        assert stats["promoted"] >= 1
+
+        episodic_pending = store.list_episodic("alice", consolidated=False)
+        assert episodic_pending["total"] == 0
+
+        hits = store.retrieve("alice", "where do I live")
+        assert any("tallinn" in str(hit.get("text", "")).lower() for hit in hits)
 
 
 def test_consolidate_blocks_sensitive_candidates(store):
@@ -201,3 +227,182 @@ def test_delete_episodic_cross_user_denied(store):
 
     episodic = store.list_episodic("alice")
     assert any(item["id"] == f"summaries:{row_id}" for item in episodic["items"])
+
+
+# ── Phase 12b: LLM-based memory extraction tests ─────────────────────────────────
+
+def test_llm_extract_filters_by_confidence(store, monkeypatch):
+    """LLM extraction must filter candidates by confidence >= 0.7 (Phase 12b)."""
+    import json
+    import asyncio
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    # Mock Ollama response with mixed confidence scores
+    mock_response = {
+        "response": json.dumps({
+            "candidates": [
+                {
+                    "key": "favorite_language",
+                    "value": "Python",
+                    "type": "preference",
+                    "confidence": 0.95,  # High confidence → included
+                },
+                {
+                    "key": "workspace_language",
+                    "value": "JavaScript",
+                    "type": "preference",
+                    "confidence": 0.6,  # Low confidence → filtered out
+                },
+                {
+                    "key": "location",
+                    "value": "Helsinki",
+                    "type": "fact",
+                    "confidence": 0.85,  # High confidence → included
+                },
+                {
+                    "key": "maybe_interest",
+                    "value": "machine learning",
+                    "type": "fact",
+                    "confidence": 0.65,  # Below threshold → filtered out
+                },
+            ]
+        })
+    }
+
+    async def mock_post_fn(*args, **kwargs):
+        resp = MagicMock()
+        resp.json = MagicMock(return_value=mock_response)  # Sync method
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    # Create a proper async context manager mock
+    async_client_mock = MagicMock()
+    async_client_mock.post = mock_post_fn
+    async_client_mock.__aenter__ = AsyncMock(return_value=async_client_mock)
+    async_client_mock.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=async_client_mock):
+        # Call the async extraction function
+        candidates = asyncio.run(store._llm_extract_candidates(
+            "User: I like Python and JavaScript for work. Interested in ML.",
+            source="test"
+        ))
+
+    # Should only include candidates with confidence >= 0.7
+    assert len(candidates) == 2
+    keys = {c.key for c in candidates}
+    assert "favorite_language" in keys
+    assert "location" in keys
+    assert "workspace_language" not in keys  # Confidence 0.6 filtered out
+    assert "maybe_interest" not in keys  # Confidence 0.65 filtered out
+
+
+def test_llm_extract_json_parse_failure(store, monkeypatch):
+    """LLM extraction must gracefully handle invalid JSON (Phase 12b)."""
+    import asyncio
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    # Mock Ollama response with invalid JSON
+    async def mock_post_fn(*args, **kwargs):
+        resp = MagicMock()
+        resp.json = MagicMock(return_value={"response": "not valid json { [ }"})
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    async_client_mock = MagicMock()
+    async_client_mock.post = mock_post_fn
+    async_client_mock.__aenter__ = AsyncMock(return_value=async_client_mock)
+    async_client_mock.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=async_client_mock):
+        # Call extraction with bad JSON response
+        candidates = asyncio.run(store._llm_extract_candidates(
+            "User: My name is Test User",
+            source="test"
+        ))
+
+    # Should return empty list (graceful failure)
+    assert candidates == []
+
+
+def test_llm_extract_ollama_unreachable(store, monkeypatch):
+    """LLM extraction must gracefully handle Ollama unreachability (Phase 12b)."""
+    import asyncio
+    from unittest.mock import patch, AsyncMock, MagicMock
+    import httpx
+
+    # Mock Ollama connection error
+    async def mock_post_fn(*args, **kwargs):
+        raise httpx.ConnectError("Failed to connect to Ollama")
+
+    async_client_mock = MagicMock()
+    async_client_mock.post = mock_post_fn
+    async_client_mock.__aenter__ = AsyncMock(return_value=async_client_mock)
+    async_client_mock.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=async_client_mock):
+        # Call extraction when Ollama is unreachable
+        candidates = asyncio.run(store._llm_extract_candidates(
+            "User: Some test content",
+            source="test"
+        ))
+
+    # Should return empty list (graceful failure, no crash)
+    assert candidates == []
+
+
+def test_consolidate_uses_llm_extraction(store, monkeypatch):
+    """Consolidation worker should use LLM extraction instead of regex (Phase 12b)."""
+    import json
+    from unittest.mock import patch, AsyncMock, MagicMock
+
+    # Mock Ollama with realistic extraction
+    mock_response = {
+        "response": json.dumps({
+            "candidates": [
+                {
+                    "key": "name",
+                    "value": "Alice",
+                    "type": "fact",
+                    "confidence": 0.95,
+                },
+                {
+                    "key": "location",
+                    "value": "Tokyo",
+                    "type": "fact",
+                    "confidence": 0.88,
+                },
+            ]
+        })
+    }
+
+    async def mock_post_fn(*args, **kwargs):
+        resp = MagicMock()
+        resp.json = MagicMock(return_value=mock_response)
+        resp.raise_for_status = MagicMock()
+        return resp
+
+    async_client_mock = MagicMock()
+    async_client_mock.post = mock_post_fn
+    async_client_mock.__aenter__ = AsyncMock(return_value=async_client_mock)
+    async_client_mock.__aexit__ = AsyncMock(return_value=None)
+
+    with patch("httpx.AsyncClient", return_value=async_client_mock):
+        # Create and consolidate an episodic summary
+        store.save_summary(
+            "alice",
+            "sess-test",
+            "- User: My name is Alice\n- User: I live in Tokyo",
+        )
+
+        # Run consolidation
+        stats = store.consolidate_pending("alice", limit=10)
+
+    # Should process the summary and promote LLM-extracted candidates
+    assert stats["processed"] == 1
+    assert stats["promoted"] >= 2  # name and location should be promoted
+
+    # Verify facts are retrievable
+    items = store.list_items("alice")["items"]
+    semantic_items = [i for i in items if i.get("tier") == "semantic"]
+    assert len(semantic_items) >= 2

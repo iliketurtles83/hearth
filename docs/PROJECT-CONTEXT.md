@@ -403,26 +403,35 @@ Acceptance:
 **Depends on: Phases 2, 6**
 
 Goal: Provide backend music search and playback integration using MPD and the
-Strawberry music database, exposing HTTP endpoints and voice and text commands
-so users can search, queue, and control playback from the UI or via voice.
+Beets music library, exposing HTTP endpoints and voice and text commands so
+users can search, queue, and control playback from the UI or via voice.
 
 Implementation notes (decisions made during build):
-- **Strawberry DB schema**: no `id` column; use `rowid` as integer primary key.
-  File paths are stored in the `url` column as `file://` URIs with URL encoding.
-  No `songs_fts` FTS table in production databases — use LIKE queries only.
-- **Path rewrite**: Strawberry stores host-side absolute file:// URIs
-  (e.g. `file:///media/jack/buffer/audio/artist/song.mp3`). The backend URL-decodes
-  and strips the `MUSIC_PATH_HOST` prefix to produce MPD-relative paths
+- **Beets DB schema**: `items` table; `id` column is the integer primary key.
+  `path` column stores raw filesystem paths (may be `bytes` in older Beets
+  versions). Columns `genre`, `year`, and `rating` are optional — presence is
+  checked at runtime via `PRAGMA table_info(items)` with `lru_cache`.
+- **Path rewrite**: Beets stores raw filesystem paths. The backend decodes
+  bytes→str with utf-8/surrogateescape fallback, then strips the `MUSIC_ROOT`
+  prefix (env var, default `/music`) to produce MPD-relative paths
   (e.g. `artist/song.mp3`) which MPD resolves against its `music_directory`.
 - **Ambiguity**: auto-pick the top-ranked LIKE result and log the confidence score
   server-side. Ranked candidate list is preserved in API response for future UX.
 - **MPD resilience**: per-request fresh MPD connection with one reconnect attempt.
   On second failure, return retryable ToolResult — never crash or silently drop.
-- **Strawberry lock handling**: open with `timeout=5, check_same_thread=False, uri=True`
-  (read-only URI mode). Wrap all reads in `try/except sqlite3.OperationalError`
-  and return `retryable=True` when locked (Strawberry holds write lock during scans).
-- **Artist radio**: implemented in Phase 8 core as weighted-random by `playcount`,
+- **DB lock handling**: open Beets DB with `timeout=5, check_same_thread=False,
+  uri=True` (read-only URI mode). Wrap reads in `try/except sqlite3.OperationalError`
+  and return `retryable=True` on lock errors.
+- **Rating**: Beets `rating` column (float 0–1) is used for ordering and radio
+  weighting. Falls back to uniform weight `0.01` when column is absent.
+- **Artist radio**: implemented in Phase 8 core as weighted-random by `rating`,
   seeded for determinism. This is the Phase 8b fallback entry point.
+- **Startup bootstrap**: on first run, if Beets DB is empty/missing, the backend
+  automatically calls `beet import -A <MUSIC_ROOT>` — offline, tag-only, no
+  MusicBrainz. Subsequent starts detect a populated DB and skip the import.
+- **Migration**: `backend/scripts/migrate_strawberry_playcount_to_beets.py`
+  copies Strawberry playcounts into Beets `rating` values (log-scale, 0–1).
+  Run with `--apply` to persist; dry-run by default.
 - **Deterministic music pre-router**: `_parse_music_command()` in `main.py` fires
   BEFORE `router_route()` in the `/chat` endpoint. High-confidence music commands
   (control, now-playing, queue-view, explicit play/queue with concrete target) bypass

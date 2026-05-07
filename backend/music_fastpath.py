@@ -41,6 +41,17 @@ def parse_music_command(prompt: str) -> dict | None:
         if action:
             return {"action": "control", "control": action}
 
+    vol_m = re.match(
+        r"^(?:set\s+)?(?:the\s+)?volume(?:\s+to)?\s+(\d{1,3})%?$",
+        pl,
+    )
+    if vol_m:
+        return {
+            "action": "control",
+            "control": "set_volume",
+            "volume": max(0, min(100, int(vol_m.group(1)))),
+        }
+
     if re.search(
         r"\b(what'?s|what is)\s+(currently\s+)?(playing|on)\b"
         r"|\bnow\s+playing\b|\bcurrent\s+(song|track)\b",
@@ -137,6 +148,9 @@ def format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:
 
     if req_action == "control":
         ctrl = music_cmd.get("control", "")
+        if ctrl == "set_volume":
+            vol = data.get("volume")
+            return f"Volume set to {vol}%." if vol is not None else "Volume updated."
         return {
             "pause": "Paused.",
             "resume": "Resumed.",

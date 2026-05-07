@@ -1,5 +1,5 @@
 """
-Music playback tool — Strawberry library search + MPD playback (Phase 8).
+Music playback tool — Beets library search + MPD playback.
 
 # ── Phase 8b Recommendation Engine Contract (locked pre-implementation) ────────
 # The recommendation engine HTTP response MUST follow this primary shape:
@@ -7,8 +7,8 @@ Music playback tool — Strawberry library search + MPD playback (Phase 8).
 # Optional fields:
 #   { "score": float, "explanation": str }
 #
-# "song_id" here refers to Strawberry songs.rowid (integer primary key).
-# Resolution: SELECT rowid, title, artist, album, url FROM songs WHERE rowid = ?
+# "song_id" here refers to Beets items.id.
+# Resolution: SELECT id, title, artist, album, path FROM items WHERE id = ?
 # → trivial join, zero ambiguity, no fuzzy matching.
 #
 # Metadata-only responses ({ "title": str, "artist": str }) are NOT the primary
@@ -19,13 +19,11 @@ Music playback tool — Strawberry library search + MPD playback (Phase 8).
 # without it.
 # ─────────────────────────────────────────────────────────────────────────────────
 
-Strawberry DB (Phase 8 schema notes):
-  - Primary key: rowid (implicit SQLite integer rowid — no id column)
-  - File path:   url column (file:// URI, URL-encoded, e.g.
-                 file:///media/jack/buffer/audio/artist/song.mp3)
-  - No songs_fts FTS table — use LIKE queries only
+Beets DB schema notes:
+    - Primary key: items.id
+    - File path:   items.path (filesystem path; often absolute)
   - Opened read-only with timeout=5, check_same_thread=False, URI mode
-  - All reads wrapped in try/except sqlite3.OperationalError for scan locks
+    - All reads wrapped in try/except sqlite3.OperationalError for transient locks
 
 MPD client (python-musicpd):
   - Per-request fresh connection (thread-safe, works with asyncio.to_thread)
@@ -33,24 +31,23 @@ MPD client (python-musicpd):
   - Connection errors bubble up as retryable ToolResult
 
 Path rewrite:
-  Strawberry stores host-side absolute file:// URIs.
-  The backend URL-decodes them, strips MUSIC_PATH_HOST, and passes the
-  resulting MPD-relative path (relative to MPD music_directory) to MPD.
+    Beets stores filesystem paths. The backend strips MUSIC_ROOT and passes the
+    resulting MPD-relative path (relative to MPD music_directory) to MPD.
 
   Example:
-    Strawberry url: file:///media/jack/buffer/audio/rock/artist/song.mp3
-    MUSIC_PATH_HOST: /media/jack/buffer/audio
+    Beets path: /media/jack/buffer/audio/rock/artist/song.mp3
+    MUSIC_ROOT: /media/jack/buffer/audio
     MPD-relative:   rock/artist/song.mp3
     MPD resolves:   /music/rock/artist/song.mp3  (music_directory=/music)
 
 Environment variables:
-  STRAWBERRY_DB_PATH       path to Strawberry sqlite db inside container
-                           (default: /strawberry/strawberry.db)
+    BEETS_DB_PATH            path to Beets sqlite db
+                                                     (default: ~/.config/beets/library.db)
   MPD_HOST                 MPD hostname (default: mpd)
   MPD_PORT                 MPD port (default: 6600)
   MPD_TIMEOUT              connection timeout seconds (default: 5)
-  MUSIC_PATH_HOST          host-side path prefix stored in Strawberry URLs
-                           (default: /media/jack/buffer/audio)
+    MUSIC_ROOT               filesystem music root used to derive MPD-relative
+                                                     paths (default: /music)
   MUSIC_PATH_CONTAINER     unused in backend; MPD resolves relative to its
                            music_directory (default: /music, for docs only)
   MUSIC_SEARCH_LIMIT       max LIKE search results (default: 20)
@@ -96,7 +93,6 @@ import re
 import sqlite3
 import time
 from typing import Any
-from urllib.parse import unquote
 
 import musicpd
 
@@ -107,15 +103,15 @@ log = logging.getLogger("assistant.tools.music")
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-STRAWBERRY_DB_PATH: str = os.getenv(
-    "STRAWBERRY_DB_PATH",
-    "/strawberry/strawberry.db",
+BEETS_DB_PATH: str = os.getenv(
+    "BEETS_DB_PATH",
+    os.path.join(os.path.expanduser("~"), ".config", "beets", "library.db"),
 )
 MPD_HOST: str = os.getenv("MPD_HOST", "mpd")
 MPD_PORT: int = int(os.getenv("MPD_PORT", "6600"))
 MPD_TIMEOUT: int = int(os.getenv("MPD_TIMEOUT", "5"))
-# The path prefix that Strawberry stores in its file:// URLs on the host.
-MUSIC_PATH_HOST: str = os.getenv("MUSIC_PATH_HOST", "/media/jack/buffer/audio")
+MUSIC_ROOT: str = os.getenv("MUSIC_ROOT", "/music")
+MUSIC_PATH_HOST: str = os.getenv("MUSIC_PATH_HOST", os.getenv("MUSIC_PATH", ""))
 MUSIC_SEARCH_LIMIT: int = int(os.getenv("MUSIC_SEARCH_LIMIT", "20"))
 MUSIC_ARTIST_RADIO_N: int = int(os.getenv("MUSIC_ARTIST_RADIO_N", "10"))
 MUSIC_PLAYLIST_MIN_N: int = int(os.getenv("MUSIC_PLAYLIST_MIN_N", "12"))
@@ -126,48 +122,67 @@ MUSIC_GENRE_TREE_PATH: str = os.getenv(
 )
 
 
-# ── Strawberry DB helpers ──────────────────────────────────────────────────────
+# ── Beets DB helpers ───────────────────────────────────────────────────────────
 
-def _open_strawberry() -> sqlite3.Connection:
-    """Open Strawberry DB read-only with a short timeout for scan-lock resilience."""
-    uri = f"file:{STRAWBERRY_DB_PATH}?mode=ro"
+def _open_beets() -> sqlite3.Connection:
+    """Open Beets DB read-only with a short timeout for lock resilience."""
+    uri = f"file:{BEETS_DB_PATH}?mode=ro"
     conn = sqlite3.connect(uri, timeout=5, check_same_thread=False, uri=True)
     conn.row_factory = sqlite3.Row
     return conn
 
 
-def _url_to_mpd_path(url: str) -> str:
-    """Convert a Strawberry file:// URL to an MPD-relative path.
+def _decode_beets_path(value: Any) -> str:
+    """Decode a Beets items.path value that may be bytes or text."""
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="surrogateescape")
+        except Exception:
+            return value.decode("latin-1", errors="ignore")
+    return str(value or "")
 
-    Steps:
-      1. Strip 'file://' prefix (7 chars).
-      2. URL-decode percent-encoded characters (%20 → space, etc.).
-      3. Strip MUSIC_PATH_HOST prefix to get music-directory-relative path.
-      4. Strip leading slash — MPD add() takes relative paths.
 
-    Example:
-      file:///media/jack/buffer/audio/rock/artist/song.mp3
-      → /media/jack/buffer/audio/rock/artist/song.mp3  (after unquote)
-      → rock/artist/song.mp3  (after stripping MUSIC_PATH_HOST)
-    """
-    if url.startswith("file://"):
-        path = unquote(url[7:])
-    else:
-        path = unquote(url)
+def _url_to_mpd_path(path_value: Any) -> str:
+    """Convert a Beets path to an MPD-relative path."""
+    path = _decode_beets_path(path_value).replace("\\", "/")
 
-    if MUSIC_PATH_HOST and path.startswith(MUSIC_PATH_HOST):
-        path = path[len(MUSIC_PATH_HOST):]
+    roots: list[str] = []
+    for candidate in (MUSIC_ROOT, MUSIC_PATH_HOST):
+        root = (candidate or "").replace("\\", "/").rstrip("/")
+        if root and root not in roots:
+            roots.append(root)
+
+    # Prefer stripping the longest matching configured root first.
+    for root in sorted(roots, key=len, reverse=True):
+        if path == root or path.startswith(f"{root}/"):
+            path = path[len(root):]
+            break
 
     return path.lstrip("/")
 
 
+@lru_cache(maxsize=1)
+def _beets_columns() -> set[str]:
+    """Return available columns from Beets items table."""
+    conn = _open_beets()
+    try:
+        rows = conn.execute("PRAGMA table_info(items)").fetchall()
+        return {str(r["name"]).lower() for r in rows}
+    finally:
+        conn.close()
+
+
+def _rating_expr() -> str:
+    return "COALESCE(rating, 0.0)" if "rating" in _beets_columns() else "0.0"
+
+
 def _row_to_track(row: sqlite3.Row, score: float = 0.0) -> dict[str, Any]:
     return {
-        "id": row["rowid"],
+        "id": row["id"],
         "title": row["title"] or "",
         "artist": row["artist"] or "",
         "album": row["album"] or "",
-        "url": row["url"] or "",
+        "url": _decode_beets_path(row["path"]),
         "score": round(score, 3),
     }
 
@@ -175,19 +190,20 @@ def _row_to_track(row: sqlite3.Row, score: float = 0.0) -> dict[str, Any]:
 # ── Synchronous DB operations (run via asyncio.to_thread) ─────────────────────
 
 def _sync_search(query: str) -> list[dict[str, Any]]:
-    """Search Strawberry songs with LIKE on title/artist/album, ranked by playcount.
+    """Search Beets items with LIKE on title/artist/album, ranked by rating.
 
-    Raises sqlite3.OperationalError if the DB is locked during a Strawberry scan.
+    Raises sqlite3.OperationalError if the DB is temporarily locked.
     """
     pattern = f"%{query}%"
-    conn = _open_strawberry()
+    conn = _open_beets()
+    rating_expr = _rating_expr()
     try:
         cur = conn.execute(
-            """
-            SELECT rowid, title, artist, album, url, playcount
-            FROM songs
+            f"""
+            SELECT id, title, artist, album, path, {rating_expr} AS rating
+            FROM items
             WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
-            ORDER BY playcount DESC, title ASC
+            ORDER BY rating DESC, title ASC
             LIMIT ?
             """,
             (pattern, pattern, pattern, MUSIC_SEARCH_LIMIT),
@@ -205,11 +221,11 @@ def _sync_search(query: str) -> list[dict[str, Any]]:
 
 
 def _sync_get_by_id(song_id: int) -> dict[str, Any] | None:
-    """Look up a song by rowid. Used by Phase 8b rec engine resolution."""
-    conn = _open_strawberry()
+    """Look up a song by id. Used by Phase 8b rec engine resolution."""
+    conn = _open_beets()
     try:
         cur = conn.execute(
-            "SELECT rowid, title, artist, album, url FROM songs WHERE rowid = ?",
+            "SELECT id, title, artist, album, path FROM items WHERE id = ?",
             (song_id,),
         )
         row = cur.fetchone()
@@ -221,21 +237,22 @@ def _sync_get_by_id(song_id: int) -> dict[str, Any] | None:
 
 
 def _sync_artist_songs(artist: str) -> list[dict[str, Any]]:
-    """Return all songs matching artist LIKE pattern, with playcount attached."""
-    conn = _open_strawberry()
+    """Return all songs matching artist LIKE pattern, with rating attached."""
+    conn = _open_beets()
+    rating_expr = _rating_expr()
     try:
         cur = conn.execute(
-            """
-            SELECT rowid, title, artist, album, url, playcount
-            FROM songs
+            f"""
+            SELECT id, title, artist, album, path, {rating_expr} AS rating
+            FROM items
             WHERE artist LIKE ?
-            ORDER BY playcount DESC, title ASC
+            ORDER BY rating DESC, title ASC
             """,
             (f"%{artist}%",),
         )
         rows = cur.fetchall()
         return [
-            {**_row_to_track(row, 0.0), "playcount": int(row["playcount"] or 0)}
+            {**_row_to_track(row, 0.0), "rating": float(row["rating"] or 0.0)}
             for row in rows
         ]
     finally:
@@ -243,20 +260,21 @@ def _sync_artist_songs(artist: str) -> list[dict[str, Any]]:
 
 
 def _sync_search_by_title_artist(title: str, artist: str) -> list[dict[str, Any]]:
-    """Search Strawberry songs by title AND artist (compound LIKE filter).
+    """Search Beets items by title AND artist (compound LIKE filter).
 
     More precise than the general _sync_search when the user says
     "<title> by <artist>" — filters both dimensions in a single query.
-    Raises sqlite3.OperationalError if the DB is scan-locked.
+    Raises sqlite3.OperationalError if the DB is temporarily locked.
     """
-    conn = _open_strawberry()
+    conn = _open_beets()
+    rating_expr = _rating_expr()
     try:
         cur = conn.execute(
-            """
-            SELECT rowid, title, artist, album, url, playcount
-            FROM songs
+            f"""
+            SELECT id, title, artist, album, path, {rating_expr} AS rating
+            FROM items
             WHERE title LIKE ? AND artist LIKE ?
-            ORDER BY playcount DESC, title ASC
+            ORDER BY rating DESC, title ASC
             LIMIT ?
             """,
             (f"%{title}%", f"%{artist}%", MUSIC_SEARCH_LIMIT),
@@ -274,18 +292,23 @@ def _sync_search_by_title_artist(title: str, artist: str) -> list[dict[str, Any]
 def _sync_search_by_year_range(year_start: int, year_end: int) -> list[dict[str, Any]]:
     """Return songs whose year column falls within [year_start, year_end].
 
-    Ordered by playcount so popular tracks are surfaced first.
+    Ordered by rating so higher-ranked tracks are surfaced first.
     Returns all matches (no LIMIT) — callers sample from the full pool.
-    Raises sqlite3.OperationalError if the DB is scan-locked.
+    Raises sqlite3.OperationalError if the DB is temporarily locked.
     """
-    conn = _open_strawberry()
+    columns = _beets_columns()
+    if "year" not in columns:
+        return []
+
+    conn = _open_beets()
+    rating_expr = _rating_expr()
     try:
         cur = conn.execute(
-            """
-            SELECT rowid, title, artist, album, url, playcount
-            FROM songs
+            f"""
+            SELECT id, title, artist, album, path, {rating_expr} AS rating
+            FROM items
             WHERE year BETWEEN ? AND ?
-            ORDER BY playcount DESC, title ASC
+            ORDER BY rating DESC, title ASC
             """,
             (year_start, year_end),
         )
@@ -296,32 +319,33 @@ def _sync_search_by_year_range(year_start: int, year_end: int) -> list[dict[str,
 
 
 def _sync_genre_songs(genre: str) -> list[dict[str, Any]]:
-    """Return all songs matching genre LIKE pattern, with playcount attached.
+    """Return all songs matching genre LIKE pattern, with rating attached.
 
-    Some Strawberry schemas omit a genre column. In that case, return an empty
+    Some Beets schemas may omit a genre column. In that case, return an empty
     list so resolver logic can fall back to artist/search paths.
     """
-    conn = _open_strawberry()
+    columns = _beets_columns()
+    if "genre" not in columns:
+        log.info("music.genre_column_missing | fallback_to_artist_search")
+        return []
+
+    conn = _open_beets()
+    rating_expr = _rating_expr()
     try:
         cur = conn.execute(
-            """
-            SELECT rowid, title, artist, album, url, playcount
-            FROM songs
+            f"""
+            SELECT id, title, artist, album, path, {rating_expr} AS rating
+            FROM items
             WHERE genre LIKE ?
-            ORDER BY playcount DESC, title ASC
+            ORDER BY rating DESC, title ASC
             """,
             (f"%{genre}%",),
         )
         rows = cur.fetchall()
         return [
-            {**_row_to_track(row, 0.0), "playcount": int(row["playcount"] or 0)}
+            {**_row_to_track(row, 0.0), "rating": float(row["rating"] or 0.0)}
             for row in rows
         ]
-    except sqlite3.OperationalError as exc:
-        if "no such column" in str(exc).lower() and "genre" in str(exc).lower():
-            log.info("music.genre_column_missing | fallback_to_artist_search")
-            return []
-        raise
     finally:
         conn.close()
 
@@ -349,20 +373,20 @@ def artist_radio(
     n: int | None = None,
     seed: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Return N songs by artist, weighted-randomly by playcount.
+    """Return N songs by artist, weighted-randomly by rating.
 
     Seeded for determinism in tests; defaults to current second.
     This is the Phase 8b fallback entry point — called directly when the rec
     engine is unavailable. 8b has nothing to fall back to without this function.
 
     Returns an empty list if the artist is not found (callers handle gracefully).
-    Raises sqlite3.OperationalError if the DB is scan-locked.
+    Raises sqlite3.OperationalError if the DB is temporarily locked.
     """
     songs = _sync_artist_songs(artist)
     if not songs:
         return []
 
-    weights = [max(s["playcount"], 1) for s in songs]
+    weights = [max(float(s.get("rating", 0.0)), 0.01) for s in songs]
     rng = random.Random(seed if seed is not None else int(time.time()))
     pick_count = _playlist_pick_count(len(songs), requested_n=n)
     log.info("artist_radio | artist=%r pool=%d picking=%d", artist, len(songs), pick_count)
@@ -386,12 +410,12 @@ def genre_radio(
     n: int | None = None,
     seed: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Return N songs by genre, weighted-randomly by playcount."""
+    """Return N songs by genre, weighted-randomly by rating."""
     songs = _sync_genre_songs(genre)
     if not songs:
         return []
 
-    weights = [max(s["playcount"], 1) for s in songs]
+    weights = [max(float(s.get("rating", 0.0)), 0.01) for s in songs]
     rng = random.Random(seed if seed is not None else int(time.time()))
     pick_count = _playlist_pick_count(len(songs), requested_n=n)
 
@@ -573,6 +597,18 @@ def _sync_play_tracks(tracks: list[dict[str, Any]]) -> None:
     _with_mpd(_fn)
 
 
+def _sync_queue_tracks(tracks: list[dict[str, Any]]) -> None:
+    """Append all tracks to the current MPD queue without changing playback."""
+    paths = [_url_to_mpd_path(t["url"]) for t in tracks]
+
+    def _fn(c: musicpd.MPDClient) -> None:
+        added = _add_mpd_paths(c, paths)
+        if added == 0:
+            raise FileNotFoundError("No selected tracks are available in the MPD library")
+
+    _with_mpd(_fn)
+
+
 # ── Intent parsing ─────────────────────────────────────────────────────────────
 
 _CONTROL_MAP: dict[str, str] = {
@@ -738,7 +774,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                              now_playing|queue_view
       query    (str|None)  — explicit search/play query
       control  (str|None)  — explicit control command: pause|resume|next|stop
-      song_id  (int|None)  — Phase 8b: direct rowid lookup, bypass search
+      song_id  (int|None)  — Phase 8b: direct id lookup, bypass search
       artist   (str|None)  — Phase 8b: trigger artist_radio() directly
     """
     prompt: str = params.get("prompt", "")
@@ -837,7 +873,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             track = await asyncio.to_thread(_sync_get_by_id, song_id)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if not track:
@@ -859,7 +895,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             tracks = await asyncio.to_thread(artist_radio, artist_param)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if not tracks:
@@ -867,15 +903,18 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 f"No songs found for artist '{artist_param}'.", retryable=False
             )
         try:
-            await asyncio.to_thread(_sync_play_tracks, tracks)
+            if action == "queue":
+                await asyncio.to_thread(_sync_queue_tracks, tracks)
+            else:
+                await asyncio.to_thread(_sync_play_tracks, tracks)
         except FileNotFoundError as exc:
             log.warning("music.artist_radio | library_miss=%s", exc)
-            return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+            return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
         except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
             log.warning("music.artist_radio | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         return ToolResult(ok=True, data={
-            "action": "play",
+            "action": "queue" if action == "queue" else "play",
             "track": tracks[0],
             "tracks": tracks,
             "confidence": 1.0,
@@ -888,7 +927,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             results = await asyncio.to_thread(_sync_search_by_title_artist, query, artist_filter)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if results:
@@ -907,7 +946,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                     return ToolResult(ok=True, data={"action": "play", "track": top, "tracks": None, "confidence": confidence, "picked_from": len(results)})
             except FileNotFoundError as exc:
                 log.warning("music.title_artist_play | library_miss=%s", exc)
-                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+                return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.title_artist_play | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -917,19 +956,28 @@ async def run(params: dict[str, Any]) -> ToolResult:
             tracks = await asyncio.to_thread(artist_radio, artist_filter)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if tracks:
             try:
-                await asyncio.to_thread(_sync_play_tracks, tracks)
+                if action == "queue":
+                    await asyncio.to_thread(_sync_queue_tracks, tracks)
+                else:
+                    await asyncio.to_thread(_sync_play_tracks, tracks)
             except FileNotFoundError as exc:
                 log.warning("music.title_artist_radio_fallback | library_miss=%s", exc)
-                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+                return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.title_artist_radio_fallback | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
-            return ToolResult(ok=True, data={"action": "play", "track": tracks[0], "tracks": tracks, "confidence": 0.7, "picked_from": len(tracks)})
+            return ToolResult(ok=True, data={
+                "action": "queue" if action == "queue" else "play",
+                "track": tracks[0],
+                "tracks": tracks,
+                "confidence": 0.7,
+                "picked_from": len(tracks),
+            })
         return ToolResult.failure(
             f"No tracks found for '{query}' by '{artist_filter}'.", retryable=False
         )
@@ -941,7 +989,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             all_year_tracks = await asyncio.to_thread(_sync_search_by_year_range, yr_start, yr_end)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if not all_year_tracks:
@@ -955,15 +1003,18 @@ async def run(params: dict[str, Any]) -> ToolResult:
             yr_start, yr_end, len(all_year_tracks), n_pick,
         )
         try:
-            await asyncio.to_thread(_sync_play_tracks, tracks)
+            if action == "queue":
+                await asyncio.to_thread(_sync_queue_tracks, tracks)
+            else:
+                await asyncio.to_thread(_sync_play_tracks, tracks)
         except FileNotFoundError as exc:
             log.warning("music.year_range_play | library_miss=%s", exc)
-            return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+            return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
         except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
             log.warning("music.year_range_play | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         return ToolResult(ok=True, data={
-            "action": "play",
+            "action": "queue" if action == "queue" else "play",
             "track": tracks[0],
             "tracks": tracks,
             "confidence": 0.9,
@@ -979,7 +1030,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             results = await asyncio.to_thread(_sync_search, q)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         return ToolResult(ok=True, data={"query": q, "results": results, "total": len(results)})
@@ -997,7 +1048,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             probe_genre_tracks = await asyncio.to_thread(_sync_genre_songs, q)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if probe_genre_tracks:
@@ -1013,7 +1064,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             tracks = await asyncio.to_thread(genre_radio, genre_match)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if tracks:
@@ -1021,7 +1072,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 await asyncio.to_thread(_sync_play_tracks, tracks)
             except FileNotFoundError as exc:
                 log.warning("music.genre_radio | library_miss=%s", exc)
-                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+                return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.genre_radio | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -1046,7 +1097,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 _year_tracks = await asyncio.to_thread(_sync_search_by_year_range, _yr_start, _yr_end)
             except sqlite3.OperationalError:
                 return ToolResult.failure(
-                    "Music library is temporarily locked (scan in progress). Please retry.",
+                    "Music library database is temporarily unavailable. Please retry.",
                     retryable=True,
                 )
             if _year_tracks:
@@ -1057,7 +1108,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                     await asyncio.to_thread(_sync_play_tracks, tracks)
                 except FileNotFoundError as exc:
                     log.warning("music.decade_year_fallback | library_miss=%s", exc)
-                    return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+                    return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
                 except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                     log.warning("music.decade_year_fallback | mpd_error=%s", exc)
                     return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -1073,7 +1124,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
         results = await asyncio.to_thread(_sync_search, q)
     except sqlite3.OperationalError:
         return ToolResult.failure(
-            "Music library is temporarily locked (scan in progress). Please retry.",
+            "Music library database is temporarily unavailable. Please retry.",
             retryable=True,
         )
 
@@ -1084,7 +1135,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             tracks = await asyncio.to_thread(artist_radio, q)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if not tracks:
@@ -1092,15 +1143,18 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 f"No tracks or artists found matching '{q}'.", retryable=False
             )
         try:
-            await asyncio.to_thread(_sync_play_tracks, tracks)
+            if action == "queue":
+                await asyncio.to_thread(_sync_queue_tracks, tracks)
+            else:
+                await asyncio.to_thread(_sync_play_tracks, tracks)
         except FileNotFoundError as exc:
             log.warning("music.artist_radio_fallback | library_miss=%s", exc)
-            return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+            return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
         except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
             log.warning("music.artist_radio_fallback | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         return ToolResult(ok=True, data={
-            "action": "play",
+            "action": "queue" if action == "queue" else "play",
             "track": tracks[0],
             "tracks": tracks,
             "confidence": 0.7,
@@ -1135,7 +1189,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             tracks = await asyncio.to_thread(artist_radio, q)
         except sqlite3.OperationalError:
             return ToolResult.failure(
-                "Music library is temporarily locked (scan in progress). Please retry.",
+                "Music library database is temporarily unavailable. Please retry.",
                 retryable=True,
             )
         if tracks:
@@ -1143,7 +1197,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 await asyncio.to_thread(_sync_play_tracks, tracks)
             except FileNotFoundError as exc:
                 log.warning("music.artist_radio_heuristic | library_miss=%s", exc)
-                return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+                return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
             except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
                 log.warning("music.artist_radio_heuristic | mpd_error=%s", exc)
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -1213,7 +1267,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
 
     if first_missing is not None:
         log.warning("music.play | library_miss=%s", first_missing)
-        return ToolResult.failure("No matching tracks are available in the MPD library.", retryable=False)
+        return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
     return ToolResult.failure(f"No tracks or artists found matching '{q}'.", retryable=False)
 
 

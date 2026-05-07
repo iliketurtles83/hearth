@@ -8,15 +8,20 @@
 - get model values from .env as opposed to being declared explicitly
 
 ### music playback
-- review strawberry access as opposed to mpd's own library management
+- review strawberry access versus mpd's own library management (if there is one)
+- consider importing to mdb (if mdb has a library management system)
 - playlist generation still makes a short list in some case. eg play michael jackson gives one song by him. why is that?
 - play Heavy Metal gives a could not reach MPD - is it running error.
 - Play 50s seems to be working somewhat
 - i have the genres.txt and also the artist names, 'play 50s' should go through genres list first and if the genre doesnt exist it looks for artist
+- should genres.txt be moved?
+- how does MPD work? What can it handle? 
+- i see music and playlists in mpd folder. how does that work?
+- write json for music tool call
+- does tool call replace existing regex?
 
 ### Tool calls
 - write json for weather tool call
-- write json for music tool call
 
 ## UI
 

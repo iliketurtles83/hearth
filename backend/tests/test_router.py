@@ -295,6 +295,12 @@ class TestCodeIntentRouting:
         assert not d.use_cloud
         assert d.model == r.CODER_MODEL
 
+    def test_heuristic_detects_write_me_code_quicksort_prompt(self):
+        d = r.classify_intent("write me code for quick sort in python")
+        assert d.intent == "code"
+        assert not d.use_cloud
+        assert d.model == r.CODER_MODEL
+
     def test_heuristic_code_uses_coder_model_when_set(self):
         original = r.CODER_MODEL
         r.CODER_MODEL = "qwen2.5-coder:7b"
@@ -389,6 +395,27 @@ async def test_route_forces_code_when_planner_misses_obvious_code_prompt(monkeyp
     monkeypatch.setattr(r, "PLANNER_ENABLED", True)
 
     d = await r.route("Can you add tests for quick sort?")
+    assert d.intent == "code"
+    assert not d.use_cloud
+    assert d.model == r.CODER_MODEL
+
+
+@pytest.mark.asyncio
+async def test_route_forces_code_for_write_me_code_quicksort_prompt(monkeypatch):
+    async def _fake_planner(_prompt: str):
+        return {
+            "intent": "quick-local",
+            "route": "local",
+            "tool": None,
+            "needs_memory": False,
+            "confidence": 0.60,
+            "reasoning": "Short prompt.",
+        }
+
+    monkeypatch.setattr(r, "_call_planner", _fake_planner)
+    monkeypatch.setattr(r, "PLANNER_ENABLED", True)
+
+    d = await r.route("write me code for quick sort in python")
     assert d.intent == "code"
     assert not d.use_cloud
     assert d.model == r.CODER_MODEL

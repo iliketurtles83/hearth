@@ -4,12 +4,18 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-if [[ -f "backend/.venv/bin/activate" ]]; then
-  # shellcheck disable=SC1091
-  source backend/.venv/bin/activate
+if [[ -n "${PYTHON_BIN:-}" ]]; then
+  if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+    echo "Configured PYTHON_BIN not found: $PYTHON_BIN" >&2
+    exit 2
+  fi
+elif [[ -x "$ROOT_DIR/backend/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/backend/.venv/bin/python"
+elif [[ -x "$ROOT_DIR/.venv/bin/python" ]]; then
+  PYTHON_BIN="$ROOT_DIR/.venv/bin/python"
+else
+  PYTHON_BIN="python"
 fi
-
-PYTHON_BIN="${PYTHON_BIN:-python}"
 
 usage() {
   cat <<'EOF'
@@ -187,6 +193,22 @@ if [[ "$ALLOW_KNOWN_FAILURES" == "true" ]]; then
   else
     echo "Known-failures file not found: $KNOWN_FAILURES_FILE"
   fi
+fi
+
+all_backend_tests=true
+backend_tests=()
+for t in "${selected_tests[@]}"; do
+  if [[ "$t" == backend/* ]]; then
+    backend_tests+=("${t#backend/}")
+  else
+    all_backend_tests=false
+    break
+  fi
+done
+
+if [[ "$all_backend_tests" == "true" ]]; then
+  cd "$ROOT_DIR/backend"
+  pytest_args=("${backend_tests[@]}" "-q")
 fi
 
 "$PYTHON_BIN" -m pytest "${pytest_args[@]}"

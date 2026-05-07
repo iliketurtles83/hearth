@@ -215,6 +215,9 @@ _MEMORY_KEYWORDS = [
 ]
 
 _CODE_PATTERNS = [
+    r"\bwrite\s+me\s+code\b",
+    r"\b(write|generate|create|implement)\b.{0,80}\b(in|using)\s+(python|javascript|typescript|sql|bash|shell|css|html)\b",
+    r"\b(quicksort|quick\s*sort|merge\s*sort|binary\s*search)\b",
     r"\b(write|create|generate|implement|build)\b.{0,40}\b(function|class|method|script|endpoint|api|module|test)\b",
     r"\b(add|create|generate|write)\b.{0,40}\b(test|tests|test\s+case|test\s+cases|pytest|unittest)\b",
     r"\bcan\s+you\b.{0,20}\b(add|write|create|generate)\b.{0,40}\btests?\b",
@@ -227,6 +230,8 @@ _CODE_PATTERNS = [
 ]
 
 _CODE_KEYWORDS = [
+    "write me code",
+    "in python",
     "write a function", "write a class", "write a script", "write a test",
     "implement a", "code this", "generate code", "write code",
     "debug this", "fix this bug", "fix the error", "fix the bug",
@@ -407,6 +412,7 @@ async def _call_planner(prompt: str) -> dict:
         "model": LOCAL_MODEL,
         "prompt": f"User message: {prompt}",
         "system": _PLANNER_SYSTEM,
+        "format": "json",
         "stream": False,
         "options": {
             "num_predict": PLANNER_MAX_TOKENS,

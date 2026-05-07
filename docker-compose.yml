@@ -53,18 +53,18 @@ services:
       - "8800:8800"
     volumes:
       - ./mpd:/config
-      - ${MUSIC_PATH:-/media/jack/buffer/audio}:/music:ro
+      - ${MUSIC_PATH}:/music:ro
       - ./mpd/playlists:/config/playlists
       # PulseAudio socket for host user (PipeWire-pulse compatibility)
-      - /run/user/1000/pulse/native:/run/user/1000/pulse/native:ro
+      - ${PULSE_SOCKET}:${PULSE_SOCKET}:ro
     devices:
       - /dev/snd
     environment:
       - TZ=UTC
-      - PUID=1000
-      - PGID=1000
-      - XDG_RUNTIME_DIR=/run/user/1000
-      - PULSE_SERVER=unix:/run/user/1000/pulse/native
+      - PUID=${PUID}
+      - PGID=${PGID}
+      - XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR}
+      - PULSE_SERVER=unix:${PULSE_SOCKET}
     healthcheck:
       test: ["CMD-SHELL", "mpc status >/dev/null 2>&1 || exit 1"]
       interval: 30s
@@ -83,9 +83,10 @@ services:
     env_file:
       - .env
     environment:
-      # Strawberry DB mounted from host (read-only). Override STRAWBERRY_DB_PATH in
-      # .env if the DB filename differs. Host directory set via STRAWBERRY_DB_DIR.
-      - STRAWBERRY_DB_PATH=/strawberry/strawberry.db
+      # Beets DB mounted from host (read-only). Override BEETS_DB_PATH in
+      # .env if the DB filename differs. Host directory set via BEETS_DB_DIR.
+      - BEETS_DB_PATH=${BEETS_DB_PATH:-/beets/library.db}
+      - MUSIC_ROOT=/music
       - CODE_WORKSPACE_ROOT=/code-workspace
       - MPD_HOST=mpd
       - TTS_ENGINE=${TTS_ENGINE:-kokoro}
@@ -102,10 +103,12 @@ services:
       - ./frontend:/frontend
       # Code tool workspace — writable volume for the code_tool node (Phase 10b).
       # CODE_WORKSPACE_ROOT inside the container is /code-workspace.
-      - ${CODE_WORKSPACE_ROOT:-/home/jack/code-workspace}:/code-workspace
-      # Strawberry music library DB — mounted read-only so the backend can search it.
-      # Set STRAWBERRY_DB_DIR in .env to the directory containing strawberry.db.
-      - ${STRAWBERRY_DB_DIR:-/home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry}:/strawberry:ro
+      - ${CODE_WORKSPACE_ROOT}:/code-workspace
+      # Music library — read-only, needed for beets bootstrap import.
+      - ${MUSIC_PATH}:/music:ro
+      # Beets library DB directory — mounted read-only so backend can query items.
+      # Set BEETS_DB_DIR in .env to the directory containing library.db.
+      - ${BEETS_DB_DIR}:/beets
     healthcheck:
       test:
         [

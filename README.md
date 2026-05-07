@@ -65,7 +65,7 @@ Code tool endpoints (Phase 10b):
 - `PUT /code/files/{file_path}` — write a workspace file (confirmation-gated)
 
 Music endpoints (Phase 8):
-- `POST /music/search` — search the Strawberry DB (title / artist / album)
+- `POST /music/search` — search the Beets library DB (title / artist / album)
 - `POST /music/play` — play a specific track or artist-radio
 - `POST /music/queue` — append tracks to MPD queue
 - `POST /music/control` — controls: `pause`, `resume`, `next`, `stop`, `play_pos`, `set_volume`
@@ -213,9 +213,10 @@ MEMORY_MIN_RELEVANCE_SCORE=0.28
 # CHROMA_PATH=/app/chroma
 #
 # Music / MPD (Phase 8)
-# STRAWBERRY_DB_PATH=/home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry.db
-# MUSIC_PATH_HOST=/media/jack/buffer/audio
-# MUSIC_PATH_CONTAINER=/music
+# BEETS_DB_PATH=/home/jack/.config/beets/library.db   # path to the Beets library.db
+# BEETS_DB_DIR=/home/jack/.config/beets               # host dir mounted at /beets in container
+# MUSIC_PATH=/media/jack/buffer/audio                 # host music dir (mounted at /music)
+# MUSIC_ROOT=/music                                   # container-side mount point (matches mpd.conf)
 # MPD_HOST=mpd
 # MPD_PORT=6600
 # MPD_TIMEOUT=5
@@ -335,17 +336,31 @@ download size and memory usage lower.
 
 ## Music / MPD (Phase 8)
 
-- The backend now includes a local music tool that integrates Strawberry's
-  SQLite database with an MPD-based playback service (Phase 8).
-- Ensure `STRAWBERRY_DB_PATH` (or `STRAWBERRY_DB_PATH` in `.env`) points to your
-  Strawberry sqlite DB; for example:
-
-  /home/jack/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry.db
-
-- `MUSIC_PATH_HOST` should match the host path prefix contained in Strawberry's
-  `file:///...` URIs (so the backend can rewrite them into MPD-relative paths).
-- The MPD container commonly mounts `/config` (mpd.conf, mpd.db) and `/music`.
-- If your host uses PipeWire/ PulseAudio, mount the socket and set `PULSE_SERVER`
+- The backend includes a local music tool that uses [Beets](https://beets.io/) as
+  the music library and MPD for playback.
+- **New-user setup** — no Strawberry required:
+  1. Point `MUSIC_PATH` in `.env` at your music folder (e.g. `/media/jack/buffer/audio`).
+  2. Set `BEETS_DB_DIR` to the directory where Beets should keep `library.db`
+  (default: `~/.config/beets`). Keep `BEETS_DB_PATH` as `/beets/library.db`
+  for Docker, or set it to a different in-container filename if needed.
+  3. Start the stack (`docker compose up -d`). On first boot the backend detects
+     an empty library and runs `beet import -A /music` automatically — it reads
+     existing file tags with no MusicBrainz lookups and no files are moved.
+  4. Subsequent startups skip the import because the DB is already populated.
+- **Migrating from Strawberry** — copy playcounts to Beets ratings (0–1 scale)
+  using the one-shot script:
+  ```bash
+  python backend/scripts/migrate_strawberry_playcount_to_beets.py \
+    --strawberry-db ~/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry.db \
+    --beets-db ~/.config/beets/library.db
+  # review the summary, then re-run with --apply to write changes
+  python backend/scripts/migrate_strawberry_playcount_to_beets.py ... --apply
+  ```
+- `MUSIC_ROOT` (container path, default `/music`) must match the `music_directory`
+  in `mpd/mpd.conf` so the backend can strip the prefix and produce MPD-relative paths.
+- `BEETS_DB_DIR` is the host directory bind-mounted into the backend container.
+  `BEETS_DB_PATH` is the runtime file path read by the backend process.
+- If your host uses PipeWire/PulseAudio, mount the socket and set `PULSE_SERVER`
   (e.g. `/run/user/1000/pulse/native`) so MPD can output audio from the container.
 
 Frontend behaviour:
@@ -478,6 +493,6 @@ Safety behavior:
 - [faster-whisper](https://github.com/guillaumekln/faster-whisper) for efficient speech-to-text processing.
 - [sqlite3](https://www.sqlite.org/index.html) and [ChromaDB](https://www.trychroma.com/) for a powerful hybrid memory solution.
 - [openmeteo](https://open-meteo.com/) for free weather data with a simple API.
-- [strawberry music player](https://www.strawberrymusicplayer.org/) for local music management and playback via MPD.
+- [beets](https://beets.io/) for local music library management (tag-based, offline-first).
 
 

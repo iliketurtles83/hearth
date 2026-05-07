@@ -14,6 +14,9 @@ import os
 import json
 import logging
 import re
+import shutil
+import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
@@ -188,6 +191,79 @@ def _required_wake_models() -> list[str]:
     return [m for m in models if m]
 
 
+def _beets_db_has_items(db_path: str) -> bool:
+    """Return True when Beets DB exists and has at least one item."""
+    if not db_path or not os.path.isfile(db_path):
+        return False
+
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(db_path, timeout=5)
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='items'"
+        )
+        if cur.fetchone() is None:
+            return False
+        return conn.execute("SELECT 1 FROM items LIMIT 1").fetchone() is not None
+    except sqlite3.Error as exc:
+        log.warning("beets.bootstrap_check_failed | db=%s error=%s", db_path, exc)
+        return False
+    finally:
+        if conn is not None:
+            conn.close()
+
+
+def _bootstrap_beets_library_if_empty() -> None:
+    """Run `beet import -A` once when the Beets library database is empty."""
+    beets_db = os.getenv(
+        "BEETS_DB_PATH",
+        os.path.join(os.path.expanduser("~"), ".config", "beets", "library.db"),
+    )
+    if _beets_db_has_items(beets_db):
+        log.info("beets.bootstrap_skip | db=%s reason=already_populated", beets_db)
+        return
+
+    music_root = os.getenv("MUSIC_ROOT", "").strip()
+    if not music_root:
+        music_path = os.getenv("MUSIC_PATH", "").strip()
+        hint = (
+            "Set MUSIC_ROOT=/music (Docker) or to your local music directory (non-Docker)."
+            if music_path
+            else "Set MUSIC_ROOT to the directory used by Beets import (e.g. /music in Docker)."
+        )
+        log.warning(
+            "beets.bootstrap_skip | db=%s reason=missing_music_root env=MUSIC_ROOT hint=%s",
+            beets_db,
+            hint,
+        )
+        return
+    if not os.path.isdir(music_root):
+        log.warning(
+            "beets.bootstrap_skip | db=%s reason=invalid_music_root path=%s",
+            beets_db,
+            music_root,
+        )
+        return
+
+    beet_bin = shutil.which("beet")
+    if not beet_bin:
+        log.warning(
+            "beets.bootstrap_skip | db=%s reason=beet_not_found hint='Install beets or include it in container image'",
+            beets_db,
+        )
+        return
+
+    cmd = [beet_bin, "-l", beets_db, "import", "-A", music_root]
+    log.info("beets.bootstrap_start | db=%s music_root=%s", beets_db, music_root)
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        log.info("beets.bootstrap_done | db=%s", beets_db)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip().splitlines()
+        tail = stderr[-1] if stderr else str(exc)
+        log.warning("beets.bootstrap_failed | db=%s error=%s", beets_db, tail)
+
+
 def _validate_startup() -> None:
     _models_dir = os.path.join(os.path.dirname(__file__), "models")
     required_models = _required_wake_models()
@@ -218,6 +294,8 @@ def _validate_startup() -> None:
         _index_paths = [p.strip() for p in _index_paths_raw.split() if p.strip()] or None
         from tools.code_indexer import start_background_index
         start_background_index(_code_root, os.getenv("CHROMA_PATH", _chroma_default), _index_paths)
+
+    _bootstrap_beets_library_if_empty()
 
     log.info(
         "Startup OK | chat_model=%s | coder_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",

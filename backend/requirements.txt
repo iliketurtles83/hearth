@@ -14,6 +14,7 @@ chromadb
 langgraph==1.1.10
 langgraph-checkpoint-sqlite==3.0.3
 python-musicpd
+beets
 pytest
 pytest-asyncio
 respx
