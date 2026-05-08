@@ -1,0 +1,39 @@
+# this file goes to the following location on the host:
+# ~/.config/beets/config.yaml
+
+# ── Paths ────────────────────────────────────────────────────────────────────
+library: /beets/library.db   # explicit; don't let it default to ~ inside container
+directory: /music                 # your music root — beets won't use this since copy: no,
+                                  # but it needs a value or it defaults to ~/Music
+
+# ── Import: touch nothing, query nothing ─────────────────────────────────────
+import:
+  copy: no        # do not copy files anywhere
+  move: no        # do not move files
+  write: no       # do not touch ID3/FLAC tags
+  link: no        # no symlinks
+  autotag: no     # no MusicBrainz lookups at all
+  quiet: yes      # non-interactive; never pause to ask
+  quiet_fallback: asis   # when unsure, import as-is (pairs with quiet: yes)
+  incremental: yes       # remember what's been imported; skip on re-runs
+  resume: no             # don't prompt about interrupted imports
+  duplicate_action: skip # if already in DB, skip silently
+
+# ── Threading ─────────────────────────────────────────────────────────────────
+threaded: no   # autotag is off anyway; threads only matter for MB lookups
+               # disabling makes logs easier to read during debugging
+
+# ── What to ignore ───────────────────────────────────────────────────────────
+ignore:
+  - '.*'          # hidden files/dirs
+  - '*~'          # backup files
+  - '*.jpg'       # cover art loose files — beets would try to import them as tracks
+  - '*.png'
+  - '*.pdf'
+  - '*.txt'
+  - '*.m3u'
+  - '*.nfo'
+  - '*.cue'
+  - '*.mp4'
+  - '*.avi'
+  - '*.mpg'
