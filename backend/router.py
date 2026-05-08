@@ -1,34 +1,21 @@
 """
-Intent-based model router (Phase 4).
+Intent classifier for the assistant graph.
+
+This file now exists as a compatibility shim around the graph's routing entry
+point: a deterministic heuristic classifier plus a thin async wrapper for code
+that still expects ``await route(prompt)``.
 
 Intent categories:
-  quick-local          — factual, short, conversational
-  reasoning-heavy      — multi-step planning, analysis, architecture
-  code                 — code generation, debugging, explanation, file editing
-  external-data-needed — weather, news, live data (tool path, not cloud)
-  memory-needed        — references to prior facts or user preferences
-
-Routing rule:
-  reasoning-heavy with confidence >= ROUTE_CONFIDENCE_THRESHOLD → cloud
-  everything else → local
-  cloud unavailable → local with caller-visible fallback flag
-
-Inner-monologue planner (Phase 4b):
-  When ROUTER_PLANNER_ENABLED=true (default), a short reasoning pass asks the
-  local model to emit a structured JSON routing decision before dispatch.
-  The reasoning_summary is logged server-side only — never sent to the client.
-  On any failure (timeout / network / bad JSON), falls back to heuristic classifier.
+    quick-local          — factual, short, conversational
+    reasoning-heavy      — multi-step planning, analysis, architecture
+    code                 — code generation, debugging, explanation, file editing
+    external-data-needed — weather, news, live data, music playback commands
+    memory-needed        — references to prior facts or user preferences
 """
 
-import json
-import logging
 import os
 import re
 from dataclasses import dataclass
-
-import httpx
-
-log = logging.getLogger("assistant.router")
 
 # ── Model config ───────────────────────────────────────────────────────────────
 # Chat model:  OLLAMA_CHAT_MODEL → MODEL_LOCAL → "llama3.2"
@@ -47,22 +34,11 @@ CODER_MODEL: str = (
 )
 LOCAL_MODEL = CHAT_MODEL  # backward-compat alias
 CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
 
-# ── Routing thresholds ─────────────────────────────────────────────────────────
+# ── Routing threshold ──────────────────────────────────────────────────────────
 # Minimum confidence score in "reasoning-heavy" required to route to cloud.
 ROUTE_CONFIDENCE_THRESHOLD = float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", "0.55"))
 
-# ── Planner controls ───────────────────────────────────────────────────────────
-PLANNER_ENABLED: bool = os.getenv("ROUTER_PLANNER_ENABLED", "true").lower() == "true"
-PLANNER_TIMEOUT_MS: int = int(os.getenv("ROUTER_PLANNER_TIMEOUT_MS", "4000"))
-PLANNER_MAX_TOKENS: int = int(os.getenv("ROUTER_PLANNER_MAX_TOKENS", "200"))
-PLANNER_TEMPERATURE: float = float(os.getenv("ROUTER_PLANNER_TEMPERATURE", "0.0"))
-
-_VALID_INTENTS = frozenset(
-    ["quick-local", "reasoning-heavy", "code", "external-data-needed", "memory-needed"]
-)
-_VALID_ROUTES = frozenset(["local", "cloud", "tool"])
 _VALID_TOOL_NAMES = frozenset(["weather", "music"])
 
 
@@ -113,9 +89,6 @@ _EXTERNAL_DATA_KEYWORDS = [
     "news", "headline", "current events", "latest news",
     "stock", "share price", "market today", "market now",
     "what time is it", "what date is it", "live score", "real-time",
-    # music
-    "play", "pause", "stop", "resume", "next song", "next track",
-    "skip", "queue", "now playing", "what's playing", "what is playing",
 ]
 
 _EXTERNAL_DATA_PATTERNS = [
@@ -124,10 +97,6 @@ _EXTERNAL_DATA_PATTERNS = [
     r"\b(stock|share\s+price|market)\b.{0,20}\b(today|now|current)\b",
     r"\bwhat\s+(time|date)\s+is\s+it\b",
     r"\b(live|real.?time)\b.{0,20}\b(data|score|result)\b",
-    # music
-    r"\b(play|queue|put\s+on)\b.{0,60}\b(song|track|music|album|artist|band)\b",
-    r"\b(pause|stop|resume|skip|next)\b.{0,30}\b(music|song|track|playback)?\b",
-    r"\b(what'?s|what\s+is)\s+(playing|in\s+the\s+queue)\b",
 ]
 
 _WEATHER_PATTERNS = [
@@ -136,7 +105,6 @@ _WEATHER_PATTERNS = [
 
 _MUSIC_PATTERNS = [
     r"\b(play|queue|put\s+on)\b.{0,60}\b(song|track|music|album|artist|band)\b",
-    r"\b(play|queue)\b.{1,80}",  # broad — refine with keyword gate below
     r"\b(pause|resume|unpause)\b.{0,30}\b(music|song|track|playback)?\b",
     r"\b(next|skip)\b.{0,20}\b(track|song)?\b",
     r"\bstop\s+(the\s+)?(music|playback|song)\b",
@@ -164,10 +132,7 @@ def _looks_like_music_request(text: str) -> bool:
     """
     p = text.lower()
     # Fast keyword gate
-    music_kw = ("play ", "queue ", "pause", "resume", "unpause", "skip",
-                "now playing", "what's playing", "what is playing",
-                "put on", "next track", "next song", "artist radio")
-    if not any(kw in p for kw in music_kw):
+    if not any(kw in p for kw in _MUSIC_KEYWORDS):
         return False
     # Require at least one structural pattern
     return any(re.search(pat, text, re.IGNORECASE) for pat in _MUSIC_PATTERNS)
@@ -281,6 +246,10 @@ def classify_intent(prompt: str) -> RouteDecision:
     # external-data signals
     scores["external-data-needed"] += _score_patterns(p, _EXTERNAL_DATA_PATTERNS)
     scores["external-data-needed"] += _score_keywords(p, _EXTERNAL_DATA_KEYWORDS)
+    if _looks_like_weather_request(p):
+        scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.30)
+    if _looks_like_music_request(p):
+        scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.55)
 
     # memory signals
     scores["memory-needed"] += _score_patterns(p, _MEMORY_PATTERNS)
@@ -333,166 +302,6 @@ def classify_intent(prompt: str) -> RouteDecision:
         planner_status="heuristic",
     )
 
-
-# ── Inner-monologue planner ────────────────────────────────────────────────────
-
-_PLANNER_SYSTEM = """\
-You are a routing assistant. Analyse the user message and output a JSON object — \
-nothing else, no prose, no markdown fences. Use exactly this schema:
-{
-  "intent": "<quick-local|reasoning-heavy|code|external-data-needed|memory-needed>",
-  "route": "<local|cloud|tool>",
-  "tool": "<weather|music|null>",
-  "needs_memory": <true|false>,
-  "confidence": <0.0–1.0>,
-  "reasoning": "<one sentence>"
-}
-
-Rules:
-- intent=code  → route=local (code almost never needs cloud)
-- intent=external-data-needed → route=tool
-- intent=reasoning-heavy AND confidence>=0.55 → route=cloud
-- everything else → route=local
-- needs_memory=true when the request references prior facts or user preferences
-- confidence reflects how certain you are of the intent, not the answer quality
-"""
-
-
-def _parse_planner_output(raw: str) -> dict:
-    """Extract and validate the JSON object from planner output.
-
-    Raises ValueError on any validation failure so callers can fall back.
-    """
-    # Strip optional markdown fences the model may still emit
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        cleaned = "\n".join(
-            line for line in lines if not line.startswith("```")
-        ).strip()
-
-    # Find first { … } block
-    start = cleaned.find("{")
-    end = cleaned.rfind("}") + 1
-    if start == -1 or end == 0:
-        raise ValueError(f"No JSON object found in planner output: {raw!r}")
-    data = json.loads(cleaned[start:end])
-
-    intent = str(data.get("intent", "")).strip()
-    if intent not in _VALID_INTENTS:
-        raise ValueError(f"Invalid intent {intent!r}")
-
-    route = str(data.get("route", "local")).strip()
-    if route not in _VALID_ROUTES:
-        route = "local"
-
-    confidence = float(data.get("confidence", 0.5))
-    confidence = max(0.0, min(1.0, confidence))
-
-    tool_raw = data.get("tool")
-    tool = str(tool_raw).strip() if tool_raw and str(tool_raw).lower() != "null" else None
-
-    needs_memory = bool(data.get("needs_memory", False))
-    reasoning = str(data.get("reasoning", "")).strip()[:300]
-
-    return {
-        "intent": intent,
-        "route": route,
-        "tool": tool,
-        "needs_memory": needs_memory,
-        "confidence": round(confidence, 3),
-        "reasoning": reasoning,
-    }
-
-
-async def _call_planner(prompt: str) -> dict:
-    """Call local Ollama with the planner system prompt and return parsed JSON."""
-    timeout = PLANNER_TIMEOUT_MS / 1000.0
-    payload = {
-        "model": LOCAL_MODEL,
-        "prompt": f"User message: {prompt}",
-        "system": _PLANNER_SYSTEM,
-        "format": "json",
-        "stream": False,
-        "options": {
-            "num_predict": PLANNER_MAX_TOKENS,
-            "temperature": PLANNER_TEMPERATURE,
-        },
-    }
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        resp.raise_for_status()
-        data = resp.json()
-        raw = data.get("response", "")
-    return _parse_planner_output(raw)
-
-
-def _decision_from_planner(parsed: dict, prompt: str = "") -> RouteDecision:
-    """Convert parsed planner dict → RouteDecision."""
-    intent = parsed["intent"]
-    route = parsed["route"]
-    confidence = parsed["confidence"]
-
-    use_cloud = (route == "cloud" and intent == "reasoning-heavy"
-                 and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
-    model = CLOUD_MODEL if use_cloud else _pick_local_model(intent)
-
-    tool = _normalize_external_tool(intent, prompt, parsed["tool"])
-
-    return RouteDecision(
-        intent=intent,
-        confidence=confidence,
-        use_cloud=use_cloud,
-        model=model,
-        tool=tool,
-        needs_memory=parsed["needs_memory"],
-        planner_status="planner",
-        reasoning_summary=parsed["reasoning"],
-    )
-
-
 async def route(prompt: str) -> RouteDecision:
-    """Primary entry point.
-
-    Tries the inner-monologue planner when enabled; falls back to the
-    deterministic heuristic classifier on any failure.
-    The reasoning_summary in the returned decision is for server logs only
-    and must never be sent to the client.
-    """
-    if PLANNER_ENABLED:
-        try:
-            parsed = await _call_planner(prompt)
-            decision = _decision_from_planner(parsed, prompt)
-            # Guardrail: if planner under-classifies obvious music commands,
-            # force tool dispatch so playback actions are executed deterministically.
-            if decision.tool is None and _looks_like_music_request(prompt):
-                decision.intent = "external-data-needed"
-                decision.tool = "music"
-                decision.use_cloud = False
-                decision.model = _pick_local_model(decision.intent)
-                decision.confidence = max(decision.confidence, 0.8)
-            # Guardrail: if planner under-classifies obvious coding requests,
-            # force local coder route so edits/tests don't fall through to chat.
-            if decision.intent != "code" and _looks_like_code_request(prompt):
-                decision.intent = "code"
-                decision.tool = None
-                decision.use_cloud = False
-                decision.model = _pick_local_model("code")
-                decision.confidence = max(decision.confidence, 0.8)
-            log.debug(
-                "router.planner | intent=%s route=%s tool=%s needs_memory=%s "
-                "confidence=%.3f reasoning=%s",
-                decision.intent,
-                "cloud" if decision.use_cloud else "local",
-                decision.tool,
-                decision.needs_memory,
-                decision.confidence,
-                decision.reasoning_summary,
-            )
-            return decision
-        except Exception as exc:
-            log.warning("router.planner_failed | reason=%s — falling back to heuristic", exc)
-
-    decision = classify_intent(prompt)
-    decision.planner_status = "disabled" if not PLANNER_ENABLED else "fallback"
-    return decision
+    """Compatibility wrapper for legacy async call sites."""
+    return classify_intent(prompt)

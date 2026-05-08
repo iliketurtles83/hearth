@@ -421,6 +421,37 @@ async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(mo
 
 
 @pytest.mark.asyncio
+async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypatch):
+    async def _unexpected_router(_message: str):
+        raise AssertionError("router_route should not run for explicit music commands")
+
+    async def _fake_dispatch(_tool_name: str, _params: dict):
+        return main.ToolResult(
+            ok=True,
+            data={
+                "action": "play",
+                "track": {"title": "As The Pages Burn", "artist": "Oratory"},
+                "tracks": [
+                    {"title": "As The Pages Burn", "artist": "Oratory"},
+                    {"title": "End of All Hope", "artist": "Nightwish"},
+                ],
+                "genre": "heavy metal",
+            },
+        )
+
+    monkeypatch.setattr(main, "router_route", _unexpected_router)
+    monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
+
+    response = await main.chat(
+        main.ChatRequest(message="play Heavy Metal", source="text"),
+        _request("alice"),
+    )
+    events = await _read_sse_events(response)
+
+    assert json.loads(events[1])["text"] == "Now playing: 2 Heavy Metal tracks."
+
+
+@pytest.mark.asyncio
 async def test_chat_vague_music_prompt_still_uses_router_path(monkeypatch):
     router_calls: list[str] = []
 
