@@ -312,6 +312,127 @@ def test_artist_radio_default_target_is_adaptive(monkeypatch):
     assert len(result) == 20
 
 
+def test_weighted_unique_sample_never_underfills_target_under_skew():
+    songs = [
+        {
+            "id": i,
+            "title": f"Song {i}",
+            "artist": "Band",
+            "album": "A",
+            "url": f"/media/jack/buffer/audio/s{i}.mp3",
+            "score": 0.0,
+            "rating": 1000 if i == 1 else 0.01,
+        }
+        for i in range(1, 51)
+    ]
+    weights = [max(float(s.get("rating", 0.0)), 0.01) for s in songs]
+
+    picked = music._weighted_unique_sample(
+        songs,
+        weights,
+        pick_count=20,
+        rng=music.random.Random(7),
+    )
+
+    assert len(picked) == 20
+    ids = [t["id"] for t in picked]
+    assert len(ids) == len(set(ids))
+
+
+def test_artist_radio_default_target_not_underfilled_with_skew(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 12)
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    songs = [
+        {
+            "id": i,
+            "title": f"Song {i}",
+            "artist": "Band",
+            "album": "A",
+            "url": f"/media/jack/buffer/audio/s{i}.mp3",
+            "score": 0.0,
+            "rating": 500.0 if i == 1 else 0.01,
+        }
+        for i in range(1, 41)
+    ]
+
+    with patch.object(music, "_sync_artist_songs", return_value=songs):
+        result = music.artist_radio("Band", seed=13)
+
+    assert len(result) == 20
+    ids = [t["id"] for t in result]
+    assert len(ids) == len(set(ids))
+
+
+def test_genre_radio_default_target_not_underfilled_with_skew(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 12)
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    songs = [
+        {
+            "id": i,
+            "title": f"Song {i}",
+            "artist": "Band",
+            "album": "A",
+            "url": f"/media/jack/buffer/audio/s{i}.mp3",
+            "score": 0.0,
+            "rating": 700.0 if i == 1 else 0.01,
+        }
+        for i in range(1, 41)
+    ]
+
+    with patch.object(music, "_sync_genre_songs", return_value=songs):
+        result = music.genre_radio("metal", seed=17)
+
+    assert len(result) == 20
+    ids = [t["id"] for t in result]
+    assert len(ids) == len(set(ids))
+
+
+def test_sync_genre_songs_uses_genres_column_when_genre_missing(monkeypatch):
+    class _FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _FakeConn:
+        def __init__(self, rows):
+            self.rows = rows
+            self.closed = False
+            self.last_sql = ""
+            self.last_params = ()
+
+        def execute(self, sql, params):
+            self.last_sql = sql
+            self.last_params = params
+            return _FakeCursor(self.rows)
+
+        def close(self):
+            self.closed = True
+
+    rows = [
+        {
+            "id": 1,
+            "title": "Track 1",
+            "artist": "Band",
+            "album": "A",
+            "path": "/media/jack/buffer/audio/s1.mp3",
+            "rating": 10,
+        }
+    ]
+    fake_conn = _FakeConn(_make_rows(rows))
+
+    monkeypatch.setattr(music, "_beets_columns", lambda: {"id", "title", "artist", "album", "path", "genres", "rating"})
+    monkeypatch.setattr(music, "_open_beets", lambda: fake_conn)
+
+    result = music._sync_genre_songs("reggae")
+
+    assert len(result) == 1
+    assert "WHERE genres LIKE ?" in fake_conn.last_sql
+    assert fake_conn.last_params == ("%reggae%",)
+    assert fake_conn.closed is True
+
+
 def test_artist_radio_empty_when_no_artist():
     """Returns empty list when artist is not in the library."""
     with patch.object(music, "_sync_artist_songs", return_value=[]):
@@ -373,6 +494,55 @@ async def test_play_michael_jackson_uses_artist_heuristic_when_not_genre(monkeyp
     assert result.ok
     assert result.data["tracks"][0]["artist"] == "Michael Jackson"
     artist_radio_mock.assert_called_once_with("michael jackson")
+
+
+@pytest.mark.asyncio
+async def test_play_multiword_artist_prefers_artist_matches_even_when_title_hits(monkeypatch):
+    search_results = [
+        {
+            "id": 1,
+            "title": "24 Michael Jackson_ I Can't Help It",
+            "artist": "DJ Jazzy Jeff & Mick Boogie",
+            "album": "Mixtape",
+            "url": "/media/jack/buffer/audio/mix.mp3",
+            "score": 0.9,
+        },
+        {
+            "id": 2,
+            "title": "Billie Jean",
+            "artist": "Michael Jackson",
+            "album": "Thriller",
+            "url": "/media/jack/buffer/audio/bj.mp3",
+            "score": 0.8,
+        },
+    ]
+    radio_tracks = [
+        {
+            "id": 2,
+            "title": "Billie Jean",
+            "artist": "Michael Jackson",
+            "album": "Thriller",
+            "url": "/media/jack/buffer/audio/bj.mp3",
+            "score": 0.0,
+            "rating": 100,
+        }
+    ]
+    monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: None)
+
+    with (
+        patch.object(music, "_sync_search", return_value=search_results),
+        patch.object(music, "_sync_genre_songs", return_value=[]),
+        patch.object(music, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
+        patch.object(music, "_sync_play_tracks", return_value=None),
+        patch.object(music, "_sync_play", return_value=None),
+    ):
+        result = await music.run(
+            {"action": "play", "query": "michael jackson", "prompt": "play Michael Jackson"}
+        )
+
+    assert result.ok
+    assert result.data["tracks"][0]["artist"] == "Michael Jackson"
+    artist_radio_mock.assert_called_once_with("Michael Jackson")
 
 
 def test_sync_play_tracks_skips_missing_mpd_paths():

@@ -138,6 +138,10 @@ def format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:
         tracks = data.get("tracks")
         verb = "Queued" if data_action == "queue" else "Now playing"
         if tracks and len(tracks) > 1:
+            genre = data.get("genre")
+            if isinstance(genre, str) and genre.strip():
+                genre_label = genre.strip().title()
+                return f"{verb}: {len(tracks)} {genre_label} tracks."
             artist = tracks[0].get("artist", "unknown artist")
             return f"{verb}: {len(tracks)} tracks by {artist}."
         if track:

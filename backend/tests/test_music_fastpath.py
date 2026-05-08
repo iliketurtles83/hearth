@@ -32,3 +32,22 @@ def test_format_set_volume_response():
         {"action": "control", "control": "set_volume", "volume": 35},
     )
     assert msg == "Volume set to 35%."
+
+
+def test_format_play_multi_track_genre_response():
+    msg = format_music_response(
+        ToolResult(
+            ok=True,
+            data={
+                "action": "play",
+                "track": {"title": "Any", "artist": "Oratory"},
+                "tracks": [
+                    {"title": "Any", "artist": "Oratory"},
+                    {"title": "Other", "artist": "Nightwish"},
+                ],
+                "genre": "heavy metal",
+            },
+        ),
+        {"action": "play", "query": "heavy metal"},
+    )
+    assert msg == "Now playing: 2 Heavy Metal tracks."

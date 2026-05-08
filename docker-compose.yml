@@ -87,6 +87,7 @@ services:
       # .env if the DB filename differs. Host directory set via BEETS_DB_DIR.
       - BEETS_DB_PATH=${BEETS_DB_PATH:-/beets/library.db}
       - MUSIC_ROOT=/music
+      - BEETSDIR=/beets
       - CODE_WORKSPACE_ROOT=/code-workspace
       - MPD_HOST=mpd
       - TTS_ENGINE=${TTS_ENGINE:-kokoro}

@@ -176,6 +176,20 @@ def _rating_expr() -> str:
     return "COALESCE(rating, 0.0)" if "rating" in _beets_columns() else "0.0"
 
 
+def _genre_expr() -> str | None:
+    """Return the Beets genre-like column expression to query.
+
+    Beets schemas can expose either ``genre`` or ``genres``. Prefer ``genre``
+    when present for compatibility, otherwise use ``genres``.
+    """
+    columns = _beets_columns()
+    if "genre" in columns:
+        return "genre"
+    if "genres" in columns:
+        return "genres"
+    return None
+
+
 def _row_to_track(row: sqlite3.Row, score: float = 0.0) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -324,8 +338,8 @@ def _sync_genre_songs(genre: str) -> list[dict[str, Any]]:
     Some Beets schemas may omit a genre column. In that case, return an empty
     list so resolver logic can fall back to artist/search paths.
     """
-    columns = _beets_columns()
-    if "genre" not in columns:
+    genre_expr = _genre_expr()
+    if not genre_expr:
         log.info("music.genre_column_missing | fallback_to_artist_search")
         return []
 
@@ -336,7 +350,7 @@ def _sync_genre_songs(genre: str) -> list[dict[str, Any]]:
             f"""
             SELECT id, title, artist, album, path, {rating_expr} AS rating
             FROM items
-            WHERE genre LIKE ?
+            WHERE {genre_expr} LIKE ?
             ORDER BY rating DESC, title ASC
             """,
             (f"%{genre}%",),
@@ -368,6 +382,33 @@ def _playlist_pick_count(pool_size: int, requested_n: int | None = None) -> int:
     adaptive = max(1, pool_size // 2)
     return min(pool_size, max(min_n, min(max_n, adaptive)))
 
+
+def _weighted_unique_sample(
+    items: list[dict[str, Any]],
+    weights: list[float],
+    pick_count: int,
+    rng: random.Random,
+) -> list[dict[str, Any]]:
+    """Weighted sample without replacement.
+
+    This guarantees up to ``pick_count`` unique selections (bounded by pool size)
+    while still biasing picks by weight.
+    """
+    if pick_count <= 0 or not items:
+        return []
+
+    pool = list(items)
+    pool_weights = [max(float(w), 0.01) for w in weights]
+    target = min(int(pick_count), len(pool))
+    chosen: list[dict[str, Any]] = []
+
+    while pool and len(chosen) < target:
+        idx = rng.choices(range(len(pool)), weights=pool_weights, k=1)[0]
+        chosen.append(pool.pop(idx))
+        pool_weights.pop(idx)
+
+    return chosen
+
 def artist_radio(
     artist: str,
     n: int | None = None,
@@ -389,18 +430,14 @@ def artist_radio(
     weights = [max(float(s.get("rating", 0.0)), 0.01) for s in songs]
     rng = random.Random(seed if seed is not None else int(time.time()))
     pick_count = _playlist_pick_count(len(songs), requested_n=n)
-    log.info("artist_radio | artist=%r pool=%d picking=%d", artist, len(songs), pick_count)
-
-    # Weighted sample with de-duplication.
-    seen: set[int] = set()
-    chosen: list[dict[str, Any]] = []
-    attempts = 0
-    while len(chosen) < pick_count and attempts < max(3, pick_count * 3):
-        attempts += 1
-        pick = rng.choices(songs, weights=weights, k=1)[0]
-        if pick["id"] not in seen:
-            seen.add(pick["id"])
-            chosen.append(pick)
+    chosen = _weighted_unique_sample(songs, weights, pick_count, rng)
+    log.info(
+        "artist_radio | artist=%r pool=%d picking=%d selected=%d",
+        artist,
+        len(songs),
+        pick_count,
+        len(chosen),
+    )
 
     return chosen
 
@@ -418,16 +455,14 @@ def genre_radio(
     weights = [max(float(s.get("rating", 0.0)), 0.01) for s in songs]
     rng = random.Random(seed if seed is not None else int(time.time()))
     pick_count = _playlist_pick_count(len(songs), requested_n=n)
-
-    seen: set[int] = set()
-    chosen: list[dict[str, Any]] = []
-    attempts = 0
-    while len(chosen) < pick_count and attempts < max(3, pick_count * 3):
-        attempts += 1
-        pick = rng.choices(songs, weights=weights, k=1)[0]
-        if pick["id"] not in seen:
-            seen.add(pick["id"])
-            chosen.append(pick)
+    chosen = _weighted_unique_sample(songs, weights, pick_count, rng)
+    log.info(
+        "genre_radio | genre=%r pool=%d picking=%d selected=%d",
+        genre,
+        len(songs),
+        pick_count,
+        len(chosen),
+    )
 
     return chosen
 
@@ -1080,6 +1115,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 "action": "play",
                 "track": tracks[0],
                 "tracks": tracks,
+                "genre": genre_match,
                 "confidence": 0.9,
                 "picked_from": len(tracks),
             })
@@ -1210,6 +1246,44 @@ async def run(params: dict[str, Any]) -> ToolResult:
             })
         # artist_radio returned nothing (shouldn't happen if LIKE found results,
         # but fall through to single-pick as safety net).
+
+    # Multi-word artist intent rescue: title matches like
+    # "Michael Jackson - remix title" can suppress the heuristic above even when
+    # there are clear artist-field matches in the result set.
+    _artist_matches = [r for r in results if _q_norm in r["artist"].lower()]
+    _multi_word_query = " " in _q_norm.strip()
+    if action != "queue" and _multi_word_query and _artist_matches:
+        preferred_artist = _artist_matches[0]["artist"]
+        log.info(
+            "music.play | artist_radio_multiword query=%r preferred_artist=%r artist_matches=%d candidates=%d",
+            q,
+            preferred_artist,
+            len(_artist_matches),
+            len(results),
+        )
+        try:
+            tracks = await asyncio.to_thread(artist_radio, preferred_artist)
+        except sqlite3.OperationalError:
+            return ToolResult.failure(
+                "Music library database is temporarily unavailable. Please retry.",
+                retryable=True,
+            )
+        if tracks:
+            try:
+                await asyncio.to_thread(_sync_play_tracks, tracks)
+            except FileNotFoundError as exc:
+                log.warning("music.artist_radio_multiword | library_miss=%s", exc)
+                return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
+            except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+                log.warning("music.artist_radio_multiword | mpd_error=%s", exc)
+                return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+            return ToolResult(ok=True, data={
+                "action": "play",
+                "track": tracks[0],
+                "tracks": tracks,
+                "confidence": 0.86,
+                "picked_from": len(tracks),
+            })
 
     # Auto-pick with availability fallback:
     # try ranked candidates in order, skipping stale Strawberry rows that MPD
