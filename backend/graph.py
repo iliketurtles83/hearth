@@ -13,12 +13,22 @@ from typing import Any, AsyncIterator, Awaitable, Callable, TypedDict
 
 log = logging.getLogger("assistant.graph")
 
+import httpx
+
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
+from router import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, RouteDecision, classify_intent
+
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
 CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
+ROUTE_CONFIDENCE_THRESHOLD = float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", "0.55"))
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+ROUTER_PLANNER_ENABLED = os.getenv("ROUTER_PLANNER_ENABLED", "true").lower() == "true"
+ROUTER_PLANNER_TIMEOUT_MS = int(os.getenv("ROUTER_PLANNER_TIMEOUT_MS", "4000"))
+ROUTER_PLANNER_MAX_TOKENS = int(os.getenv("ROUTER_PLANNER_MAX_TOKENS", "200"))
+ROUTER_PLANNER_TEMPERATURE = float(os.getenv("ROUTER_PLANNER_TEMPERATURE", "0.0"))
 
 
 class AssistantState(TypedDict, total=False):
@@ -202,6 +212,115 @@ def _tool_summary_prompt(user_message: str, tool_data: dict[str, Any]) -> str:
     )
 
 
+_PLANNER_SYSTEM = """\
+You are a routing assistant. Analyse the user message and output a JSON object — \
+nothing else, no prose, no markdown fences. Use exactly this schema:
+{
+  "intent": "<quick-local|reasoning-heavy|code|external-data-needed|memory-needed>",
+  "route": "<local|cloud|tool>",
+  "tool": "<weather|music|null>",
+  "needs_memory": <true|false>,
+  "confidence": <0.0–1.0>,
+  "reasoning": "<one sentence>"
+}
+
+Rules:
+- intent=code  → route=local (code almost never needs cloud)
+- intent=external-data-needed → route=tool
+- intent=reasoning-heavy AND confidence>=0.55 → route=cloud
+- everything else → route=local
+- needs_memory=true when the request references prior facts or user preferences
+- confidence reflects how certain you are of the intent, not the answer quality
+"""
+
+
+def _parse_planner_output(raw: str) -> dict[str, Any]:
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        cleaned = "\n".join(line for line in lines if not line.startswith("```"))
+        cleaned = cleaned.strip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}") + 1
+    if start == -1 or end == 0:
+        raise ValueError("No JSON object found in planner output")
+
+    payload = json.loads(cleaned[start:end])
+    if not isinstance(payload, dict):
+        raise ValueError("Planner output must be a JSON object")
+
+    return payload
+
+
+def _decision_from_planner(
+    parsed: dict[str, Any],
+    prompt: str = "",
+    *,
+    chat_model: str,
+    cloud_model: str,
+    coder_model: str,
+) -> RouteDecision:
+    intent = str(parsed.get("intent", "")).strip()
+    route = str(parsed.get("route", "local")).strip() or "local"
+    tool = parsed.get("tool")
+    confidence = float(parsed.get("confidence", 0.5))
+    confidence = max(0.0, min(1.0, confidence))
+    needs_memory = bool(parsed.get("needs_memory", False))
+    reasoning = str(parsed.get("reasoning", "")).strip()[:300]
+
+    use_cloud = bool(route == "cloud" and intent == "reasoning-heavy" and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
+
+    if intent == "code":
+        model = coder_model
+    elif use_cloud:
+        model = cloud_model
+    else:
+        model = chat_model
+
+    safe_tool = None
+    if intent == "external-data-needed":
+        candidate = str(tool).strip().lower() if tool is not None and str(tool).lower() != "null" else ""
+        if candidate in {"weather", "music"}:
+            safe_tool = candidate
+        elif re.search(r"\b(weather|forecast|temperature|rain|snow|humidity)\b", prompt, re.IGNORECASE):
+            safe_tool = "weather"
+        elif re.search(r"\b(play|queue|pause|resume|skip|now\s+playing|what'?s\s+playing|what\s+is\s+playing)\b", prompt, re.IGNORECASE):
+            safe_tool = "music"
+
+    return RouteDecision(
+        intent=intent,
+        confidence=confidence,
+        use_cloud=use_cloud,
+        model=model,
+        tool=safe_tool,
+        planner_status="planner",
+        reasoning_summary=reasoning,
+        needs_memory=needs_memory,
+    )
+
+
+async def _call_planner(prompt: str) -> dict[str, Any]:
+    payload = {
+        "model": os.getenv("OLLAMA_CHAT_MODEL") or os.getenv("MODEL_LOCAL") or "llama3.2",
+        "prompt": f"User message: {prompt}",
+        "system": _PLANNER_SYSTEM,
+        "format": "json",
+        "stream": False,
+        "options": {
+            "num_predict": ROUTER_PLANNER_MAX_TOKENS,
+            "temperature": ROUTER_PLANNER_TEMPERATURE,
+        },
+    }
+    timeout = ROUTER_PLANNER_TIMEOUT_MS / 1000.0
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+        response.raise_for_status()
+        data = response.json()
+        raw = data.get("response", "")
+    return _parse_planner_output(raw)
+
+
 def code_context_retrieval(query: str, chroma_path: str, max_snippets: int = 5) -> str:
     """Fetch and format code-context snippets for prompt injection."""
     if not chroma_path:
@@ -359,7 +478,25 @@ def build_assistant_graph(
                     "needs_memory": False,
                 }
 
-        decision = await deps.router_route(state["message"])
+        decision: RouteDecision
+        if ROUTER_PLANNER_ENABLED:
+            try:
+                parsed = await _call_planner(state["message"])
+                decision = _decision_from_planner(
+                    parsed,
+                    state["message"],
+                    chat_model=deps.chat_model,
+                    cloud_model=deps.cloud_model,
+                    coder_model=deps.coder_model or deps.chat_model,
+                )
+            except Exception as exc:
+                log.warning("graph.intent_classifier | planner_failed=%s | falling_back=heuristic", exc)
+                decision = classify_intent(state["message"])
+                decision.planner_status = "fallback"
+        else:
+            decision = classify_intent(state["message"])
+            decision.planner_status = "disabled"
+
         route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
         if decision.intent == "code":
             route_type = "code"
@@ -949,6 +1086,25 @@ def build_assistant_graph(
         )
         return result if result else original
 
+    async def _emit_response_chunks(
+        stream: AsyncIterator[str],
+        *,
+        modality: str,
+        compress_model: str,
+    ) -> str:
+        writer = get_stream_writer()
+        if modality == "voice":
+            collected = ""
+            async for chunk in stream:
+                collected += chunk
+            return await _compress_response_for_voice(collected, compress_model)
+
+        response_text = ""
+        async for chunk in stream:
+            writer({"text": chunk})
+            response_text += chunk
+        return response_text
+
     async def responder(state: AssistantState) -> dict[str, Any]:
         writer = get_stream_writer()
         response_text = ""
@@ -966,60 +1122,48 @@ def build_assistant_graph(
                     message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),
                     system=state["augmented_system"],
                 )
+                response_text = await _emit_response_chunks(
+                    deps.stream_local(summary_request, model_name=deps.chat_model),
+                    modality=modality,
+                    compress_model=deps.chat_model,
+                )
                 if modality == "voice":
-                    collected = ""
-                    async for chunk in deps.stream_local(summary_request, model_name=deps.chat_model):
-                        collected += chunk
-                    response_text = await _compress_response_for_voice(collected, deps.chat_model)
                     writer({"text": response_text})
-                else:
-                    async for chunk in deps.stream_local(summary_request, model_name=deps.chat_model):
-                        writer({"text": chunk})
-                        response_text += chunk
             else:
                 response_text = getattr(tool_result, "error", "The tool returned no data.") or "The tool returned no data."
                 writer({"text": response_text})
         elif state.get("use_cloud"):
             response_model = deps.cloud_model
             try:
+                response_text = await _emit_response_chunks(
+                    deps.stream_cloud(state["augmented_system"], state["cloud_messages"]),
+                    modality=modality,
+                    compress_model=deps.chat_model,
+                )
                 if modality == "voice":
-                    collected = ""
-                    async for chunk in deps.stream_cloud(state["augmented_system"], state["cloud_messages"]):
-                        collected += chunk
-                    response_text = await _compress_response_for_voice(collected, deps.chat_model)
                     writer({"text": response_text})
-                else:
-                    async for chunk in deps.stream_cloud(state["augmented_system"], state["cloud_messages"]):
-                        writer({"text": chunk})
-                        response_text += chunk
             except Exception:
                 log.warning("graph.cloud_fallback | session_id=%s", state.get("session_id", ""))
                 response_model = deps.chat_model
                 writer({"notice": "Cloud unavailable \u2014 responding with local model"})
                 writer({"model": deps.chat_model, "intent": state.get("intent", ""), "confidence": state.get("confidence", 0.0), "fallback": True})
                 local_request = PromptRequest(message=state["local_prompt"], system=state["augmented_system"])
+                response_text = await _emit_response_chunks(
+                    deps.stream_local(local_request, model_name=deps.chat_model),
+                    modality=modality,
+                    compress_model=deps.chat_model,
+                )
                 if modality == "voice":
-                    collected = ""
-                    async for chunk in deps.stream_local(local_request, model_name=deps.chat_model):
-                        collected += chunk
-                    response_text = await _compress_response_for_voice(collected, deps.chat_model)
                     writer({"text": response_text})
-                else:
-                    async for chunk in deps.stream_local(local_request, model_name=deps.chat_model):
-                        writer({"text": chunk})
-                        response_text += chunk
         else:
             local_request = PromptRequest(message=state["local_prompt"], system=state["augmented_system"])
+            response_text = await _emit_response_chunks(
+                deps.stream_local(local_request, model_name=state["model"]),
+                modality=modality,
+                compress_model=deps.chat_model,
+            )
             if modality == "voice":
-                collected = ""
-                async for chunk in deps.stream_local(local_request, model_name=state["model"]):
-                    collected += chunk
-                response_text = await _compress_response_for_voice(collected, deps.chat_model)
                 writer({"text": response_text})
-            else:
-                async for chunk in deps.stream_local(local_request, model_name=state["model"]):
-                    writer({"text": chunk})
-                    response_text += chunk
 
         return {"response_text": response_text.strip(), "response_model": response_model}
 

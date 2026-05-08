@@ -45,6 +45,21 @@ class _FakeMemoryStore:
         return []
 
 
+@pytest.fixture(autouse=True)
+def _fake_planner(monkeypatch):
+    async def _planner(prompt: str):
+        return {
+            "intent": "quick-local",
+            "route": "local",
+            "tool": None,
+            "needs_memory": False,
+            "confidence": 0.99,
+            "reasoning": f"stubbed planner for {prompt}",
+        }
+
+    monkeypatch.setattr(assistant_graph, "_call_planner", _planner)
+
+
 def _base_state() -> assistant_graph.AssistantState:
     return {
         "user_id": "alice",
@@ -171,7 +186,7 @@ async def test_graph_checkpoint_resume_reloads_state_without_reexecution():
         result = await graph.ainvoke(_base_state(), config=config)
 
     assert result["response_text"] == "checkpoint state"
-    assert calls == {"router": 1, "local": 1}
+    assert calls == {"router": 0, "local": 1}
 
     async with assistant_graph.create_assistant_graph(deps, checkpoint_path=checkpoint_path) as graph_restarted:
         snapshot = await graph_restarted.aget_state(config)
@@ -179,7 +194,7 @@ async def test_graph_checkpoint_resume_reloads_state_without_reexecution():
     assert snapshot.values["response_text"] == "checkpoint state"
     assert snapshot.values["intent"] == "quick-local"
     # Snapshot read should not execute planner/LLM nodes again.
-    assert calls == {"router": 1, "local": 1}
+    assert calls == {"router": 0, "local": 1}
 
 
 @pytest.mark.asyncio
