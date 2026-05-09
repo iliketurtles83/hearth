@@ -347,15 +347,9 @@ download size and memory usage lower.
      an empty library and runs `beet import -A /music` automatically — it reads
      existing file tags with no MusicBrainz lookups and no files are moved.
   4. Subsequent startups skip the import because the DB is already populated.
-- **Migrating from Strawberry** — copy playcounts to Beets ratings (0–1 scale)
-  using the one-shot script:
-  ```bash
-  python backend/scripts/migrate_strawberry_playcount_to_beets.py \
-    --strawberry-db ~/.var/app/org.strawberrymusicplayer.strawberry/data/strawberry/strawberry.db \
-    --beets-db ~/.config/beets/library.db
-  # review the summary, then re-run with --apply to write changes
-  python backend/scripts/migrate_strawberry_playcount_to_beets.py ... --apply
-  ```
+  5. A manual way to trigger the import is from inside the running container:
+  `docker compose exec backend sh -c 'cd /beets && beet import -A /music'`
+    
 - `MUSIC_ROOT` (container path, default `/music`) must match the `music_directory`
   in `mpd/mpd.conf` so the backend can strip the prefix and produce MPD-relative paths.
 - `BEETS_DB_DIR` is the host directory bind-mounted into the backend container.
