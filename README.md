@@ -213,9 +213,9 @@ MEMORY_MIN_RELEVANCE_SCORE=0.28
 # CHROMA_PATH=/app/chroma
 #
 # Music / MPD (Phase 8)
-# BEETS_DB_PATH=/home/jack/.config/beets/library.db   # path to the Beets library.db
-# BEETS_DB_DIR=/home/jack/.config/beets               # host dir mounted at /beets in container
-# MUSIC_PATH=/media/jack/buffer/audio                 # host music dir (mounted at /music)
+# BEETS_DB_PATH=~/.config/beets/library.db   # path to the Beets library.db
+# BEETS_DB_DIR=~/.config/beets               # host dir mounted at /beets in container
+# MUSIC_PATH=buffer/audio                 # host music dir (mounted at /music)
 # MUSIC_ROOT=/music                                   # container-side mount point (matches mpd.conf)
 # MPD_HOST=mpd
 # MPD_PORT=6600
@@ -339,7 +339,7 @@ download size and memory usage lower.
 - The backend includes a local music tool that uses [Beets](https://beets.io/) as
   the music library and MPD for playback.
 - **New-user setup** — no Strawberry required:
-  1. Point `MUSIC_PATH` in `.env` at your music folder (e.g. `/media/jack/buffer/audio`).
+  1. Point `MUSIC_PATH` in `.env` at your music folder (e.g. `/path/to/audio`).
   2. Set `BEETS_DB_DIR` to the directory where Beets should keep `library.db`
   (default: `~/.config/beets`). Keep `BEETS_DB_PATH` as `/beets/library.db`
   for Docker, or set it to a different in-container filename if needed.
