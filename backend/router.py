@@ -8,7 +8,8 @@ that still expects ``await route(prompt)``.
 Intent categories:
     quick-local          — factual, short, conversational
     reasoning-heavy      — multi-step planning, analysis, architecture
-    code                 — code generation, debugging, explanation, file editing
+    code-question        — explanation, understanding, code review (answered by local code_tool)
+    code-write           — code generation, file edits, debugging (dispatched to external coding agent)
     external-data-needed — weather, news, live data, music playback commands
     memory-needed        — references to prior facts or user preferences
 """
@@ -44,7 +45,7 @@ _VALID_TOOL_NAMES = frozenset(["weather", "music"])
 
 @dataclass
 class RouteDecision:
-    intent: str           # quick-local | reasoning-heavy | code | external-data-needed | memory-needed
+    intent: str           # quick-local | reasoning-heavy | code-question | code-write | external-data-needed | memory-needed
     confidence: float     # 0.0–1.0
     use_cloud: bool
     model: str
@@ -54,12 +55,17 @@ class RouteDecision:
     reasoning_summary: str = ""      # server-log only, never sent to client
 
 
+def _is_code_intent(intent: str) -> bool:
+    """Return True for any code-related intent (question or write)."""
+    return intent in ("code-question", "code-write")
+
+
 def _pick_local_model(intent: str) -> str:
     """Return the appropriate local Ollama model for a given intent.
 
-    Code intents use CODER_MODEL; all others use CHAT_MODEL.
+    Both code-question and code-write use CODER_MODEL; all others use CHAT_MODEL.
     """
-    return CODER_MODEL if intent == "code" else CHAT_MODEL
+    return CODER_MODEL if _is_code_intent(intent) else CHAT_MODEL
 
 
 # ── Pattern banks ──────────────────────────────────────────────────────────────
@@ -179,7 +185,9 @@ _MEMORY_KEYWORDS = [
     "my name", "my preference", "my favorite", "my favourite", "my city",
 ]
 
-_CODE_PATTERNS = [
+# ── Code-write patterns (user wants code produced or files changed) ───────────
+
+_CODE_WRITE_PATTERNS = [
     r"\bwrite\s+me\s+code\b",
     r"\b(write|generate|create|implement)\b.{0,80}\b(in|using)\s+(python|javascript|typescript|sql|bash|shell|css|html)\b",
     r"\b(quicksort|quick\s*sort|merge\s*sort|binary\s*search)\b",
@@ -192,9 +200,10 @@ _CODE_PATTERNS = [
     r"\b(code|snippet|function|class|method)\b.{0,20}\bthat\b",
     r"\bhow\s+(do\s+I|to)\s+(implement|code|write|build|create)\b",
     r"\b(unit\s+test|integration\s+test|write\s+test)\b",
+    r"\b(add|remove|delete|rename|move|update|change)\b.{0,40}\b(function|class|method|file|module|endpoint|variable)\b",
 ]
 
-_CODE_KEYWORDS = [
+_CODE_WRITE_KEYWORDS = [
     "write me code",
     "in python",
     "write a function", "write a class", "write a script", "write a test",
@@ -206,12 +215,39 @@ _CODE_KEYWORDS = [
     "create an endpoint", "write an api", "write a module",
 ]
 
+# ── Code-question patterns (user wants explanation or understanding) ───────────
+
+_CODE_QUESTION_PATTERNS = [
+    r"\bexplain\b.{0,60}\b(function|class|method|code|script|algorithm|module|file|logic|pattern)\b",
+    r"\bhow\s+does\b.{0,60}\b(work|function|run|operate)\b",
+    r"\bwhat\s+(does|is)\b.{0,60}\b(function|class|method|code|this|doing|mean)\b",
+    r"\bwalk\s+(me\s+)?through\b",
+    r"\b(understand|explain)\b.{0,40}\b(code|function|class|module|script|algorithm)\b",
+    r"\bwhat'?s?\s+the\s+difference\b",
+    r"\bwhy\s+(does|is|do)\b.{0,40}\b(this|it|code)\b",
+    r"\b(review|look\s+at|read|inspect)\b.{0,40}\b(code|file|function|class|script)\b",
+    r"\bcan\s+you\s+(explain|describe|clarify|summarize|summarise)\b",
+    r"\bhow\s+(does|do)\s+(it|this|that)\b",
+    r"\b(coding|programming|code)\s+(solution|approach|example|snippet)\b",
+]
+
+_CODE_QUESTION_KEYWORDS = [
+    "explain", "how does", "what does", "walk through", "walk me through",
+    "how does this work", "what does this do", "what is this doing",
+    "understand this code", "make sense of", "what's the difference",
+    "why does this", "review this code", "look at this code",
+    "can you explain", "can you describe", "can you clarify",
+    "what's happening", "what is happening",
+    "coding solution", "code snippet", "how do i",
+]
+
 
 def _looks_like_code_request(text: str) -> bool:
-    """Conservative gate for forcing code routing on obvious coding prompts."""
+    """Conservative gate for detecting any code-related prompt (question or write)."""
     p = text.lower()
-    score = _score_patterns(p, _CODE_PATTERNS) + _score_keywords(p, _CODE_KEYWORDS)
-    return score >= 0.25
+    write_score = _score_patterns(p, _CODE_WRITE_PATTERNS) + _score_keywords(p, _CODE_WRITE_KEYWORDS)
+    question_score = _score_patterns(p, _CODE_QUESTION_PATTERNS) + _score_keywords(p, _CODE_QUESTION_KEYWORDS)
+    return max(write_score, question_score) >= 0.25
 
 
 def _score_patterns(text: str, patterns: list[str]) -> float:
@@ -230,7 +266,8 @@ def classify_intent(prompt: str) -> RouteDecision:
     scores: dict[str, float] = {
         "quick-local": 0.0,
         "reasoning-heavy": 0.0,
-        "code": 0.0,
+        "code-question": 0.0,
+        "code-write": 0.0,
         "external-data-needed": 0.0,
         "memory-needed": 0.0,
     }
@@ -255,9 +292,13 @@ def classify_intent(prompt: str) -> RouteDecision:
     scores["memory-needed"] += _score_patterns(p, _MEMORY_PATTERNS)
     scores["memory-needed"] += _score_keywords(p, _MEMORY_KEYWORDS)
 
-    # code signals — dampen quick-local baseline when strong
-    scores["code"] += _score_patterns(p, _CODE_PATTERNS)
-    scores["code"] += _score_keywords(p, _CODE_KEYWORDS)
+    # code-write signals — user wants code produced or files changed
+    scores["code-write"] += _score_patterns(p, _CODE_WRITE_PATTERNS)
+    scores["code-write"] += _score_keywords(p, _CODE_WRITE_KEYWORDS)
+
+    # code-question signals — user wants explanation or understanding
+    scores["code-question"] += _score_patterns(p, _CODE_QUESTION_PATTERNS)
+    scores["code-question"] += _score_keywords(p, _CODE_QUESTION_KEYWORDS)
 
     # quick-local baseline — short, conversational prompts
     if len(prompt) < 60:
@@ -271,7 +312,7 @@ def classify_intent(prompt: str) -> RouteDecision:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
     if scores["memory-needed"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
-    if scores["code"] >= 0.25:
+    if scores["code-write"] >= 0.25 or scores["code-question"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
 
     # Clamp all scores
@@ -287,7 +328,7 @@ def classify_intent(prompt: str) -> RouteDecision:
         confidence = 0.50
 
     # Routing: only send to cloud for reasoning-heavy with sufficient confidence.
-    # Code intent always stays local and uses the coder model.
+    # Code intents always stay local and use the coder model.
     use_cloud = (intent == "reasoning-heavy" and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
     model = CLOUD_MODEL if use_cloud else _pick_local_model(intent)
 

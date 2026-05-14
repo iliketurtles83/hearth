@@ -19,6 +19,7 @@ When this section conflicts with historical roadmap notes below, follow this sec
 - Phase 11 is complete (shipped as a single Hearth character prompt in `backend/hearth_prompt.txt`; tone_probe, persona_renderer, /persona endpoints, and persona UI panel were removed).
 - Phase 12 is complete (three-tier memory: working/episodic/semantic; consolidation worker; tiered retrieval; `GET /memory/episodic`, `POST /memory/consolidate`; tier badges in memory panel). The consolidation worker currently uses regex-based candidate extraction — this is the known gap addressed in Phase 12b.
 - Phase 12b is complete
+- Phase 13 is in progress (AgentAPI adapter `backend/tools/coding_agent.py` implemented; `code-write` intent split from `code-question`; confirmation gate nodes `coding_agent_tool` + `coding_agent_executor` wired in graph; voice UX tuned; 199 tests passing).
 - Active models: `gemma:e4b` (chat) and `qwen2.5-coder:14b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
@@ -837,7 +838,7 @@ Implementation notes:
 ---
 
 ### Phase 13 — Voice-activated external coding agent integration
-**Status: not started**
+**Status: in progress**
 **Estimate: 3–5 days**
 **Depends on: Phase 12b**
 

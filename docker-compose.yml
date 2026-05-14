@@ -22,18 +22,18 @@ services:
               capabilities: [gpu]
 
   # open-webui is out of Phase 0b scope — it remains on :3000 (plain HTTP).
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    container_name: open-webui
-    restart: unless-stopped
-    ports:
-      - "3000:8080"
-    volumes:
-      - open-webui:/app/backend/data
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
-    depends_on:
-      - ollama
+  # open-webui:
+  #   image: ghcr.io/open-webui/open-webui:main
+  #   container_name: open-webui
+  #   restart: unless-stopped
+  #   ports:
+  #     - "3000:8080"
+  #   volumes:
+  #     - open-webui:/app/backend/data
+  #   environment:
+  #     - OLLAMA_BASE_URL=http://ollama:11434
+  #   depends_on:
+  #     - ollama
 
   # MPD — music playback daemon (Phase 8).
   # Audio output: PulseAudio socket mounted from the host (PipeWire-PA compatible).

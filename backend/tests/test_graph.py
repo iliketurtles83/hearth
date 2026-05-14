@@ -245,3 +245,248 @@ async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
     result = await graph.ainvoke(state)
     assert result["intent"] == "confirm_write"
     assert result["response_text"] == "No pending write to execute."
+
+
+# ── Phase 13 — coding agent integration ───────────────────────────────────────
+
+def _deps_for_code_write() -> assistant_graph.AssistantGraphDependencies:
+    """Return minimal deps for coding-agent tests (stream_local not needed)."""
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "should not stream in coding agent gate tests"
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run in coding agent tests")
+
+    return assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        router_route=lambda _m: None,  # unused — routing goes through _call_planner
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+
+
+def _planner_returning(intent: str):
+    """Return an async planner stub that emits the given intent."""
+    async def _planner(prompt: str):
+        return {
+            "intent": intent,
+            "route": "local",
+            "tool": None,
+            "needs_memory": False,
+            "confidence": 0.9,
+            "reasoning": f"test stub for {intent}",
+        }
+    return _planner
+
+
+@pytest.mark.asyncio
+async def test_code_write_routes_to_coding_agent_tool(monkeypatch):
+    """code-write intent should trigger the confirmation gate, not the executor."""
+    monkeypatch.setattr(assistant_graph, "_call_planner", _planner_returning("code-write"))
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
+    state = _base_state()
+    state["message"] = "Write a Python function that sorts a list of integers."
+
+    result = await graph.ainvoke(state)
+
+    assert result["intent"] == "code-write"
+    assert result["awaiting_agent_confirmation"] is True
+    assert result["pending_code_task"] == state["message"]
+    # response_text should contain a confirmation prompt
+    assert "yes" in result["response_text"].lower()
+
+
+@pytest.mark.asyncio
+async def test_code_write_voice_prompt_is_short(monkeypatch):
+    """Voice confirmation prompt should be ≤ 12-word preview, not full task."""
+    monkeypatch.setattr(assistant_graph, "_call_planner", _planner_returning("code-write"))
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
+    long_task = "Write " + " ".join([f"word{i}" for i in range(30)])
+    state = _base_state()
+    state["message"] = long_task
+    state["modality"] = "voice"
+
+    result = await graph.ainvoke(state)
+
+    # The preview should be truncated — full task (30+ extra words) must not appear verbatim
+    assert result["pending_code_task"] == long_task
+    assert long_task not in result["response_text"]
+    assert "..." in result["response_text"]
+
+
+@pytest.mark.asyncio
+async def test_confirm_agent_task_routes_to_executor(monkeypatch):
+    """'yes' with pending agent task should invoke coding_agent_executor."""
+    import tools.coding_agent as _coding_agent_mod
+    from tools.base import ToolResult
+
+    async def _mock_agent_run(params: dict) -> ToolResult:
+        assert params["task"] == "Add type hints to utils.py"
+        return ToolResult(
+            ok=True,
+            data={"result": "Done.", "files_changed": ["utils.py"], "status": "success"},
+        )
+
+    monkeypatch.setattr(_coding_agent_mod, "run", _mock_agent_run)
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
+    state = _base_state()
+    state["message"] = "yes"
+    state["awaiting_agent_confirmation"] = True
+    state["pending_code_task"] = "Add type hints to utils.py"
+
+    result = await graph.ainvoke(state)
+
+    assert result["intent"] == "confirm_agent_task"
+    assert result["awaiting_agent_confirmation"] is False
+    assert result["pending_code_task"] == ""
+    assert "utils.py" in result["response_text"]
+
+
+@pytest.mark.asyncio
+async def test_orphan_yes_without_agent_pending_does_not_trigger_executor():
+    """'yes' without awaiting_agent_confirmation must not enter coding_agent_executor."""
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "normal response"
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+    graph = assistant_graph.build_assistant_graph(deps)
+    state = _base_state()
+    state["message"] = "yes"
+    state["awaiting_agent_confirmation"] = False
+    state["pending_code_task"] = ""
+
+    result = await graph.ainvoke(state)
+
+    # Should NOT be confirm_agent_task — routes normally
+    assert result.get("intent") != "confirm_agent_task"
+    assert result.get("awaiting_agent_confirmation") is not True
+
+
+# ── Slice 1 — Heuristic gate tests ───────────────────────────────────────────
+
+def _deps_for_weather_stream() -> assistant_graph.AssistantGraphDependencies:
+    """Deps suitable for weather-routing tests: tool_dispatch returns a valid weather result."""
+    from tools.base import ToolResult
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "It is cloudy."
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(tool_name: str, params: dict):
+        return ToolResult(
+            ok=True,
+            data={
+                "location": "London, UK",
+                "temperature": 12.0,
+                "feels_like": 9.0,
+                "humidity": 75,
+                "wind_speed": 15.0,
+                "condition": "Cloudy",
+                "units": {"temperature": "°C", "wind_speed": "km/h"},
+                "clothing": "Wear a jacket.",
+            },
+        )
+
+    return assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+
+
+@pytest.mark.asyncio
+async def test_heuristic_gate_skips_planner_for_weather(monkeypatch):
+    """High-confidence weather query must bypass _call_planner entirely."""
+    planner_calls: list[str] = []
+
+    async def _spy_planner(prompt: str):
+        planner_calls.append(prompt)
+        # Return a deliberately wrong intent — if this runs, the assertion below fails.
+        return {
+            "intent": "quick-local",
+            "route": "local",
+            "tool": None,
+            "needs_memory": False,
+            "confidence": 0.99,
+            "reasoning": "spy",
+        }
+
+    monkeypatch.setattr(assistant_graph, "_call_planner", _spy_planner)
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_weather_stream())
+    state = _base_state()
+    state["message"] = "weather in london"
+
+    result = await graph.ainvoke(state)
+
+    assert result["intent"] == "external-data-needed"
+    assert planner_calls == [], "Planner must not be called when heuristic gate fires"
+
+
+@pytest.mark.asyncio
+async def test_planner_failure_uses_precomputed_heuristic(monkeypatch):
+    """When _call_planner raises, the pre-computed heuristic is used without re-running classify_intent."""
+    async def _failing_planner(prompt: str):
+        raise RuntimeError("simulated planner timeout")
+
+    monkeypatch.setattr(assistant_graph, "_call_planner", _failing_planner)
+
+    async def _fake_stream_local(_request, model_name=None):
+        yield "fallback response"
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run in fallback test")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+
+    # "hello" → quick-local (not in _HEURISTIC_GATE) so planner is attempted then fails.
+    graph = assistant_graph.build_assistant_graph(deps)
+    state = _base_state()
+    state["message"] = "hello"
+
+    result = await graph.ainvoke(state)
+
+    assert result["intent"] == "quick-local"
+    assert result["planner_status"] == "fallback"

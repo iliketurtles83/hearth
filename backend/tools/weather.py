@@ -181,6 +181,73 @@ async def _fetch_current(
     }
 
 
+# ── Deterministic response formatting (no LLM) ────────────────────────────────
+
+_WEATHER_REASONING_RE = re.compile(
+    r"\b(should\s+i|would\s+you|is\s+it\s+(worth|good|safe|ok|okay|alright)"
+    r"|do\s+you\s+recommend|worth\s+going|can\s+i\s+\w+\s+outside)\b",
+    re.IGNORECASE,
+)
+
+# km/h and mph thresholds above which wind gets a note in the response.
+_WIND_NOTE_KMH: float = 30.0
+_WIND_NOTE_MPH: float = 19.0
+
+
+def is_weather_reasoning(prompt: str) -> bool:
+    """Return True when the prompt asks for a recommendation on top of weather data.
+
+    These queries need LLM reasoning; plain lookups ("weather in Tallinn") do not.
+    """
+    return bool(_WEATHER_REASONING_RE.search(prompt))
+
+
+def format_weather_response(data: dict) -> str:
+    """Format a weather ToolResult.data dict into a short human-readable string.
+
+    Deterministic — no LLM call needed for plain weather lookups.
+    Mirrors the music fastpath pattern (format_music_response in music_fastpath.py).
+    """
+    location = data.get("location", "your location")
+    temp = data.get("temperature")
+    feels_like = data.get("feels_like")
+    condition = data.get("condition", "")
+    wind_speed = data.get("wind_speed")
+    clothing = data.get("clothing", "")
+    units = data.get("units", {})
+    temp_unit = units.get("temperature", "°C")
+    wind_unit = units.get("wind_speed", "km/h")
+
+    parts: list[str] = []
+
+    # Primary sentence: condition + location + temperature.
+    if temp is not None:
+        sentence = f"It's {condition} in {location} — {temp}{temp_unit}"
+        try:
+            if feels_like is not None and abs(float(feels_like) - float(temp)) >= 2:
+                sentence += f" (feels like {feels_like}{temp_unit})"
+        except (TypeError, ValueError):
+            pass
+        sentence += "."
+    else:
+        sentence = f"It's {condition} in {location}."
+    parts.append(sentence)
+
+    # Clothing advice.
+    if clothing:
+        parts.append(clothing)
+
+    # Wind note only for notable wind speed.
+    threshold = _WIND_NOTE_MPH if wind_unit == "mph" else _WIND_NOTE_KMH
+    try:
+        if wind_speed is not None and float(wind_speed) >= threshold:
+            parts.append(f"Wind is {wind_speed} {wind_unit}.")
+    except (TypeError, ValueError):
+        pass
+
+    return " ".join(parts)
+
+
 async def run(params: dict[str, Any]) -> ToolResult:
     """Entry point called by tools.dispatch().
 

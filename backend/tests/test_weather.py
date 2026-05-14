@@ -295,3 +295,99 @@ class TestWeatherRun:
             "relative_humidity_2m", "wind_speed_10m", "weather_code",
         }
         assert not provider_fields.intersection(result.data.keys())
+
+
+# ── is_weather_reasoning tests ────────────────────────────────────────────────
+
+class TestIsWeatherReasoning:
+    def test_plain_lookup_is_not_reasoning(self):
+        assert not w.is_weather_reasoning("weather in Tallinn")
+
+    def test_what_is_weather_is_not_reasoning(self):
+        assert not w.is_weather_reasoning("What is the weather in Toronto?")
+
+    def test_should_i_is_reasoning(self):
+        assert w.is_weather_reasoning("Should I go for a run today?")
+
+    def test_is_it_worth_is_reasoning(self):
+        assert w.is_weather_reasoning("Is it worth going outside today?")
+
+    def test_do_you_recommend_is_reasoning(self):
+        assert w.is_weather_reasoning("Do you recommend I bring an umbrella?")
+
+    def test_is_it_safe_is_reasoning(self):
+        assert w.is_weather_reasoning("Is it safe to cycle in this weather?")
+
+
+# ── format_weather_response tests ─────────────────────────────────────────────
+
+def _sample_data(
+    location: str = "Tallinn, Estonia",
+    temp: float = 14.8,
+    feels_like: float = 12.0,
+    condition: str = "Clear sky",
+    wind_speed: float = 10.0,
+    clothing: str = "Light jacket or sweater.",
+    temp_unit: str = "°C",
+    wind_unit: str = "km/h",
+) -> dict:
+    return {
+        "location": location,
+        "temperature": temp,
+        "feels_like": feels_like,
+        "condition": condition,
+        "wind_speed": wind_speed,
+        "clothing": clothing,
+        "humidity": 60,
+        "units": {"temperature": temp_unit, "wind_speed": wind_unit},
+    }
+
+
+class TestFormatWeatherResponse:
+    def test_includes_location(self):
+        result = w.format_weather_response(_sample_data())
+        assert "Tallinn, Estonia" in result
+
+    def test_includes_temperature(self):
+        result = w.format_weather_response(_sample_data(temp=14.8))
+        assert "14.8" in result
+        assert "°C" in result
+
+    def test_includes_feels_like_when_notably_different(self):
+        result = w.format_weather_response(_sample_data(temp=14.8, feels_like=12.0))
+        assert "feels like" in result
+        assert "12.0" in result
+
+    def test_omits_feels_like_when_close(self):
+        result = w.format_weather_response(_sample_data(temp=14.8, feels_like=14.5))
+        assert "feels like" not in result
+
+    def test_includes_clothing(self):
+        result = w.format_weather_response(_sample_data(clothing="Wear a heavy coat."))
+        assert "Wear a heavy coat." in result
+
+    def test_includes_wind_note_above_threshold(self):
+        result = w.format_weather_response(_sample_data(wind_speed=35.0))
+        assert "35.0" in result
+        assert "km/h" in result
+
+    def test_omits_wind_note_below_threshold(self):
+        result = w.format_weather_response(_sample_data(wind_speed=10.0))
+        # wind_speed appears in data but should not appear in output below threshold
+        lines = result.lower()
+        assert "wind is" not in lines
+
+    def test_mph_wind_threshold(self):
+        # 18 mph is below threshold (19 mph), 20 mph is above
+        below = w.format_weather_response(_sample_data(wind_speed=18.0, wind_unit="mph"))
+        above = w.format_weather_response(_sample_data(wind_speed=20.0, wind_unit="mph"))
+        assert "wind is" not in below.lower()
+        assert "wind is" in above.lower()
+        assert "mph" in above
+
+    def test_missing_temp_still_returns_string(self):
+        data = _sample_data()
+        data["temperature"] = None
+        result = w.format_weather_response(data)
+        assert isinstance(result, str)
+        assert "Tallinn" in result

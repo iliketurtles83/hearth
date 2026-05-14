@@ -19,7 +19,8 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from router import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, RouteDecision, classify_intent
+from router import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, RouteDecision, classify_intent, _is_code_intent
+from tools.weather import format_weather_response, is_weather_reasoning
 
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
 CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
@@ -29,6 +30,14 @@ ROUTER_PLANNER_ENABLED = os.getenv("ROUTER_PLANNER_ENABLED", "true").lower() == 
 ROUTER_PLANNER_TIMEOUT_MS = int(os.getenv("ROUTER_PLANNER_TIMEOUT_MS", "4000"))
 ROUTER_PLANNER_MAX_TOKENS = int(os.getenv("ROUTER_PLANNER_MAX_TOKENS", "200"))
 ROUTER_PLANNER_TEMPERATURE = float(os.getenv("ROUTER_PLANNER_TEMPERATURE", "0.0"))
+
+# Minimum heuristic confidence required to skip the planner for deterministic intents.
+# Intents not listed here always go through the planner (when enabled).
+_HEURISTIC_GATE: dict[str, float] = {
+    "external-data-needed": float(os.getenv("HEURISTIC_GATE_EXTERNAL", "0.50")),
+    "code-question": float(os.getenv("HEURISTIC_GATE_CODE", "0.50")),
+    "code-write": float(os.getenv("HEURISTIC_GATE_CODE", "0.50")),
+}
 
 
 class AssistantState(TypedDict, total=False):
@@ -66,6 +75,9 @@ class AssistantState(TypedDict, total=False):
     force_code: bool                  # True for /code endpoint to bypass classifier
     # Phase 10c — responder modality split
     modality: str                     # "voice" or "chat"; set by /chat endpoint from request source
+    # Phase 13 — coding agent tool
+    pending_code_task: str            # code-write task description awaiting agent confirmation
+    awaiting_agent_confirmation: bool # True when a code-write task needs user approval before dispatch
 
 
 @dataclass
@@ -216,7 +228,7 @@ _PLANNER_SYSTEM = """\
 You are a routing assistant. Analyse the user message and output a JSON object — \
 nothing else, no prose, no markdown fences. Use exactly this schema:
 {
-  "intent": "<quick-local|reasoning-heavy|code|external-data-needed|memory-needed>",
+  "intent": "<quick-local|reasoning-heavy|code-question|code-write|external-data-needed|memory-needed>",
   "route": "<local|cloud|tool>",
   "tool": "<weather|music|null>",
   "needs_memory": <true|false>,
@@ -225,7 +237,7 @@ nothing else, no prose, no markdown fences. Use exactly this schema:
 }
 
 Rules:
-- intent=code  → route=local (code almost never needs cloud)
+- intent=code-question or code-write  → route=local (code almost never needs cloud)
 - intent=external-data-needed → route=tool
 - intent=reasoning-heavy AND confidence>=0.55 → route=cloud
 - everything else → route=local
@@ -271,7 +283,7 @@ def _decision_from_planner(
 
     use_cloud = bool(route == "cloud" and intent == "reasoning-heavy" and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
 
-    if intent == "code":
+    if _is_code_intent(intent):
         model = coder_model
     elif use_cloud:
         model = cloud_model
@@ -410,7 +422,7 @@ def build_assistant_graph(
             writer({
                 "meta": {
                     "model": deps.coder_model or deps.chat_model,
-                    "intent": "code",
+                    "intent": "code-question",
                     "confidence": 1.0,
                     "route_type": "code",
                     "needs_memory": True,
@@ -420,7 +432,7 @@ def build_assistant_graph(
                 }
             })
             return {
-                "intent": "code",
+                "intent": "code-question",
                 "confidence": 1.0,
                 "use_cloud": False,
                 "model": deps.coder_model or deps.chat_model,
@@ -444,6 +456,26 @@ def build_assistant_graph(
                 return {
                     "intent": "confirm_write",
                     "route_type": "write_executor",
+                    "confidence": 1.0,
+                    "use_cloud": False,
+                    "planner_status": "deterministic",
+                    "reasoning_summary": "",
+                    "needs_memory": False,
+                }
+
+        # Short-circuit: if a coding agent task is pending and the user confirmed it,
+        # skip normal routing and go straight to coding_agent_executor.
+        if state.get("awaiting_agent_confirmation") and state.get("pending_code_task"):
+            msg = str(state.get("message", "")).strip()
+            if _CONFIRM_PATTERN.match(msg):
+                log.info(
+                    "graph.intent_classifier | confirm_agent_task detected | session=%s",
+                    state.get("session_id", ""),
+                )
+                writer({"meta": {"intent": "confirm_agent_task", "route_type": "coding_agent_executor"}})
+                return {
+                    "intent": "confirm_agent_task",
+                    "route_type": "coding_agent_executor",
                     "confidence": 1.0,
                     "use_cloud": False,
                     "planner_status": "deterministic",
@@ -478,8 +510,26 @@ def build_assistant_graph(
                     "needs_memory": False,
                 }
 
+        # Compute heuristic unconditionally so it can (a) gate the planner for
+        # high-confidence deterministic intents and (b) serve as a pre-computed
+        # fallback on planner failure — classify_intent is never called twice.
+        heuristic = classify_intent(state["message"])
+        gate_threshold = _HEURISTIC_GATE.get(heuristic.intent)
+        skip_planner = gate_threshold is not None and heuristic.confidence >= gate_threshold
+
         decision: RouteDecision
-        if ROUTER_PLANNER_ENABLED:
+        if not ROUTER_PLANNER_ENABLED or skip_planner:
+            decision = heuristic
+            if not ROUTER_PLANNER_ENABLED:
+                decision.planner_status = "disabled"
+            else:
+                log.debug(
+                    "graph.intent_classifier | heuristic_gate | intent=%s confidence=%.2f",
+                    heuristic.intent,
+                    heuristic.confidence,
+                )
+                # planner_status already "heuristic" from classify_intent
+        else:
             try:
                 parsed = await _call_planner(state["message"])
                 decision = _decision_from_planner(
@@ -491,14 +541,11 @@ def build_assistant_graph(
                 )
             except Exception as exc:
                 log.warning("graph.intent_classifier | planner_failed=%s | falling_back=heuristic", exc)
-                decision = classify_intent(state["message"])
+                decision = heuristic
                 decision.planner_status = "fallback"
-        else:
-            decision = classify_intent(state["message"])
-            decision.planner_status = "disabled"
 
         route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
-        if decision.intent == "code":
+        if _is_code_intent(decision.intent):
             route_type = "code"
         writer({
             "meta": {
@@ -546,7 +593,7 @@ def build_assistant_graph(
         # - Code intents: code_context_retrieval() queries 'code_context' only.
         # The two collections are strictly separate — see Phase 10d for migration details.
         code_context = ""
-        if state.get("intent") == "code":
+        if _is_code_intent(state.get("intent", "")):
             log.info(
                 "graph.memory_retrieval | collection=code_context | session=%s",
                 state.get("session_id", ""),
@@ -1047,6 +1094,126 @@ def build_assistant_graph(
             "active_files": sorted(touched_files),
         }
 
+    async def coding_agent_tool(state: AssistantState) -> dict[str, Any]:
+        """Confirmation gate for code-write tasks dispatched to the external coding agent.
+
+        Presents the planned task to the user and waits for explicit confirmation
+        before dispatching to AgentAPI. Sets awaiting_agent_confirmation=True and
+        stores the task in pending_code_task state.
+        """
+        writer = get_stream_writer()
+        task = str(state.get("message", "")).strip()
+        modality = state.get("modality", "chat")
+
+        if modality == "voice":
+            words = task.split()
+            task_preview = " ".join(words[:12]) + ("..." if len(words) > 12 else "")
+            confirm_text = (
+                f"Got it. {task_preview}. "
+                "Say yes to confirm, or tell me what to change."
+            )
+        else:
+            confirm_text = (
+                "I'll send this task to the external coding agent:\n\n"
+                f"> {task}\n\n"
+                "Type **yes** to confirm, or describe what you want changed."
+            )
+
+        writer({"text": confirm_text})
+        log.info(
+            "graph.coding_agent_tool | awaiting_confirmation | session=%s task_len=%d",
+            state.get("session_id", ""),
+            len(task),
+        )
+        return {
+            "response_text": confirm_text,
+            "response_model": deps.coder_model or deps.chat_model,
+            "pending_code_task": task,
+            "awaiting_agent_confirmation": True,
+        }
+
+    async def coding_agent_executor(state: AssistantState) -> dict[str, Any]:
+        """Execute a confirmed code-write task via the external AgentAPI adapter.
+
+        Reads pending_code_task and code_context from state, calls coding_agent.run(),
+        shapes the result based on modality, and clears the confirmation flags.
+        """
+        writer = get_stream_writer()
+        task = str(state.get("pending_code_task", "") or state.get("message", "")).strip()
+        code_context = state.get("code_context", "") or ""
+        session_id = state.get("session_id", "")
+        modality = state.get("modality", "chat")
+
+        _base: dict[str, Any] = {
+            "pending_code_task": "",
+            "awaiting_agent_confirmation": False,
+            "response_model": deps.coder_model or deps.chat_model,
+        }
+
+        if not task:
+            msg = "No pending coding task to execute."
+            writer({"text": msg})
+            return {**_base, "response_text": msg}
+
+        log.info(
+            "graph.coding_agent_executor | dispatching | session=%s task_len=%d context_len=%d",
+            session_id,
+            len(task),
+            len(code_context),
+        )
+
+        try:
+            from tools.coding_agent import run as _agent_run
+        except ImportError:
+            msg = "Coding agent tool is not available. Check backend/tools/coding_agent.py."
+            writer({"text": msg})
+            return {**_base, "response_text": msg}
+
+        result = await _agent_run({
+            "task": task,
+            "context": code_context,
+            "session_id": session_id,
+        })
+
+        if not result.ok:
+            msg = result.error or "The coding agent returned an error."
+            writer({"text": msg})
+            return {**_base, "response_text": msg}
+
+        result_text: str = result.data.get("result", "")
+        files_changed: list[str] = result.data.get("files_changed", [])
+
+        if modality == "voice":
+            if files_changed:
+                names = [f.split("/")[-1] for f in files_changed[:3]]
+                files_summary = ", ".join(names)
+                if len(files_changed) > 3:
+                    files_summary += f" and {len(files_changed) - 3} more"
+                spoken_base = f"Done. Modified {files_summary}."
+            else:
+                spoken_base = "Done. The coding agent completed the task."
+            full_spoken = spoken_base + (f" {result_text}" if result_text else "")
+            response_text = await _compress_response_for_voice(full_spoken, deps.chat_model)
+            writer({"text": response_text})
+        else:
+            parts: list[str] = []
+            if files_changed:
+                files_list = "\n".join(f"- `{f}`" for f in files_changed)
+                parts.append(f"**Files changed:**\n{files_list}")
+            if result_text:
+                parts.append(result_text)
+            if not parts:
+                parts.append("The coding agent completed the task.")
+            response_text = "\n\n".join(parts)
+            writer({"text": response_text})
+
+        log.info(
+            "graph.coding_agent_executor | done | files=%d session=%s",
+            len(files_changed),
+            session_id,
+        )
+        return {**_base, "response_text": response_text}
+
     _VOICE_COMPRESS_SYSTEM = (
         "You convert assistant responses to natural spoken English for audio output. "
         "Rules:\n"
@@ -1118,17 +1285,22 @@ def build_assistant_graph(
             )
             if getattr(tool_result, "ok", False):
                 response_model = deps.chat_model
-                summary_request = PromptRequest(
-                    message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),
-                    system=state["augmented_system"],
-                )
-                response_text = await _emit_response_chunks(
-                    deps.stream_local(summary_request, model_name=deps.chat_model),
-                    modality=modality,
-                    compress_model=deps.chat_model,
-                )
-                if modality == "voice":
+                # Weather fast-path: skip LLM for plain lookups.
+                if state["tool"] == "weather" and not is_weather_reasoning(state["message"]):
+                    response_text = format_weather_response(getattr(tool_result, "data", {}))
                     writer({"text": response_text})
+                else:
+                    summary_request = PromptRequest(
+                        message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),
+                        system=state["augmented_system"],
+                    )
+                    response_text = await _emit_response_chunks(
+                        deps.stream_local(summary_request, model_name=deps.chat_model),
+                        modality=modality,
+                        compress_model=deps.chat_model,
+                    )
+                    if modality == "voice":
+                        writer({"text": response_text})
             else:
                 response_text = getattr(tool_result, "error", "The tool returned no data.") or "The tool returned no data."
                 writer({"text": response_text})
@@ -1172,10 +1344,14 @@ def build_assistant_graph(
     def _after_intent_classifier(state: AssistantState) -> str:
         if state.get("intent") == "confirm_write":
             return "write_executor"
+        if state.get("intent") == "confirm_agent_task":
+            return "coding_agent_executor"
         return "memory_retrieval"
 
     def _after_tool_router(state: AssistantState) -> str:
-        if state.get("intent") == "code":
+        if state.get("intent") == "code-write":
+            return "coding_agent_tool"
+        if state.get("intent") == "code-question":
             return "code_tool"
         return "responder"
 
@@ -1186,20 +1362,26 @@ def build_assistant_graph(
     graph.add_node("tool_router", tool_router)
     graph.add_node("code_tool", code_tool)
     graph.add_node("write_executor", write_executor)
+    graph.add_node("coding_agent_tool", coding_agent_tool)
+    graph.add_node("coding_agent_executor", coding_agent_executor)
     graph.add_node("responder", responder)
 
     graph.add_edge(START, "intent_classifier")
     graph.add_conditional_edges("intent_classifier", _after_intent_classifier, {
         "memory_retrieval": "memory_retrieval",
         "write_executor": "write_executor",
+        "coding_agent_executor": "coding_agent_executor",
     })
     graph.add_edge("memory_retrieval", "tool_router")
     graph.add_conditional_edges("tool_router", _after_tool_router, {
+        "coding_agent_tool": "coding_agent_tool",
         "code_tool": "code_tool",
         "responder": "responder",
     })
     graph.add_edge("code_tool", END)
     graph.add_edge("write_executor", END)
+    graph.add_edge("coding_agent_tool", END)
+    graph.add_edge("coding_agent_executor", END)
     graph.add_edge("responder", END)
 
     return graph.compile(checkpointer=checkpointer)
