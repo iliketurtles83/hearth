@@ -35,8 +35,6 @@ Path rewrite:
     resulting MPD-relative path (relative to MPD music_directory) to MPD.
 
   Example:
-    Beets path: /media/jack/buffer/audio/rock/artist/song.mp3
-    MUSIC_ROOT: /media/jack/buffer/audio
     MPD-relative:   rock/artist/song.mp3
     MPD resolves:   /music/rock/artist/song.mp3  (music_directory=/music)
 

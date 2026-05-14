@@ -6,7 +6,7 @@ from __future__ import annotations
 # Kokoro stays optional and runtime-dependent. If assets are missing, the benchmark
 # may report winner=none; default still stays Piper for deployment consistency.
 # Re-run benchmarks with:
-#   /home/jack/assistant/.venv/bin/python backend/scripts/benchmark_tts.py
+#   venv/bin/python backend/scripts/benchmark_tts.py
 # after changing model assets, drivers, or TTS runtime packages.
 
 import importlib

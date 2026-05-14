@@ -248,6 +248,22 @@ class MemoryStore:
         return None
 
     def _extract_candidates(self, message: str, source: str) -> list[MemoryCandidate]:
+        """Extract memory candidates using regex pattern matching (fallback for direct ingestion).
+
+        Phase 12b: This regex extractor is retained for direct user message ingestion via
+        ingest_user_message() to maintain a fast, lightweight path for explicit memory
+        commands ("Remember that..." hints). The consolidation worker uses LLM-based
+        extraction (_llm_extract_candidates) for richer candidate discovery from episodic
+        summaries.
+
+        Regex patterns handle:
+        - Explicit preferences: "my favorite X is Y", "I prefer X", "default Y is Z"
+        - Explicit facts: "my name is X", "I live in Y", "I work on Z", "I lived in W"
+        - Explicit memory hints: "remember X: Y" (parsed as-is for high-value facts)
+
+        This path is intentionally simple and fast (no LLM call). For semantic extraction
+        from episodic text, use _llm_extract_candidates() instead.
+        """
         m = message.strip()
         lower = m.lower()
         out: list[MemoryCandidate] = []
