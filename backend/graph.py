@@ -19,7 +19,7 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from router import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, RouteDecision, classify_intent, _is_code_intent
+from router import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, VISION_MODEL, RouteDecision, classify_intent, _is_code_intent
 from tools.weather import format_weather_response, is_weather_reasoning
 
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
@@ -78,6 +78,9 @@ class AssistantState(TypedDict, total=False):
     # Phase 13 — coding agent tool
     pending_code_task: str            # code-write task description awaiting agent confirmation
     awaiting_agent_confirmation: bool # True when a code-write task needs user approval before dispatch
+    # Phase 14 — vision input
+    image_base64: str | None          # raw base64 image (ephemeral, not persisted)
+    image_mime: str | None            # "image/png" | "image/jpeg" | "image/webp"
 
 
 @dataclass
@@ -97,6 +100,9 @@ class AssistantGraphDependencies:
     cloud_model: str
     coder_model: str = ""             # Phase 10b: OLLAMA_CODER_MODEL for code_tool node
     chroma_path: str = ""             # Phase 10b: path to ChromaDB directory for code_context
+    # Phase 14: vision model callable — calls Ollama /api/chat with images
+    stream_local_vision: Callable[[PromptRequest, str, str], AsyncIterator[str]] | None = None
+    vision_model: str = ""            # Phase 14: OLLAMA_VISION_MODEL (defaults to chat_model)
 
 
 def checkpoint_config(session_id: str) -> dict[str, Any]:
@@ -510,6 +516,36 @@ def build_assistant_graph(
                     "needs_memory": False,
                 }
 
+        # Phase 14: image attachment is a structural signal — skip the classifier
+        # entirely.  There is no ambiguous case: an attached image always means
+        # "vision request".  The classifier still runs for imageless visual queries
+        # (e.g. "describe this photo?" with no image) so keyword scoring is preserved.
+        if state.get("image_base64"):
+            vision_model = deps.vision_model or deps.chat_model
+            writer({
+                "meta": {
+                    "model": vision_model,
+                    "intent": "vision",
+                    "confidence": 1.0,
+                    "route_type": "vision",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "deterministic",
+                    "reasoning_summary": "",
+                }
+            })
+            return {
+                "intent": "vision",
+                "confidence": 1.0,
+                "use_cloud": False,
+                "model": vision_model,
+                "tool": None,
+                "planner_status": "deterministic",
+                "reasoning_summary": "",
+                "needs_memory": False,
+                "route_type": "vision",
+            }
+
         # Compute heuristic unconditionally so it can (a) gate the planner for
         # high-confidence deterministic intents and (b) serve as a pre-computed
         # fallback on planner failure — classify_intent is never called twice.
@@ -547,6 +583,7 @@ def build_assistant_graph(
         route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
         if _is_code_intent(decision.intent):
             route_type = "code"
+
         writer({
             "meta": {
                 "model": decision.model,
@@ -1277,6 +1314,71 @@ def build_assistant_graph(
         response_text = ""
         response_model = state.get("model", deps.chat_model)
         modality = state.get("modality", "chat")
+
+        # ── Phase 14: vision path ────────────────────────────────────────────
+        if state.get("intent") == "vision" and state.get("image_base64"):
+            image_b64 = state["image_base64"]
+            image_mime = state.get("image_mime") or "image/png"
+            vision_request = PromptRequest(
+                message=state.get("local_prompt") or state["message"],
+                system=state.get("augmented_system") or state.get("system") or "",
+            )
+            local_vision_ok = False
+            if deps.stream_local_vision is not None:
+                try:
+                    response_text = await _emit_response_chunks(
+                        deps.stream_local_vision(vision_request, image_b64, image_mime),
+                        modality=modality,
+                        compress_model=deps.chat_model,
+                    )
+                    if modality == "voice":
+                        writer({"text": response_text})
+                    response_model = deps.vision_model or deps.chat_model
+                    local_vision_ok = True
+                except Exception as exc:
+                    log.warning(
+                        "graph.responder | vision_local_failed=%s | trying_cloud",
+                        exc,
+                    )
+
+            if not local_vision_ok:
+                # Cloud fallback: Anthropic vision API (multimodal message format)
+                response_model = deps.cloud_model
+                vision_cloud_messages = [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": image_mime,
+                                    "data": image_b64,
+                                },
+                            },
+                            {"type": "text", "text": vision_request.message},
+                        ],
+                    }
+                ]
+                try:
+                    response_text = await _emit_response_chunks(
+                        deps.stream_cloud(vision_request.system, vision_cloud_messages),
+                        modality=modality,
+                        compress_model=deps.chat_model,
+                    )
+                    if modality == "voice":
+                        writer({"text": response_text})
+                except Exception as exc:
+                    log.error("graph.responder | vision_cloud_failed=%s", exc)
+                    response_text = (
+                        "I can't process this image right now — the local vision model and "
+                        "cloud fallback are both unavailable. "
+                        "Run `ollama pull gemma:e4b` to enable local image understanding."
+                    )
+                    writer({"text": response_text})
+
+            return {"response_text": response_text.strip(), "response_model": response_model}
+        # ── End vision path ──────────────────────────────────────────────────
 
         if state.get("tool"):
             tool_result = await deps.tool_dispatch(

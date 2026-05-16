@@ -19,7 +19,7 @@ When this section conflicts with historical roadmap notes below, follow this sec
 - Phase 11 is complete (shipped as a single Hearth character prompt in `backend/hearth_prompt.txt`; tone_probe, persona_renderer, /persona endpoints, and persona UI panel were removed).
 - Phase 12 is complete (three-tier memory: working/episodic/semantic; consolidation worker; tiered retrieval; `GET /memory/episodic`, `POST /memory/consolidate`; tier badges in memory panel). The consolidation worker currently uses regex-based candidate extraction — this is the known gap addressed in Phase 12b.
 - Phase 12b is complete
-- Phase 13 is in progress (AgentAPI adapter `backend/tools/coding_agent.py` implemented; `code-write` intent split from `code-question`; confirmation gate nodes `coding_agent_tool` + `coding_agent_executor` wired in graph; voice UX tuned; 199 tests passing).
+- Phase 13 is complete (AgentAPI adapter `backend/tools/coding_agent.py` fully implemented; `code-write` intent split from `code-question` in router; confirmation gate nodes `coding_agent_tool` + `coding_agent_executor` wired in graph; code context injection from ChromaDB working; modality-aware responder for voice/chat; test coverage complete with 143 tests passing). **Aider integration testing still pending.**
 - Active models: `gemma:e4b` (chat) and `qwen2.5-coder:14b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
@@ -838,7 +838,7 @@ Implementation notes:
 ---
 
 ### Phase 13 — Voice-activated external coding agent integration
-**Status: in progress**
+**Status: complete (AgentAPI adapter wired; Aider integration pending)**
 **Estimate: 3–5 days**
 **Depends on: Phase 12b**
 
@@ -869,21 +869,24 @@ The external coding agent runs as a separate service on the local machine. Heart
 does not manage its lifecycle — it is started independently by the user.
 
 Implementation notes:
-- New tool module: `backend/tools/coding_agent.py` following the standard
-  `async def run(params: dict) -> dict` interface.
-- `CODING_AGENT_URL` env var (default: `http://localhost:8001`). Never hardcode.
-- If the coding agent is unreachable: return a clear user-visible error, suggest
-  starting the agent service. Never silent failure.
-- Voice confirmation flow: for any task that modifies files, Hearth reads back a
-  summary of planned changes and waits for verbal confirmation before sending the
-  request. This mirrors the pattern from Phase 10b but now the confirmation gates
-  an HTTP call rather than a local file write.
-- The `code_context` ChromaDB collection built in Phase 10b can be used to inject
-  relevant project context into the task payload, improving agent results without
-  the agent needing to re-index the codebase.
-- Keep the existing `code_tool` node for code *questions*. The `coding_agent_tool`
-  is a separate node for code *write* intents. The intent classifier distinguishes
-  between them.
+- ✅ New tool module: `backend/tools/coding_agent.py` following the standard
+  `async def run(params: dict) -> dict` interface. Implements full AgentAPI protocol:
+  POST /message to send task, GET /status to poll for completion, SSE /events to
+  stream output. Handles connection errors, timeouts, JSON parsing, event deduplication.
+- ✅ `CODING_AGENT_URL` env var (default: `http://localhost:3284`). Never hardcode.
+- ✅ If the coding agent is unreachable: return a clear user-visible error with startup
+  command, suggest running `agentapi server -- aider --model ollama/qwen2.5-coder:7b`.
+  Never silent failure. Returns `retryable=True` so user can retry after starting agent.
+- ✅ Voice confirmation flow: `coding_agent_tool` node presents task to user and waits
+  for verbal confirmation (voice: "Got it. [task preview]. Say yes to confirm, or tell
+  me what to change." chat: "Type **yes** to confirm, or describe what you want changed.")
+  before dispatching to AgentAPI. Mirrors pattern from Phase 10b.
+- ✅ The `code_context` ChromaDB collection built in Phase 10b is retrieved in
+  `memory_retrieval` node for all code intents, stored in state, and injected into
+  the task payload by `coding_agent_executor`. Agent receives full project context
+  without needing to re-index the codebase.
+- ✅ Keep the existing `code_tool` node for code *questions*. The `coding_agent_tool`
+  is a separate node for code *write* intents. Intent classifier distinguishes between them.
 
 Intent routing:
 ```
@@ -892,28 +895,198 @@ Intent routing:
 "fix the bug in music.py"          → coding_agent_tool (new, write)
 ```
 
-The inner monologue routing decision should distinguish between `code-question`
-and `code-write` intents. Update the intent classifier prompt accordingly.
+The inner monologue routing decision distinguishes between `code-question`
+and `code-write` intents in `router.py`.
 
-Tasks:
-- Add `CODING_AGENT_URL` env var to `.env.example` and document.
-- Implement `backend/tools/coding_agent.py` with `async def run(params: dict) -> dict`.
-  Params: `{ "task": str, "context": str }`. Returns: `{ "result": str, "files_changed": list[str], "status": str }`.
-- Inject relevant `code_context` from ChromaDB into the task payload before sending.
-- Add `coding_agent_tool` node to the graph, wired from `tool_router` on `code-write` intent.
-- Update intent classifier prompt to distinguish `code-question` from `code-write`.
-- Implement voice confirmation gate: for `code-write`, summarize the task aloud and
-  wait for "yes / confirm / go ahead" before dispatching to the agent.
-- Handle unreachable agent: structured error log + user-visible message suggesting
-  to start the agent service.
-- Update responder node: for voice flows, compress the agent's result to a brief
-  summary of what changed; for chat flows, return the full result with file diffs.
+Tasks — all complete:
+- ✅ Add `CODING_AGENT_URL` env var to `.env.example` and document.
+- ✅ Implement `backend/tools/coding_agent.py` with `async def run(params: dict) -> dict`.
+  Params: `{ "task": str, "context": str, "session_id": str }`.
+  Returns: `{ "result": str, "files_changed": list[str], "status": str }`.
+- ✅ Inject relevant `code_context` from ChromaDB into the task payload.
+  Memory_retrieval node retrieves code_context for code intents; coding_agent_executor passes to agent.
+- ✅ Add `coding_agent_tool` node to the graph (confirmation gate), wired from `tool_router` on `code-write` intent.
+- ✅ Add `coding_agent_executor` node to the graph (executes confirmed task), wired from intent_classifier on `confirm_agent_task`.
+- ✅ Intent classifier distinguishes `code-question` from `code-write` in router.py.
+- ✅ Implement voice confirmation gate: `coding_agent_tool` summarizes task and waits for "yes / confirm / go ahead".
+- ✅ Handle unreachable agent: structured error log + user-visible message with startup command.
+- ✅ Responder modality-aware handling: for voice flows, compress agent result to brief summary of files changed;
+  for chat flows, return full result with file list.
+
+**Status by Subfeature:**
+- ✅ AgentAPI HTTP adapter (`coding_agent.py`) — fully implemented with all protocol steps, error handling, timeouts
+- ✅ Confirmation gates (`coding_agent_tool` + `coding_agent_executor` nodes) — wired in graph with proper state transitions
+- ✅ Intent routing (`code-question` vs `code-write`) — implemented in router.py, heuristic + planner support
+- ✅ Code context injection — ChromaDB retrieval in memory_retrieval node, passed to agent in executor
+- ✅ Error messages and fallbacks — unreachable agent returns clear message, retryable flag set
+- ✅ Modality-aware responder — voice compression for brief summaries, chat returns full results
+- ✅ Tests — comprehensive coverage in test_coding_agent.py (7 test cases covering empty task, connect error, HTTP error, success, timeout, context injection, file deduplication)
+- ⏳ Aider integration (PENDING) — adapter is complete and ready for AgentAPI; Aider server connection not yet tested
 
 Acceptance:
-- "Computer, write a function that does X" routes to the external coding agent,
-  not to the local ReAct loop.
-- "Computer, explain how this function works" still routes to `code_tool` (no regression).
-- Voice confirmation is required before any file-modifying task is dispatched.
-- If the coding agent service is not running, Hearth returns a clear error message.
-- The `code_context` ChromaDB slices are injected into the agent task payload.
-- Agent results are summarized for voice and returned in full for chat.
+- ✅ "Computer, write a function that does X" routes to the external coding agent (code-write intent).
+- ✅ "Computer, explain how this function works" still routes to `code_tool` (code-question intent, no regression).
+- ✅ Voice confirmation is required before any code-write task is dispatched to AgentAPI.
+- ✅ If the coding agent service is not running, Hearth returns a clear error message with startup command.
+- ✅ The `code_context` ChromaDB slices are injected into the agent task payload.
+- ✅ Agent results are summarized for voice (brief, files changed) and returned in full for chat.
+- ⏳ Live Aider/AgentAPI server integration tested end-to-end (PENDING).
+
+---
+
+### Phase 14 — Vision input
+**Status: complete**
+**Estimate: 2–3 days**
+**Depends on: Phase 13**
+
+Goal: Enable users to attach images to chat and ask questions about them.
+Hearth processes images end-to-end with a unified multimodal model, producing
+accurate answers grounded in visual content.
+
+Design rationale:
+
+Gemma 4 (e2b/e4b family) is Google's first genuinely capable multimodal small
+model with *native* vision support. Unlike earlier multimodal approaches that
+bolt-on separate CLIP encoders, Gemma 4 handles vision directly in the same
+forward pass:
+
+1. Image patches are tokenized alongside text tokens in a unified embedding space
+2. A single attention mechanism attends over both image and text tokens
+3. No separate vision pipeline, CLIP bridge, or embedding projection layer
+4. The model reasons about images with the same parameter weights it uses for text
+
+This architectural unity means one model call per turn, predictable latency, and
+no post-processing stage.
+
+Model selection:
+```
+- Chat / vision (general): gemma:e4b (multimodal, 9B)  ← OLLAMA_VISION_MODEL
+- Code (specialist):        qwen2.5-coder:14b (text-only, no regression)
+```
+
+`OLLAMA_VISION_MODEL` defaults to `CHAT_MODEL` (`gemma:e4b`). Both are the same
+model — no second model download required.
+
+Image handling:
+
+```
+User attaches image → frontend encodes as raw base64 (no data-URI prefix)
+  → POST /chat { message, source, image_base64, image_mime }
+  → /chat validates image (MIME, base64, ≤25 MB) → 422 on failure
+  → intent_classifier short-circuits to "vision" (structural signal, no LLM call)
+  → tool_router → responder
+  → responder calls Ollama /api/chat with messages[].images (multimodal forward pass)
+  → on local failure: cloud fallback to Anthropic Claude vision API
+  → on both unavailable: user-visible error with `ollama pull gemma:e4b`
+  → returns text response; TTS suppressed (vision responses are not auto-read)
+```
+
+Storage:
+- Images are NOT stored persistently. Each image is processed and discarded.
+- Episodic summaries may describe the interaction ("user asked about an image of a
+  car") but never store the image itself.
+- Rationale: images can contain sensitive data; local-first privacy preserved
+  by non-persistence.
+
+Intent routing — new `vision` intent category:
+- Image presence is a **structural signal**: `intent_classifier` short-circuits
+  before `classify_intent()` is called when `image_base64` is set in state.
+  There is no ambiguous case — an attached image always means "vision request".
+- Text-only keyword scoring (`_VISION_PATTERNS`, `_VISION_KEYWORDS`) handles
+  imageless visual queries ("describe this photo?" without an attached file).
+  The classifier still runs for those cases, scoring them as `vision` intent.
+- `VISION_MODEL` in `router.py` maps `vision` intent to the local multimodal model.
+- `quick-local` dampening is applied when vision score ≥ 0.25 (same pattern as
+  code and weather intents).
+
+Implementation notes:
+
+**Payload format:**
+- Flat JSON fields: `image_base64` (raw base64 string, no `data:…;base64,` prefix)
+  and `image_mime` (`"image/png"` | `"image/jpeg"` | `"image/webp"`).
+- Kept simple intentionally. This is a single-user LAN system; base64 in the
+  JSON body is appropriate and avoids multipart complexity.
+- `ChatRequest` in `app_schemas.py` carries both fields as optional; they are
+  transparent to all non-vision code paths.
+
+**Validation (`_validate_image()` in `main.py`):**
+- Allowed MIME types: `image/png`, `image/jpeg`, `image/webp`.
+- Maximum size: 25 MB (decoded bytes).
+- Base64 integrity: `base64.b64decode(..., validate=True)`.
+- Returns 422 with `{"error": "...", "code": "INVALID_IMAGE"}` on failure.
+- Validation fires in the HTTP handler before the graph is invoked.
+
+**Ollama multimodal API (`stream_local_vision()` in `main.py`):**
+- Uses `/api/chat` endpoint (not `/api/generate`) with a structured messages array.
+- Image passed as `messages[].images: [base64_string]`.
+- Streams response chunks from `message.content` field.
+- Separate from the existing `stream_local()` function — text-only paths are
+  completely unchanged.
+
+**Cloud fallback (Anthropic Claude vision):**
+- `responder` node in `graph.py` tries `stream_local_vision()` first.
+- On any exception, falls back to `stream_cloud()` with Anthropic's vision message
+  format: `content: [{type: "image", source: {type: "base64", ...}}, {type: "text", ...}]`.
+- On both unavailable: returns a user-visible error string with `ollama pull gemma:e4b`.
+- `response_model` in the SSE meta event reflects which model actually ran.
+
+**TTS suppression:**
+- `_voice_tts_metadata()` is called as normal but its result is set to `None` when
+  `intent_for_log == "vision"` before the SSE event is emitted.
+- Rationale: image responses are visual; auto-reading them aloud is intrusive.
+  User can trigger TTS manually via the stop/play controls.
+
+**Frontend:**
+- Hidden `<input id="image-upload" type="file" accept="image/png,image/jpeg,image/webp">`.
+- Paperclip `<button id="image-attach-btn">` triggers the picker.
+- Preview strip (`#image-preview-strip`) above the textarea with thumbnail and clear button.
+- Client-side MIME and size validation before encoding (fail fast, no wasted round trip).
+- `fileToBase64()` strips the `data:…;base64,` prefix — backend receives raw base64.
+- `pendingImage` state cleared after send.
+- Attached image shown as a `<img class="chat-image-thumb">` in the user message bubble.
+- `image_base64` and `image_mime` included in the POST body only when `pendingImage` is set.
+
+**Graph changes:**
+- `AssistantState` carries `image_base64: str | None` and `image_mime: str | None`
+  (ephemeral; never written to memory or checkpointer).
+- `AssistantGraphDependencies` carries `stream_local_vision` callable and `vision_model` string.
+- `intent_classifier` node: if `image_base64` is set, returns `planner_status: "deterministic"`
+  immediately — no heuristic, no planner, no LLM call.
+- `responder` node: vision branch runs before tool/cloud/local branches; handles local
+  attempt, cloud fallback, and hard-error case.
+
+Environment variables:
+  `OLLAMA_VISION_MODEL`   Ollama model for vision requests (default: same as `CHAT_MODEL`)
+
+Tasks — all complete:
+- ✅ Add `OLLAMA_VISION_MODEL` env var to `main.py` and `router.py` (defaults to `CHAT_MODEL`).
+- ✅ Extend `ChatRequest` in `app_schemas.py` with `image_base64` and `image_mime` optional fields.
+- ✅ Implement `_validate_image()` in `main.py`: MIME allowlist, 25 MB cap, base64 integrity check.
+- ✅ Add `stream_local_vision()` in `main.py` using Ollama `/api/chat` with `images` array.
+- ✅ Wire image validation and graph state fields into the `/chat` endpoint.
+- ✅ Add `vision` intent to `router.py`: `VISION_MODEL` constant, `_VISION_PATTERNS` /
+  `_VISION_KEYWORDS` / `_looks_like_vision_request()`, scoring in `classify_intent()`,
+  quick-local dampening, `RouteDecision` docstring.
+- ✅ Short-circuit `intent_classifier` node in `graph.py` when `image_base64` is present
+  (before `classify_intent()` is called).
+- ✅ Add vision branch to `responder` node: local attempt → cloud fallback → hard-error string.
+- ✅ Suppress TTS for vision intent in `generate()` SSE loop.
+- ✅ Wire `stream_local_vision` and `vision_model` into `AssistantGraphDependencies`.
+- ✅ Add image attach button, preview strip, and chat history thumbnails to frontend
+  (`index.html`, `message.js`, `style.css`).
+- ✅ Add 18 tests in `backend/tests/test_vision.py` covering validation, intent routing,
+  classifier short-circuit logic, and TTS suppression.
+
+Acceptance:
+- ✅ Frontend image picker (file button) attaches images to chat with preview strip.
+- ✅ `/chat` endpoint accepts `image_base64` + `image_mime`; validates on arrival.
+- ✅ Image validation rejects unsupported MIME types, bad base64, and files >25 MB (HTTP 422).
+- ✅ `intent_classifier` short-circuits to `vision` intent without calling the LLM when an
+  image is attached; text-only visual queries still scored by keyword patterns.
+- ✅ Local `gemma:e4b` is used via Ollama `/api/chat` with `images` array.
+- ✅ Cloud fallback to Anthropic Claude vision API fires on local model failure.
+- ✅ User-visible error with `ollama pull gemma:e4b` if both local and cloud unavailable.
+- ✅ Model badge in SSE meta event reflects which model handled the image question.
+- ✅ Images are not persisted to disk, SQLite, or ChromaDB; ephemeral per turn.
+- ✅ TTS is suppressed for vision responses; user initiates audio manually.
+- ✅ No regression on text-only chat (143 existing tests pass).

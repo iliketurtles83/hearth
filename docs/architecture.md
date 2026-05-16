@@ -36,7 +36,7 @@ FastAPI backend
 
 Ollama (container)                    local model inference (GPU)
   ├── gemma:e4b                       general conversation, voice responses, persona anchor
-  └── qwen2.5-coder:7b                code-specialized model for code questions
+  └── qwen2.5-coder:14b                code-specialized model for code questions
 Anthropic API (external)              cloud fallback for complex queries
 
 Reverse proxy / HTTPS edge            enabled when LAN/mobile deployment requires it
@@ -55,7 +55,7 @@ runtime code.
 - Anthropic is fallback only when local confidence is low or the task exceeds local capability.
 - Both local models hot-swap inside one Ollama container. Simultaneous residency is not realistic on 12 GB VRAM, so routing and UX must account for swap latency.
 - Measured swap latency (2026-04-28, RTX 3060 NVMe): median 0.2–0.3 s after first load. Ollama keeps weights in system RAM after GPU eviction so repeat swaps are RAM to GPU re-pin only. First cold load from disk is about 2 s. Overall impact is imperceptible, so loading-state UX is low priority.
-- **Upgrade candidate:** `gemma:e4b` may be replaced with `gemma4:E4B` (mixture-of-experts, similar VRAM, stronger reasoning). Evaluate by running memory consolidation extraction quality tests with both models before committing. Do not change `OLLAMA_CHAT_MODEL` in source — it is env-var controlled.
+
 
 ## Locked architecture decisions
 

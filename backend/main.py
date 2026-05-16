@@ -6,6 +6,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from contextlib import asynccontextmanager
 import asyncio
+import base64
 import httpx
 import anthropic
 import importlib
@@ -104,6 +105,11 @@ SESSION_MAX_ITEMS = int(os.getenv("CHAT_SESSION_MAX_ITEMS", "200"))
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
 CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+# Phase 14 — vision model: defaults to CHAT_MODEL (gemma:e4b is multimodal)
+OLLAMA_VISION_MODEL: str = (
+    os.getenv("OLLAMA_VISION_MODEL")
+    or CHAT_MODEL
+)
 CHAT_SUMMARY_TRIGGER_MESSAGES = int(os.getenv("CHAT_SUMMARY_TRIGGER_MESSAGES", "18"))
 CHAT_SUMMARY_KEEP_RECENT_MESSAGES = int(os.getenv("CHAT_SUMMARY_KEEP_RECENT_MESSAGES", "8"))
 CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
@@ -904,6 +910,57 @@ async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
                     if data.get("done"):
                         break
 
+
+# ── Phase 14: vision helpers ──────────────────────────────────────────────────
+
+_ALLOWED_VISION_MIME = frozenset({"image/png", "image/jpeg", "image/webp"})
+_MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
+
+
+def _validate_image(image_base64: str | None, image_mime: str | None) -> str | None:
+    """Return an error string if the image payload is invalid, else None."""
+    if image_base64 is None:
+        return None
+    if image_mime not in _ALLOWED_VISION_MIME:
+        return f"Unsupported image type '{image_mime}'. Allowed: image/png, image/jpeg, image/webp."
+    try:
+        raw = base64.b64decode(image_base64, validate=True)
+    except Exception:
+        return "Image data is not valid base64."
+    if len(raw) > _MAX_IMAGE_BYTES:
+        mb = len(raw) / (1024 * 1024)
+        return f"Image too large ({mb:.1f} MB). Maximum is 25 MB."
+    return None
+
+
+async def stream_local_vision(
+    request: ChatRequest,
+    image_base64: str,
+    image_mime: str,
+    model_name: str = OLLAMA_VISION_MODEL,
+):
+    """Ollama /api/chat endpoint with image tokens (multimodal forward pass)."""
+    user_msg: dict = {"role": "user", "content": request.message, "images": [image_base64]}
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": request.system or CHAT_DEFAULT_SYSTEM_PROMPT},
+            user_msg,
+        ],
+        "stream": True,
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if line:
+                    data = json.loads(line)
+                    chunk = data.get("message", {}).get("content", "")
+                    if chunk:
+                        yield chunk
+                    if data.get("done"):
+                        break
+
 async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[override]
     client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     with client.messages.stream(
@@ -933,6 +990,10 @@ def _make_graph_deps() -> AssistantGraphDependencies:
         async for chunk in stream_cloud(system, messages):
             yield chunk
 
+    async def _late_stream_local_vision(req, image_b64: str, image_mime: str):
+        async for chunk in stream_local_vision(req, image_b64, image_mime):  # type: ignore[arg-type]
+            yield chunk
+
     async def _late_tool_dispatch(tool_name: str, params: dict):
         return await tools.dispatch(tool_name, params)
 
@@ -941,10 +1002,12 @@ def _make_graph_deps() -> AssistantGraphDependencies:
         router_route=_late_router_route,
         stream_local=_late_stream_local,
         stream_cloud=_late_stream_cloud,
+        stream_local_vision=_late_stream_local_vision,
         tool_dispatch=_late_tool_dispatch,
         chat_model=CHAT_MODEL,
         cloud_model=CLOUD_MODEL,
         coder_model=CODER_MODEL,
+        vision_model=OLLAMA_VISION_MODEL,
         chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
     )
 
@@ -995,6 +1058,12 @@ async def chat(request: ChatRequest, http_request: Request):
 
     summary_updated, summary_message_count, summary_char_count = _update_session_summary_if_needed(session_id)
 
+    # ── Phase 14: validate image if present ──────────────────────────────────
+    image_error = _validate_image(request.image_base64, request.image_mime)
+    if image_error:
+        log.warning("chat.image_invalid | session_id=%s reason=%s", session_id, image_error)
+        return JSONResponse({"error": image_error, "code": "INVALID_IMAGE"}, status_code=422)
+
     with _session_store_lock:
         session = _session_store[session_id]
         session_messages = list(session["messages"])
@@ -1014,6 +1083,9 @@ async def chat(request: ChatRequest, http_request: Request):
         "modality": "voice" if chat_source == "voice" else "chat",
         "history": session_messages,
         "session_summary": session_summary,
+        # Phase 14: pass image through state (ephemeral, not persisted to memory)
+        "image_base64": request.image_base64,
+        "image_mime": request.image_mime,
     }
     graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
 
@@ -1119,6 +1191,9 @@ async def chat(request: ChatRequest, http_request: Request):
         )
 
         voice_meta = _voice_tts_metadata(chat_source)
+        # Phase 14: images are visual — suppress auto-TTS for vision responses.
+        if intent_for_log == "vision":
+            voice_meta = None
         if voice_meta is not None:
             yield "data: " + json.dumps(voice_meta) + "\n\n"
 

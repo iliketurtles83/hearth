@@ -5,6 +5,9 @@ class ChatRequest(BaseModel):
     message: str
     system: str | None = None
     source: str = "text"
+    # Phase 14 — vision input
+    image_base64: str | None = None  # raw base64, no data-URI prefix
+    image_mime: str | None = None    # "image/png" | "image/jpeg" | "image/webp"
 
 
 class TTSRequest(BaseModel):

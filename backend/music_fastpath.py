@@ -53,7 +53,10 @@ def parse_music_command(prompt: str) -> dict | None:
         }
 
     if re.search(
-        r"\b(what'?s|what is)\s+(currently\s+)?(playing|on)\b"
+        # "playing" arm is open-ended; "on" arm requires end-of-string so that
+        # "what's on the picture?" / "what's on TV?" don't trigger now_playing.
+        r"\b(what'?s|what is)\s+(currently\s+)?playing\b"
+        r"|\b(what'?s|what is)\s+on\s*$"
         r"|\bnow\s+playing\b|\bcurrent\s+(song|track)\b",
         pl,
     ):

@@ -26,6 +26,63 @@
   let currentQueuePos = null;
   let _currentAbortController = null;
 
+  // Phase 14: pending image attachment state
+  let pendingImage = null; // { base64: string, mime: string, dataUrl: string } | null
+
+  const imageUploadInput = document.getElementById('image-upload');
+  const imageAttachBtn = document.getElementById('image-attach-btn');
+  const imagePreviewStrip = document.getElementById('image-preview-strip');
+  const imagePreviewThumb = document.getElementById('image-preview-thumb');
+  const imageClearBtn = document.getElementById('image-clear-btn');
+  const _MAX_IMAGE_BYTES = 25 * 1024 * 1024;
+
+  function fileToBase64(file) {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        // Strip the data-URI prefix — server expects raw base64
+        const dataUrl = reader.result;
+        const comma = dataUrl.indexOf(',');
+        resolve({ base64: dataUrl.slice(comma + 1), dataUrl });
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function clearPendingImage() {
+    pendingImage = null;
+    if (imagePreviewStrip) imagePreviewStrip.style.display = 'none';
+    if (imagePreviewThumb) imagePreviewThumb.src = '';
+    if (imageUploadInput) imageUploadInput.value = '';
+  }
+
+  if (imageAttachBtn && imageUploadInput) {
+    imageAttachBtn.addEventListener('click', () => imageUploadInput.click());
+    imageUploadInput.addEventListener('change', async () => {
+      const file = imageUploadInput.files?.[0];
+      if (!file) return;
+      const allowed = ['image/png', 'image/jpeg', 'image/webp'];
+      if (!allowed.includes(file.type)) {
+        alert('Unsupported image type. Please use PNG, JPEG, or WebP.');
+        imageUploadInput.value = '';
+        return;
+      }
+      if (file.size > _MAX_IMAGE_BYTES) {
+        alert(`Image too large (${(file.size / 1024 / 1024).toFixed(1)} MB). Maximum is 25 MB.`);
+        imageUploadInput.value = '';
+        return;
+      }
+      const { base64, dataUrl } = await fileToBase64(file);
+      pendingImage = { base64, mime: file.type, dataUrl };
+      if (imagePreviewThumb) imagePreviewThumb.src = dataUrl;
+      if (imagePreviewStrip) imagePreviewStrip.style.display = 'flex';
+    });
+  }
+  if (imageClearBtn) {
+    imageClearBtn.addEventListener('click', clearPendingImage);
+  }
+
   // eslint-disable-next-line no-unused-vars
   function setTtsStatus(_text) { /* text removed; mic colour conveys state */ }
 
@@ -226,11 +283,20 @@
     messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
-  function appendMessage(role, text = '') {
+  function appendMessage(role, text = '', imageInfo = null) {
     document.getElementById('empty-state')?.remove();
 
     const wrapper = document.createElement('div');
     wrapper.className = `message ${role}`;
+
+    // Phase 14: show image thumbnail in user message bubble
+    if (role === 'user' && imageInfo) {
+      const thumb = document.createElement('img');
+      thumb.className = 'chat-image-thumb';
+      thumb.src = imageInfo.dataUrl;
+      thumb.alt = 'Attached image';
+      wrapper.appendChild(thumb);
+    }
 
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
@@ -618,12 +684,15 @@
   async function send(options = {}) {
     const source = options?.source === 'voice' ? 'voice' : 'text';
     const text = input.value.trim();
-    if (!text) return;
+    if (!text && !pendingImage) return;
     closeSidebar();
 
-    appendMessage('user', text);
+    // Capture image before clearing
+    const imageSnapshot = pendingImage ? { ...pendingImage } : null;
+    appendMessage('user', text, imageSnapshot);
     input.value = '';
     input.style.height = 'auto';
+    clearPendingImage();
     setLocked(true);
 
     const { wrapper, bubble } = appendMessage('assistant');
@@ -642,10 +711,24 @@
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
         signal: abortController.signal,
-        body: JSON.stringify({ message: text, source }),
+        body: JSON.stringify({
+          message: text,
+          source,
+          ...(imageSnapshot && {
+            image_base64: imageSnapshot.base64,
+            image_mime: imageSnapshot.mime,
+          }),
+        }),
       });
 
-      if (!resp.ok) throw new Error(`Server error: HTTP ${resp.status}`);
+      if (!resp.ok) {
+        let errMsg = `Server error: HTTP ${resp.status}`;
+        try {
+          const errBody = await resp.clone().json();
+          if (errBody?.error) errMsg = errBody.error;
+        } catch { /* best effort */ }
+        throw new Error(errMsg);
+      }
 
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();

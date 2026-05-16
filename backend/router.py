@@ -33,6 +33,11 @@ CODER_MODEL: str = (
     or os.getenv("MODEL_LOCAL")
     or "llama3.2"
 )
+# Phase 14 — vision model: defaults to CHAT_MODEL (e.g. gemma:e4b is multimodal)
+VISION_MODEL: str = (
+    os.getenv("OLLAMA_VISION_MODEL")
+    or CHAT_MODEL
+)
 LOCAL_MODEL = CHAT_MODEL  # backward-compat alias
 CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
 
@@ -45,12 +50,13 @@ _VALID_TOOL_NAMES = frozenset(["weather", "music"])
 
 @dataclass
 class RouteDecision:
-    intent: str           # quick-local | reasoning-heavy | code-question | code-write | external-data-needed | memory-needed
+    intent: str           # quick-local | reasoning-heavy | code-question | code-write | external-data-needed | memory-needed | vision
     confidence: float     # 0.0–1.0
     use_cloud: bool
     model: str
     tool: str | None = None          # tool name when route == "tool", else None
-    needs_memory: bool = False       # planner signal: memory retrieval recommended
+    needs_memory: bool = False       # set by LLM planner only; classify_intent() never sets this;
+                                     # graph._should_inject_memory() uses intent+term-overlap instead
     planner_status: str = "heuristic"  # planner | fallback | heuristic | disabled
     reasoning_summary: str = ""      # server-log only, never sent to client
 
@@ -63,9 +69,14 @@ def _is_code_intent(intent: str) -> bool:
 def _pick_local_model(intent: str) -> str:
     """Return the appropriate local Ollama model for a given intent.
 
-    Both code-question and code-write use CODER_MODEL; all others use CHAT_MODEL.
+    Both code-question and code-write use CODER_MODEL; vision uses VISION_MODEL;
+    all others use CHAT_MODEL.
     """
-    return CODER_MODEL if _is_code_intent(intent) else CHAT_MODEL
+    if _is_code_intent(intent):
+        return CODER_MODEL
+    if intent == "vision":
+        return VISION_MODEL
+    return CHAT_MODEL
 
 
 # ── Pattern banks ──────────────────────────────────────────────────────────────
@@ -112,10 +123,12 @@ _WEATHER_PATTERNS = [
 _MUSIC_PATTERNS = [
     r"\b(play|queue|put\s+on)\b.{0,60}\b(song|track|music|album|artist|band)\b",
     r"\b(pause|resume|unpause)\b.{0,30}\b(music|song|track|playback)?\b",
-    r"\b(next|skip)\b.{0,20}\b(track|song)?\b",
+    # (track|song) is required (not optional) to avoid matching bare "skip" or "next" in non-music context.
+    r"\b(next|skip)\b.{0,20}\b(track|song)\b",
     r"\bstop\s+(the\s+)?(music|playback|song)\b",
     r"\b(now\s+playing|what'?s\s+playing|what\s+is\s+playing)\b",
     r"\b(what'?s|what\s+is)\s+in\s+the\s+queue\b",
+    r"\bshuffle\b.{0,30}\b(music|songs?|tracks?|playlist|queue)\b",
 ]
 
 _MUSIC_KEYWORDS = [
@@ -127,6 +140,34 @@ _MUSIC_KEYWORDS = [
 
 def _looks_like_weather_request(text: str) -> bool:
     return any(re.search(p, text, re.IGNORECASE) for p in _WEATHER_PATTERNS)
+
+
+# ── Vision patterns ──────────────────────────────────────────────────────────
+# NOTE: when an image is attached, graph.py forces intent="vision" and bypasses
+# classify_intent() entirely. These patterns only fire for text-only prompts
+# where the user mentions an image without attaching one.
+
+_VISION_PATTERNS = [
+    r"\b(what|who|where|how|why|when)\b.{0,40}\b(image|picture|photo|screenshot|diagram|chart|graph)\b",
+    r"\b(describe|analyze|analyse|explain|identify|read|ocr)\b.{0,40}\b(image|picture|photo|screenshot|diagram)\b",
+    r"\bwhat('?s|\s+is)\b.{0,20}\b(in|on|this|the)\b.{0,20}\b(image|picture|photo)\b",
+    r"\bthis\s+(image|picture|photo|screenshot|diagram)\b",
+    r"\b(image|picture|photo|screenshot)\b.{0,40}\b(shows?|contain|display|depict)\b",
+    r"\b(look|see|view)\b.{0,20}\b(at|this|the)\b.{0,30}\b(image|picture|photo)\b",
+]
+
+_VISION_KEYWORDS = [
+    "in this image", "in the image", "in this photo", "in this picture",
+    "what do you see", "what's in", "what is in",
+    "describe this", "describe the image", "describe the photo",
+    "analyze this image", "analyse this image", "look at this",
+    "what does this image", "what does the image",
+    "read this", "ocr this", "text in the image", "text in this image",
+]
+
+
+def _looks_like_vision_request(text: str) -> bool:
+    return any(re.search(p, text, re.IGNORECASE) for p in _VISION_PATTERNS)
 
 
 def _looks_like_music_request(text: str) -> bool:
@@ -270,6 +311,7 @@ def classify_intent(prompt: str) -> RouteDecision:
         "code-write": 0.0,
         "external-data-needed": 0.0,
         "memory-needed": 0.0,
+        "vision": 0.0,
     }
 
     # reasoning-heavy signals
@@ -306,13 +348,21 @@ def classify_intent(prompt: str) -> RouteDecision:
     elif len(prompt) < 120:
         scores["quick-local"] += 0.35
 
-    # If we already have strong external-data, memory, or code signals, dampen
-    # quick-local baseline so intent-specific routes win short prompts.
+    # vision signals — user explicitly mentions an image in text
+    scores["vision"] += _score_patterns(p, _VISION_PATTERNS)
+    scores["vision"] += _score_keywords(p, _VISION_KEYWORDS)
+    if _looks_like_vision_request(p):
+        scores["vision"] = min(1.0, scores["vision"] + 0.40)
+
+    # If we already have strong external-data, memory, code, or vision signals,
+    # dampen quick-local baseline so intent-specific routes win short prompts.
     if scores["external-data-needed"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
     if scores["memory-needed"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
     if scores["code-write"] >= 0.25 or scores["code-question"] >= 0.25:
+        scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
+    if scores["vision"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
 
     # Clamp all scores
@@ -329,6 +379,7 @@ def classify_intent(prompt: str) -> RouteDecision:
 
     # Routing: only send to cloud for reasoning-heavy with sufficient confidence.
     # Code intents always stay local and use the coder model.
+    # Vision intents stay local first (cloud fallback is handled in the responder node).
     use_cloud = (intent == "reasoning-heavy" and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
     model = CLOUD_MODEL if use_cloud else _pick_local_model(intent)
 
