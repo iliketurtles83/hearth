@@ -71,18 +71,18 @@ class AssistantState(TypedDict, total=False):
     cloud_messages: list[dict[str, Any]]
     response_text: str
     response_model: str
-    # Phase 10b — code tool
+    # Code tool
     active_files: list[str]          # files the coder has read/touched this turn
     code_context: str                 # tree-sitter snippets injected into coder prompt
     pending_write: dict[str, Any]    # {path, content, relative_path} awaiting confirmation
     awaiting_confirmation: bool       # True when a write diff is pending user approval
     force_code: bool                  # True for /code endpoint to bypass classifier
-    # Phase 10c — responder modality split
+    # Responder modality split
     modality: str                     # "voice" or "chat"; set by /chat endpoint from request source
-    # Phase 13 — coding agent tool
+    # Coding agent tool
     pending_code_task: str            # code-write task description awaiting agent confirmation
     awaiting_agent_confirmation: bool # True when a code-write task needs user approval before dispatch
-    # Phase 14 — vision input
+    # Vision input
     image_base64: str | None          # raw base64 image (ephemeral, not persisted)
     image_mime: str | None            # "image/png" | "image/jpeg" | "image/webp"
 
@@ -102,11 +102,11 @@ class AssistantGraphDependencies:
     tool_dispatch: Callable[[str, dict[str, Any]], Awaitable[Any]]
     chat_model: str
     cloud_model: str
-    coder_model: str = ""             # Phase 10b: OLLAMA_CODER_MODEL for code_tool node
-    chroma_path: str = ""             # Phase 10b: path to ChromaDB directory for code_context
-    # Phase 14: vision model callable — calls Ollama /api/chat with images
+    coder_model: str = ""             # OLLAMA_CODER_MODEL for code_tool node
+    chroma_path: str = ""             # path to ChromaDB directory for code_context
+    # Vision model callable — calls Ollama /api/chat with images
     stream_local_vision: Callable[[PromptRequest, str, str], AsyncIterator[str]] | None = None
-    vision_model: str = ""            # Phase 14: OLLAMA_VISION_MODEL (defaults to chat_model)
+    vision_model: str = ""            # OLLAMA_VISION_MODEL (defaults to chat_model)
 
 
 def checkpoint_config(session_id: str) -> dict[str, Any]:
@@ -630,7 +630,7 @@ def build_assistant_graph(
                     "needs_memory": False,
                 }
 
-        # Phase 14: image attachment is a structural signal — skip the classifier
+        # Image attachment is a structural signal; skip the classifier
         # entirely.  There is no ambiguous case: an attached image always means
         # "vision request".  The classifier still runs for imageless visual queries
         # (e.g. "describe this photo?" with no image) so keyword scoring is preserved.
@@ -861,10 +861,10 @@ def build_assistant_graph(
         system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
         augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
 
-        # Phase 10b/10d: route ChromaDB queries by intent.
+        # Route ChromaDB queries by intent.
         # - Non-code intents: deps.memory_store.retrieve() queries 'conversation_memory' only.
         # - Code intents: code_context_retrieval() queries 'code_context' only.
-        # The two collections are strictly separate — see Phase 10d for migration details.
+        # The two collections are strictly separate.
         code_context = ""
         if _is_code_intent(state.get("intent", "")):
             log.info(
@@ -1551,7 +1551,7 @@ def build_assistant_graph(
         response_model = state.get("model", deps.chat_model)
         modality = state.get("modality", "chat")
 
-        # ── Phase 14: vision path ────────────────────────────────────────────
+        # ── Vision path ───────────────────────────────────────────────────────
         if state.get("intent") == "vision" and state.get("image_base64"):
             image_b64 = state["image_base64"]
             image_mime = state.get("image_mime") or "image/png"

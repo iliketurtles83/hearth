@@ -111,7 +111,7 @@ SESSION_MAX_ITEMS = int(os.getenv("CHAT_SESSION_MAX_ITEMS", "200"))
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
 CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
-# Phase 14 — vision model: defaults to CHAT_MODEL (gemma:e4b is multimodal)
+# Vision model defaults to CHAT_MODEL (gemma:e4b is multimodal)
 OLLAMA_VISION_MODEL: str = (
     os.getenv("OLLAMA_VISION_MODEL")
     or CHAT_MODEL
@@ -170,12 +170,12 @@ WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "").strip().lower()
 #   Overall median: 0.3s — imperceptible; loading-state UX not required.
 # Interpretation: Ollama caches model weights in system RAM after GPU eviction
 # (keep_alive=0). First-ever load hits disk (~2s); subsequent swaps are RAM→GPU
-# re-pin only (~0.2-0.3s). Skip visible loading-state badge in Phase 10b.
+# re-pin only (~0.2-0.3s). Skip visible loading-state badge.
 
-# ── HTTPS / CORS / cookie policy (Phase 0b) ───────────────────────────────────
+# ── HTTPS / CORS / cookie policy ───────────────────────────────────────────────
 # CORS_ORIGINS: comma-separated list of allowed origins, e.g.
 #   CORS_ORIGINS=https://192.168.1.42,https://assistant.lan
-# Default '*' preserves the Phase 1 permissive behaviour for plain-HTTP dev.
+# Default '*' preserves permissive behaviour for plain-HTTP dev.
 # Set to the exact Caddy origin(s) once HTTPS is in use.
 _cors_origins_raw = os.getenv("CORS_ORIGINS", "*")
 _CORS_ORIGINS: list[str] = [o.strip() for o in _cors_origins_raw.split(",") if o.strip()]
@@ -288,7 +288,7 @@ def _validate_startup() -> None:
     if not os.getenv("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
 
-    # Phase 10b: code workspace
+    # Code workspace
     _code_root = os.getenv("CODE_WORKSPACE_ROOT", "")
     if not _code_root:
         log.warning(
@@ -937,7 +937,7 @@ async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
                         break
 
 
-# ── Phase 14: vision helpers ──────────────────────────────────────────────────
+# ── Vision helpers ─────────────────────────────────────────────────────────────
 
 _ALLOWED_VISION_MIME = frozenset({"image/png", "image/jpeg", "image/webp"})
 _MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
@@ -1084,7 +1084,7 @@ async def chat(request: ChatRequest, http_request: Request):
 
     summary_updated, summary_message_count, summary_char_count = _update_session_summary_if_needed(session_id)
 
-    # ── Phase 14: validate image if present ──────────────────────────────────
+    # Validate image payload if present
     image_error = _validate_image(request.image_base64, request.image_mime)
     if image_error:
         log.warning("chat.image_invalid | session_id=%s reason=%s", session_id, image_error)
@@ -1109,7 +1109,7 @@ async def chat(request: ChatRequest, http_request: Request):
         "modality": "voice" if chat_source == "voice" else "chat",
         "history": session_messages,
         "session_summary": session_summary,
-        # Phase 14: pass image through state (ephemeral, not persisted to memory)
+        # Pass image through state (ephemeral, not persisted to memory)
         "image_base64": request.image_base64,
         "image_mime": request.image_mime,
     }
@@ -1217,7 +1217,7 @@ async def chat(request: ChatRequest, http_request: Request):
         )
 
         voice_meta = _voice_tts_metadata(chat_source)
-        # Phase 14: images are visual — suppress auto-TTS for vision responses.
+        # Images are visual; suppress auto-TTS for vision responses.
         if intent_for_log == "vision":
             voice_meta = None
         if voice_meta is not None:
@@ -1425,24 +1425,6 @@ async def get_chat_session_messages(http_request: Request):
     return response
 
 
-# Compatibility wrappers retained for existing unit tests that call these
-# handlers directly from the main module.
-async def list_episodic_memory(
-    http_request: Request,
-    limit: int = 200,
-    offset: int = 0,
-    consolidated: bool | None = None,
-):
-    user_id: str = http_request.state.user_id
-    return JSONResponse(memory_store.list_episodic(user_id, limit=limit, offset=offset, consolidated=consolidated))
-
-
-async def consolidate_memory(http_request: Request):
-    user_id: str = http_request.state.user_id
-    stats = await asyncio.to_thread(memory_store.consolidate_pending, user_id, MEMORY_CONSOLIDATION_BATCH_SIZE)
-    return JSONResponse({"ok": True, "stats": stats})
-
-
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -1467,35 +1449,6 @@ async def tts_synthesize(request: TTSRequest):
         status = _tts_error_status(code, retryable)
         log.warning("tts.error | code=%s retryable=%s message=%s", code, retryable, message)
         return _error_response(message, code, retryable, status_code=status)
-
-
-# Legacy asset routes (compatibility with clients requesting root-mounted files)
-@app.get("/style.css", include_in_schema=False)
-async def legacy_style():
-    return FileResponse(os.path.join(_frontend_dir, "style.css"))
-
-
-@app.get("/auth.js", include_in_schema=False)
-async def legacy_auth_js():
-    return FileResponse(os.path.join(_frontend_dir, "auth.js"))
-
-
-@app.get("/message.js", include_in_schema=False)
-async def legacy_message_js():
-    return FileResponse(os.path.join(_frontend_dir, "message.js"))
-
-
-@app.get("/voice.js", include_in_schema=False)
-async def legacy_voice_js():
-    return FileResponse(os.path.join(_frontend_dir, "voice.js"))
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def legacy_favicon():
-    path = os.path.join(_frontend_dir, "favicon.ico")
-    if os.path.exists(path):
-        return FileResponse(path)
-    return Response(status_code=404)
 
 
 # Browser sends raw binary frames: 1280 int16 samples (80ms @ 16kHz).

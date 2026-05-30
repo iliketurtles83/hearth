@@ -18,3 +18,4 @@ backend/chroma/
 # mkcert-generated certificates — never commit private keys
 caddy/certs/
 .aider*
+backend/tests/artifacts/tts-benchmark.json

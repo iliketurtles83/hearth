@@ -48,6 +48,13 @@ def _json_body(response) -> dict:
     return json.loads(response.body.decode("utf-8"))
 
 
+def _route_endpoint(path: str, method: str):
+    for route in main.app.routes:
+        if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
+            return route.endpoint
+    raise AssertionError(f"Route not found: {method} {path}")
+
+
 async def _read_sse_events(streaming_response) -> list[str]:
     events: list[str] = []
     async for chunk in streaming_response.body_iterator:
@@ -452,27 +459,31 @@ async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_chat_vague_music_prompt_still_uses_router_path(monkeypatch):
-    router_calls: list[str] = []
+async def test_chat_vague_music_prompt_uses_music_fastpath(monkeypatch):
+    music_dispatch_calls: list[tuple[str, dict]] = []
 
-    async def _fake_router_route(message: str):
-        router_calls.append(message)
-        return SimpleNamespace(
-            intent="quick-local",
-            confidence=0.75,
-            use_cloud=False,
-            model=main.CHAT_MODEL,
-            planner_status="ok",
-            needs_memory=False,
-            tool=None,
-            reasoning_summary="",
-        )
+    async def _unexpected_music_dispatch(tool_name: str, params: dict):
+        music_dispatch_calls.append((tool_name, params))
+        raise AssertionError("deterministic music fastpath should not run for vague prompts")
 
-    async def _fake_stream_local(_request, model_name=None):
-        yield "handled by router"
+    class _FakeGraph:
+        async def astream(self, _state, config=None, stream_mode=None):
+            yield {
+                "meta": {
+                    "model": main.CHAT_MODEL,
+                    "intent": "quick-local",
+                    "confidence": 0.70,
+                    "route_type": "local",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "fallback",
+                    "reasoning_summary": "",
+                }
+            }
+            yield {"text": "handled by graph"}
 
-    monkeypatch.setattr(main, "router_route", _fake_router_route)
-    monkeypatch.setattr(main, "stream_local", _fake_stream_local)
+    monkeypatch.setattr(main.tools, "dispatch", _unexpected_music_dispatch)
+    monkeypatch.setattr(main.app.state, "assistant_graph", _FakeGraph(), raising=False)
     monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         main.memory_store,
@@ -493,9 +504,9 @@ async def test_chat_vague_music_prompt_still_uses_router_path(monkeypatch):
     )
     events = await _read_sse_events(response)
 
-    assert router_calls == ["play something chill"]
+    assert music_dispatch_calls == []
     assert json.loads(events[0])["model"] == main.CHAT_MODEL
-    assert any(json.loads(event).get("text") == "handled by router" for event in events if event != "[DONE]")
+    assert any(json.loads(event).get("text") == "handled by graph" for event in events if event != "[DONE]")
     assert events[-1] == "[DONE]"
 
 
@@ -589,7 +600,9 @@ async def test_get_graph_state_denies_foreign_session():
 async def test_list_episodic_memory_endpoint_returns_user_rows():
     main.memory_store.save_summary("alice", "sess-ep-1", "- User: I like coffee")
 
-    response = await main.list_episodic_memory(
+    list_episodic_memory = _route_endpoint("/memory/episodic", "GET")
+
+    response = await list_episodic_memory(
         _request("alice"),
         limit=200,
         offset=0,
@@ -605,7 +618,9 @@ async def test_list_episodic_memory_endpoint_returns_user_rows():
 async def test_consolidate_memory_endpoint_runs_for_current_user():
     main.memory_store.save_summary("alice", "sess-ep-2", "- User: My name is Alice")
 
-    response = await main.consolidate_memory(_request("alice"))
+    consolidate_memory = _route_endpoint("/memory/consolidate", "POST")
+
+    response = await consolidate_memory(_request("alice"))
     payload = _json_body(response)
 
     assert payload["ok"] is True
