@@ -10,9 +10,10 @@ import wave
 from typing import Any
 
 from tts import TTSError
+from tts.engines._base import BaseTTSEngine
 
 
-class Engine:
+class Engine(BaseTTSEngine):
     """Kokoro TTS engine backed by the optional `kokoro_onnx` runtime.
 
     This engine is capability-gated: if runtime deps or model assets are missing,
@@ -24,51 +25,17 @@ class Engine:
         self.voices_path = os.getenv("TTS_KOKORO_VOICES", "").strip() or None
         self.voice = os.getenv("TTS_KOKORO_VOICE", "af_heart").strip() or "af_heart"
         self.language = os.getenv("TTS_KOKORO_LANG", "en-us").strip() or "en-us"
-        self.speed = self._parse_float("TTS_KOKORO_SPEED", default=1.0)
-        self.default_sample_rate = self._parse_int("TTS_KOKORO_SAMPLE_RATE", default=24000)
+        self.speed = self._parse_float("TTS_KOKORO_SPEED", default=1.0, error_code="TTS_KOKORO_CONFIG_INVALID")
+        self.default_sample_rate = self._parse_int(
+            "TTS_KOKORO_SAMPLE_RATE",
+            default=24000,
+            error_code="TTS_KOKORO_CONFIG_INVALID",
+        )
 
         self._runtime = self._load_runtime()
 
     async def synthesize(self, text: str) -> bytes:
         return await asyncio.to_thread(self._synthesize_sync, text)
-
-    @staticmethod
-    def _parse_float(name: str, default: float) -> float:
-        raw = os.getenv(name, str(default)).strip()
-        try:
-            value = float(raw)
-        except ValueError as exc:
-            raise TTSError(
-                message=f"Invalid {name}: {raw}",
-                code="TTS_KOKORO_CONFIG_INVALID",
-                retryable=False,
-            ) from exc
-        if value <= 0:
-            raise TTSError(
-                message=f"{name} must be > 0",
-                code="TTS_KOKORO_CONFIG_INVALID",
-                retryable=False,
-            )
-        return value
-
-    @staticmethod
-    def _parse_int(name: str, default: int) -> int:
-        raw = os.getenv(name, str(default)).strip()
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise TTSError(
-                message=f"Invalid {name}: {raw}",
-                code="TTS_KOKORO_CONFIG_INVALID",
-                retryable=False,
-            ) from exc
-        if value <= 0:
-            raise TTSError(
-                message=f"{name} must be > 0",
-                code="TTS_KOKORO_CONFIG_INVALID",
-                retryable=False,
-            )
-        return value
 
     def _load_runtime(self) -> Any:
         try:

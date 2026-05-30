@@ -13,39 +13,25 @@ from typing import Any, AsyncIterator, Awaitable, Callable, TypedDict
 
 log = logging.getLogger("assistant.graph")
 
-import httpx
-
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from router import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, VISION_MODEL, RouteDecision, classify_intent, _is_code_intent
+from intents import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, VISION_MODEL, RouteDecision, classify_intent, _is_code_intent
 from embedding_router import (
     EmbeddingRouterSnapshotMismatchError,
     get_embedding_router,
     ollama_embed_text,
 )
+from routing_config import ROUTING_CONFIG
 from tools.weather import format_weather_response, is_weather_reasoning
 
-CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
-CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
-ROUTE_CONFIDENCE_THRESHOLD = float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", "0.55"))
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
-ROUTER_PLANNER_ENABLED = os.getenv("ROUTER_PLANNER_ENABLED", "true").lower() == "true"
-ROUTER_PLANNER_TIMEOUT_MS = int(os.getenv("ROUTER_PLANNER_TIMEOUT_MS", "4000"))
-ROUTER_PLANNER_MAX_TOKENS = int(os.getenv("ROUTER_PLANNER_MAX_TOKENS", "200"))
-ROUTER_PLANNER_TEMPERATURE = float(os.getenv("ROUTER_PLANNER_TEMPERATURE", "0.0"))
-ROUTER_EMBEDDING_ENABLED = os.getenv("ROUTER_EMBEDDING_ENABLED", "true").lower() == "true"
-ROUTER_EMBED_MODEL = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
-ROUTER_EMBED_TIMEOUT_MS = int(os.getenv("ROUTER_EMBED_TIMEOUT_MS", "1500"))
-
-# Minimum heuristic confidence required to skip the planner for deterministic intents.
-# Intents not listed here always go through the planner (when enabled).
-_HEURISTIC_GATE: dict[str, float] = {
-    "external-data-needed": float(os.getenv("HEURISTIC_GATE_EXTERNAL", "0.50")),
-    "code-question": float(os.getenv("HEURISTIC_GATE_CODE", "0.50")),
-    "code-write": float(os.getenv("HEURISTIC_GATE_CODE", "0.50")),
-}
+CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
+CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
+OLLAMA_URL = ROUTING_CONFIG.ollama_url
+ROUTER_EMBEDDING_ENABLED = ROUTING_CONFIG.router_embedding_enabled
+ROUTER_EMBED_MODEL = ROUTING_CONFIG.router_embed_model
+ROUTER_EMBED_TIMEOUT_MS = ROUTING_CONFIG.router_embed_timeout_ms
 
 
 class AssistantState(TypedDict, total=False):
@@ -238,94 +224,6 @@ def _tool_summary_prompt(user_message: str, tool_data: dict[str, Any]) -> str:
     )
 
 
-_PLANNER_SYSTEM = """\
-You are a routing assistant. Analyse the user message and output a JSON object — \
-nothing else, no prose, no markdown fences. Use exactly this schema:
-{
-  "intent": "<quick-local|reasoning-heavy|code-question|code-write|external-data-needed|memory-needed>",
-  "route": "<local|cloud|tool>",
-  "tool": "<weather|music|null>",
-  "needs_memory": <true|false>,
-  "confidence": <0.0–1.0>,
-  "reasoning": "<one sentence>"
-}
-
-Rules:
-- intent=code-question or code-write  → route=local (code almost never needs cloud)
-- intent=external-data-needed → route=tool
-- intent=reasoning-heavy AND confidence>=0.55 → route=cloud
-- everything else → route=local
-- needs_memory=true when the request references prior facts or user preferences
-- confidence reflects how certain you are of the intent, not the answer quality
-"""
-
-
-def _parse_planner_output(raw: str) -> dict[str, Any]:
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        lines = cleaned.splitlines()
-        cleaned = "\n".join(line for line in lines if not line.startswith("```"))
-        cleaned = cleaned.strip()
-
-    start = cleaned.find("{")
-    end = cleaned.rfind("}") + 1
-    if start == -1 or end == 0:
-        raise ValueError("No JSON object found in planner output")
-
-    payload = json.loads(cleaned[start:end])
-    if not isinstance(payload, dict):
-        raise ValueError("Planner output must be a JSON object")
-
-    return payload
-
-
-def _decision_from_planner(
-    parsed: dict[str, Any],
-    prompt: str = "",
-    *,
-    chat_model: str,
-    cloud_model: str,
-    coder_model: str,
-) -> RouteDecision:
-    intent = str(parsed.get("intent", "")).strip()
-    route = str(parsed.get("route", "local")).strip() or "local"
-    tool = parsed.get("tool")
-    confidence = float(parsed.get("confidence", 0.5))
-    confidence = max(0.0, min(1.0, confidence))
-    needs_memory = bool(parsed.get("needs_memory", False))
-    reasoning = str(parsed.get("reasoning", "")).strip()[:300]
-
-    use_cloud = bool(route == "cloud" and intent == "reasoning-heavy" and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
-
-    if _is_code_intent(intent):
-        model = coder_model
-    elif use_cloud:
-        model = cloud_model
-    else:
-        model = chat_model
-
-    safe_tool = None
-    if intent == "external-data-needed":
-        candidate = str(tool).strip().lower() if tool is not None and str(tool).lower() != "null" else ""
-        if candidate in {"weather", "music"}:
-            safe_tool = candidate
-        elif re.search(r"\b(weather|forecast|temperature|rain|snow|humidity)\b", prompt, re.IGNORECASE):
-            safe_tool = "weather"
-        elif re.search(r"\b(play|queue|pause|resume|skip|now\s+playing|what'?s\s+playing|what\s+is\s+playing)\b", prompt, re.IGNORECASE):
-            safe_tool = "music"
-
-    return RouteDecision(
-        intent=intent,
-        confidence=confidence,
-        use_cloud=use_cloud,
-        model=model,
-        tool=safe_tool,
-        planner_status="planner",
-        reasoning_summary=reasoning,
-        needs_memory=needs_memory,
-    )
-
-
 def _similarity_to_confidence(score: float) -> float:
     # Cosine similarity range is [-1, 1]; remap to confidence range [0, 1].
     return max(0.0, min(1.0, (score + 1.0) / 2.0))
@@ -434,27 +332,6 @@ def _pick_model_for_decision(
     if intent == "vision":
         return vision_model
     return chat_model
-
-
-async def _call_planner(prompt: str) -> dict[str, Any]:
-    payload = {
-        "model": os.getenv("OLLAMA_CHAT_MODEL") or os.getenv("MODEL_LOCAL") or "llama3.2",
-        "prompt": f"User message: {prompt}",
-        "system": _PLANNER_SYSTEM,
-        "format": "json",
-        "stream": False,
-        "options": {
-            "num_predict": ROUTER_PLANNER_MAX_TOKENS,
-            "temperature": ROUTER_PLANNER_TEMPERATURE,
-        },
-    }
-    timeout = ROUTER_PLANNER_TIMEOUT_MS / 1000.0
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
-        response.raise_for_status()
-        data = response.json()
-        raw = data.get("response", "")
-    return _parse_planner_output(raw)
 
 
 def code_context_retrieval(query: str, chroma_path: str, max_snippets: int = 5) -> str:
@@ -664,62 +541,28 @@ def build_assistant_graph(
                 "route_type": "vision",
             }
 
-        # Compute heuristic once; used for deterministic fallback, code intent
-        # sub-selection, and planner-failure recovery.
+        # Compute heuristic once; used as deterministic fallback.
         heuristic = classify_intent(state["message"])
         decision: RouteDecision
 
-        async def _legacy_router_decision() -> RouteDecision:
-            gate_threshold = _HEURISTIC_GATE.get(heuristic.intent)
-            skip_planner = gate_threshold is not None and heuristic.confidence >= gate_threshold
-
-            if not ROUTER_PLANNER_ENABLED or skip_planner:
-                legacy = heuristic
-                legacy.model = _pick_model_for_decision(
-                    legacy.intent,
-                    use_cloud=legacy.use_cloud,
-                    chat_model=deps.chat_model,
-                    cloud_model=deps.cloud_model,
-                    coder_model=deps.coder_model or deps.chat_model,
-                    vision_model=deps.vision_model or deps.chat_model,
-                )
-                if not ROUTER_PLANNER_ENABLED:
-                    legacy.planner_status = "disabled"
-                else:
-                    log.debug(
-                        "graph.intent_classifier | heuristic_gate | intent=%s confidence=%.2f",
-                        heuristic.intent,
-                        heuristic.confidence,
-                    )
-                return legacy
-
-            parsed = await _call_planner(state["message"])
-            return _decision_from_planner(
-                parsed,
-                state["message"],
+        def _heuristic_router_decision() -> RouteDecision:
+            fallback = heuristic
+            fallback.model = _pick_model_for_decision(
+                fallback.intent,
+                use_cloud=fallback.use_cloud,
                 chat_model=deps.chat_model,
                 cloud_model=deps.cloud_model,
                 coder_model=deps.coder_model or deps.chat_model,
+                vision_model=deps.vision_model or deps.chat_model,
             )
+            fallback.planner_status = "heuristic"
+            return fallback
 
         if ROUTER_EMBEDDING_ENABLED:
             embed_router = get_embedding_router()
             if embed_router is None:
                 log.info("embedding_route.fallback | reason=router_unavailable")
-                try:
-                    decision = await _legacy_router_decision()
-                except Exception as exc:
-                    log.warning("graph.intent_classifier | legacy_router_failed=%s | falling_back=heuristic", exc)
-                    decision = heuristic
-                    decision.model = _pick_model_for_decision(
-                        decision.intent,
-                        use_cloud=decision.use_cloud,
-                        chat_model=deps.chat_model,
-                        cloud_model=deps.cloud_model,
-                        coder_model=deps.coder_model or deps.chat_model,
-                        vision_model=deps.vision_model or deps.chat_model,
-                    )
-                    decision.planner_status = "fallback"
+                decision = _heuristic_router_decision()
             else:
                 try:
                     query_embedding = await ollama_embed_text(
@@ -742,85 +585,22 @@ def build_assistant_graph(
                     )
                 except EmbeddingRouterSnapshotMismatchError as exc:
                     log.warning("embedding_route.snapshot_mismatch | error=%s", exc)
-                    try:
-                        decision = await _legacy_router_decision()
-                    except Exception as legacy_exc:
-                        log.warning("graph.intent_classifier | legacy_router_failed=%s | falling_back=heuristic", legacy_exc)
-                        decision = heuristic
-                        decision.model = _pick_model_for_decision(
-                            decision.intent,
-                            use_cloud=decision.use_cloud,
-                            chat_model=deps.chat_model,
-                            cloud_model=deps.cloud_model,
-                            coder_model=deps.coder_model or deps.chat_model,
-                            vision_model=deps.vision_model or deps.chat_model,
-                        )
-                        decision.planner_status = "fallback"
+                    decision = _heuristic_router_decision()
                 except Exception as exc:
                     log.warning("embedding_route.fallback | reason=embedding_failed error=%s", exc)
-                    try:
-                        decision = await _legacy_router_decision()
-                    except Exception as legacy_exc:
-                        log.warning("graph.intent_classifier | legacy_router_failed=%s | falling_back=heuristic", legacy_exc)
-                        decision = heuristic
-                        decision.model = _pick_model_for_decision(
-                            decision.intent,
-                            use_cloud=decision.use_cloud,
-                            chat_model=deps.chat_model,
-                            cloud_model=deps.cloud_model,
-                            coder_model=deps.coder_model or deps.chat_model,
-                            vision_model=deps.vision_model or deps.chat_model,
-                        )
-                        decision.planner_status = "fallback"
+                    decision = _heuristic_router_decision()
                 else:
                     reasoning_summary = (
                         "embed"
                         f" tool={embed_result.tool.label}:{embed_result.tool.score:.3f}/gap={embed_result.tool.gap:.3f}"
                         f" dialogue={embed_result.dialogue.label}:{embed_result.dialogue.score:.3f}/gap={embed_result.dialogue.gap:.3f}"
                     )
-                    if embed_result.should_escalate and ROUTER_PLANNER_ENABLED:
-                        log.info("embedding_route.ambiguous | action=planner")
-                        try:
-                            parsed = await _call_planner(state["message"])
-                            decision = _decision_from_planner(
-                                parsed,
-                                state["message"],
-                                chat_model=deps.chat_model,
-                                cloud_model=deps.cloud_model,
-                                coder_model=deps.coder_model or deps.chat_model,
-                            )
-                            decision.planner_status = "embedding_ambiguous_planner"
-                            if not decision.reasoning_summary:
-                                decision.reasoning_summary = reasoning_summary
-                        except Exception as planner_exc:
-                            log.warning(
-                                "graph.intent_classifier | ambiguous_planner_failed=%s | falling_back=heuristic",
-                                planner_exc,
-                            )
-                            decision = heuristic
-                            decision.model = _pick_model_for_decision(
-                                decision.intent,
-                                use_cloud=decision.use_cloud,
-                                chat_model=deps.chat_model,
-                                cloud_model=deps.cloud_model,
-                                coder_model=deps.coder_model or deps.chat_model,
-                                vision_model=deps.vision_model or deps.chat_model,
-                            )
-                            decision.planner_status = "embedding_ambiguous_fallback"
-                            if not decision.reasoning_summary:
-                                decision.reasoning_summary = reasoning_summary
-                    elif embed_result.should_escalate and not ROUTER_PLANNER_ENABLED:
-                        log.info("embedding_route.ambiguous | action=heuristic_disabled_planner")
-                        decision = heuristic
-                        decision.model = _pick_model_for_decision(
-                            decision.intent,
-                            use_cloud=decision.use_cloud,
-                            chat_model=deps.chat_model,
-                            cloud_model=deps.cloud_model,
-                            coder_model=deps.coder_model or deps.chat_model,
-                            vision_model=deps.vision_model or deps.chat_model,
-                        )
-                        decision.planner_status = "disabled"
+                    if embed_result.should_escalate:
+                        log.info("embedding_route.ambiguous | action=heuristic")
+                        decision = _heuristic_router_decision()
+                        decision.planner_status = "embedding_ambiguous_fallback"
+                        if not decision.reasoning_summary:
+                            decision.reasoning_summary = reasoning_summary
                     else:
                         decision = _decision_from_embedding(
                             embed_result.tool.label,
@@ -835,20 +615,7 @@ def build_assistant_graph(
                             reasoning_summary=reasoning_summary,
                         )
         else:
-            try:
-                decision = await _legacy_router_decision()
-            except Exception as exc:
-                log.warning("graph.intent_classifier | planner_failed=%s | falling_back=heuristic", exc)
-                decision = heuristic
-                decision.model = _pick_model_for_decision(
-                    decision.intent,
-                    use_cloud=decision.use_cloud,
-                    chat_model=deps.chat_model,
-                    cloud_model=deps.cloud_model,
-                    coder_model=deps.coder_model or deps.chat_model,
-                    vision_model=deps.vision_model or deps.chat_model,
-                )
-                decision.planner_status = "fallback"
+            decision = _heuristic_router_decision()
 
         route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
         if _is_code_intent(decision.intent):

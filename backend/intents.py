@@ -1,27 +1,25 @@
 """
-Intent classifier for the assistant graph.
-
-This file now exists as a compatibility shim around the graph's routing entry
-point: a deterministic heuristic classifier plus a thin async wrapper for code
-that still expects ``await route(prompt)``.
+Deterministic intent classifier and shared routing model constants.
 
 Intent categories:
     quick-local          — factual, short, conversational
     reasoning-heavy      — multi-step planning, analysis, architecture
-    code-question        — explanation, understanding, code review (answered by local code_tool)
-    code-write           — code generation, file edits, debugging (dispatched to external coding agent)
-    external-data-needed — weather, news, live data, music playback commands
+    code-question        — explanation, understanding, code review
+    code-write           — code generation, file edits, debugging
+    external-data-needed — weather/news/live-data/music commands
     memory-needed        — references to prior facts or user preferences
+    vision               — image-related requests
 """
+
+from __future__ import annotations
 
 import os
 import re
 from dataclasses import dataclass
 
-# ── Model config ───────────────────────────────────────────────────────────────
-# Chat model:  OLLAMA_CHAT_MODEL → MODEL_LOCAL → "llama3.2"
-# Coder model: OLLAMA_CODER_MODEL → OLLAMA_CHAT_MODEL → MODEL_LOCAL → "llama3.2"
-# LOCAL_MODEL is a backward-compatible alias for CHAT_MODEL.
+from routing_config import ROUTING_CONFIG
+
+
 CHAT_MODEL: str = (
     os.getenv("OLLAMA_CHAT_MODEL")
     or os.getenv("MODEL_LOCAL")
@@ -33,53 +31,40 @@ CODER_MODEL: str = (
     or os.getenv("MODEL_LOCAL")
     or "llama3.2"
 )
-# Phase 14 — vision model: defaults to CHAT_MODEL (e.g. gemma:e4b is multimodal)
 VISION_MODEL: str = (
     os.getenv("OLLAMA_VISION_MODEL")
     or CHAT_MODEL
 )
-LOCAL_MODEL = CHAT_MODEL  # backward-compat alias
+LOCAL_MODEL = CHAT_MODEL
 CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
 
-# ── Routing threshold ──────────────────────────────────────────────────────────
-# Minimum confidence score in "reasoning-heavy" required to route to cloud.
-ROUTE_CONFIDENCE_THRESHOLD = float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", "0.55"))
-
+ROUTE_CONFIDENCE_THRESHOLD = ROUTING_CONFIG.route_confidence_threshold
 _VALID_TOOL_NAMES = frozenset(["weather", "music"])
 
 
 @dataclass
 class RouteDecision:
-    intent: str           # quick-local | reasoning-heavy | code-question | code-write | external-data-needed | memory-needed | vision
-    confidence: float     # 0.0–1.0
+    intent: str
+    confidence: float
     use_cloud: bool
     model: str
-    tool: str | None = None          # tool name when route == "tool", else None
-    needs_memory: bool = False       # set by LLM planner only; classify_intent() never sets this;
-                                     # graph._should_inject_memory() uses intent+term-overlap instead
-    planner_status: str = "heuristic"  # planner | fallback | heuristic | disabled
-    reasoning_summary: str = ""      # server-log only, never sent to client
+    tool: str | None = None
+    needs_memory: bool = False
+    planner_status: str = "heuristic"
+    reasoning_summary: str = ""
 
 
 def _is_code_intent(intent: str) -> bool:
-    """Return True for any code-related intent (question or write)."""
     return intent in ("code-question", "code-write")
 
 
 def _pick_local_model(intent: str) -> str:
-    """Return the appropriate local Ollama model for a given intent.
-
-    Both code-question and code-write use CODER_MODEL; vision uses VISION_MODEL;
-    all others use CHAT_MODEL.
-    """
     if _is_code_intent(intent):
         return CODER_MODEL
     if intent == "vision":
         return VISION_MODEL
     return CHAT_MODEL
 
-
-# ── Pattern banks ──────────────────────────────────────────────────────────────
 
 _REASONING_PATTERNS = [
     r"\barchitect\w*\b",
@@ -123,7 +108,6 @@ _WEATHER_PATTERNS = [
 _MUSIC_PATTERNS = [
     r"\b(play|queue|put\s+on)\b.{0,60}\b(song|track|music|album|artist|band)\b",
     r"\b(pause|resume|unpause)\b.{0,30}\b(music|song|track|playback)?\b",
-    # (track|song) is required (not optional) to avoid matching bare "skip" or "next" in non-music context.
     r"\b(next|skip)\b.{0,20}\b(track|song)\b",
     r"\bstop\s+(the\s+)?(music|playback|song)\b",
     r"\b(now\s+playing|what'?s\s+playing|what\s+is\s+playing)\b",
@@ -141,11 +125,6 @@ _MUSIC_KEYWORDS = [
 def _looks_like_weather_request(text: str) -> bool:
     return any(re.search(p, text, re.IGNORECASE) for p in _WEATHER_PATTERNS)
 
-
-# ── Vision patterns ──────────────────────────────────────────────────────────
-# NOTE: when an image is attached, graph.py forces intent="vision" and bypasses
-# classify_intent() entirely. These patterns only fire for text-only prompts
-# where the user mentions an image without attaching one.
 
 _VISION_PATTERNS = [
     r"\b(what|who|where|how|why|when)\b.{0,40}\b(image|picture|photo|screenshot|diagram|chart|graph)\b",
@@ -171,28 +150,13 @@ def _looks_like_vision_request(text: str) -> bool:
 
 
 def _looks_like_music_request(text: str) -> bool:
-    """Return True when the prompt is almost certainly a music command.
-
-    Uses keyword gate first (fast path), then regex patterns for structural matches.
-    Intentionally conservative — broad "play" alone is not sufficient; it must
-    be accompanied by a music-related keyword or structural pattern.
-    """
     p = text.lower()
-    # Fast keyword gate
     if not any(kw in p for kw in _MUSIC_KEYWORDS):
         return False
-    # Require at least one structural pattern
     return any(re.search(pat, text, re.IGNORECASE) for pat in _MUSIC_PATTERNS)
 
 
 def _normalize_external_tool(intent: str, prompt: str, tool_name: str | None) -> str | None:
-    """Return a safe tool name for external-data intents, else None.
-
-    - Only external-data intents may dispatch to tools.
-    - Unknown planner tool names are ignored.
-    - Weather requests infer the weather tool when planner omits a tool.
-    - Music requests infer the music tool when planner omits a tool.
-    """
     if intent != "external-data-needed":
         return None
 
@@ -226,8 +190,6 @@ _MEMORY_KEYWORDS = [
     "my name", "my preference", "my favorite", "my favourite", "my city",
 ]
 
-# ── Code-write patterns (user wants code produced or files changed) ───────────
-
 _CODE_WRITE_PATTERNS = [
     r"\bwrite\s+me\s+code\b",
     r"\b(write|generate|create|implement)\b.{0,80}\b(in|using)\s+(python|javascript|typescript|sql|bash|shell|css|html)\b",
@@ -256,8 +218,6 @@ _CODE_WRITE_KEYWORDS = [
     "create an endpoint", "write an api", "write a module",
 ]
 
-# ── Code-question patterns (user wants explanation or understanding) ───────────
-
 _CODE_QUESTION_PATTERNS = [
     r"\bexplain\b.{0,60}\b(function|class|method|code|script|algorithm|module|file|logic|pattern)\b",
     r"\bhow\s+does\b.{0,60}\b(work|function|run|operate)\b",
@@ -284,7 +244,6 @@ _CODE_QUESTION_KEYWORDS = [
 
 
 def _looks_like_code_request(text: str) -> bool:
-    """Conservative gate for detecting any code-related prompt (question or write)."""
     p = text.lower()
     write_score = _score_patterns(p, _CODE_WRITE_PATTERNS) + _score_keywords(p, _CODE_WRITE_KEYWORDS)
     question_score = _score_patterns(p, _CODE_QUESTION_PATTERNS) + _score_keywords(p, _CODE_QUESTION_KEYWORDS)
@@ -314,7 +273,6 @@ def classify_intent(prompt: str) -> RouteDecision:
         "vision": 0.0,
     }
 
-    # reasoning-heavy signals
     scores["reasoning-heavy"] += _score_patterns(p, _REASONING_PATTERNS)
     scores["reasoning-heavy"] += _score_keywords(p, _REASONING_KEYWORDS)
     if len(prompt) > 600:
@@ -322,7 +280,6 @@ def classify_intent(prompt: str) -> RouteDecision:
     elif len(prompt) > 300:
         scores["reasoning-heavy"] = min(1.0, scores["reasoning-heavy"] + 0.10)
 
-    # external-data signals
     scores["external-data-needed"] += _score_patterns(p, _EXTERNAL_DATA_PATTERNS)
     scores["external-data-needed"] += _score_keywords(p, _EXTERNAL_DATA_KEYWORDS)
     if _looks_like_weather_request(p):
@@ -330,32 +287,25 @@ def classify_intent(prompt: str) -> RouteDecision:
     if _looks_like_music_request(p):
         scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.55)
 
-    # memory signals
     scores["memory-needed"] += _score_patterns(p, _MEMORY_PATTERNS)
     scores["memory-needed"] += _score_keywords(p, _MEMORY_KEYWORDS)
 
-    # code-write signals — user wants code produced or files changed
     scores["code-write"] += _score_patterns(p, _CODE_WRITE_PATTERNS)
     scores["code-write"] += _score_keywords(p, _CODE_WRITE_KEYWORDS)
 
-    # code-question signals — user wants explanation or understanding
     scores["code-question"] += _score_patterns(p, _CODE_QUESTION_PATTERNS)
     scores["code-question"] += _score_keywords(p, _CODE_QUESTION_KEYWORDS)
 
-    # quick-local baseline — short, conversational prompts
     if len(prompt) < 60:
         scores["quick-local"] += 0.60
     elif len(prompt) < 120:
         scores["quick-local"] += 0.35
 
-    # vision signals — user explicitly mentions an image in text
     scores["vision"] += _score_patterns(p, _VISION_PATTERNS)
     scores["vision"] += _score_keywords(p, _VISION_KEYWORDS)
     if _looks_like_vision_request(p):
         scores["vision"] = min(1.0, scores["vision"] + 0.40)
 
-    # If we already have strong external-data, memory, code, or vision signals,
-    # dampen quick-local baseline so intent-specific routes win short prompts.
     if scores["external-data-needed"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
     if scores["memory-needed"] >= 0.25:
@@ -365,21 +315,16 @@ def classify_intent(prompt: str) -> RouteDecision:
     if scores["vision"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
 
-    # Clamp all scores
-    for k in scores:
-        scores[k] = min(1.0, scores[k])
+    for key in scores:
+        scores[key] = min(1.0, scores[key])
 
     intent = max(scores, key=lambda k: scores[k])
     confidence = scores[intent]
 
-    # If all scores are zero, treat as quick-local with baseline confidence
     if confidence == 0.0:
         intent = "quick-local"
         confidence = 0.50
 
-    # Routing: only send to cloud for reasoning-heavy with sufficient confidence.
-    # Code intents always stay local and use the coder model.
-    # Vision intents stay local first (cloud fallback is handled in the responder node).
     use_cloud = (intent == "reasoning-heavy" and confidence >= ROUTE_CONFIDENCE_THRESHOLD)
     model = CLOUD_MODEL if use_cloud else _pick_local_model(intent)
 
@@ -394,6 +339,7 @@ def classify_intent(prompt: str) -> RouteDecision:
         planner_status="heuristic",
     )
 
+
 async def route(prompt: str) -> RouteDecision:
-    """Compatibility wrapper for legacy async call sites."""
+    """Compatibility async wrapper for callers that still await route()."""
     return classify_intent(prompt)

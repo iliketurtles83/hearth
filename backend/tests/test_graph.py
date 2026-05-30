@@ -51,21 +51,6 @@ class _FakeMemoryStore:
         return []
 
 
-@pytest.fixture(autouse=True)
-def _fake_planner(monkeypatch):
-    async def _planner(prompt: str):
-        return {
-            "intent": "quick-local",
-            "route": "local",
-            "tool": None,
-            "needs_memory": False,
-            "confidence": 0.99,
-            "reasoning": f"stubbed planner for {prompt}",
-        }
-
-    monkeypatch.setattr(assistant_graph, "_call_planner", _planner)
-
-
 def _base_state() -> assistant_graph.AssistantState:
     return {
         "user_id": "alice",
@@ -269,7 +254,7 @@ def _deps_for_code_write() -> assistant_graph.AssistantGraphDependencies:
 
     return assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
-        router_route=lambda _m: None,  # unused — routing goes through _call_planner
+        router_route=lambda _m: None,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
         tool_dispatch=_fake_tool_dispatch,
@@ -278,24 +263,28 @@ def _deps_for_code_write() -> assistant_graph.AssistantGraphDependencies:
     )
 
 
-def _planner_returning(intent: str):
-    """Return an async planner stub that emits the given intent."""
-    async def _planner(prompt: str):
-        return {
-            "intent": intent,
-            "route": "local",
-            "tool": None,
-            "needs_memory": False,
-            "confidence": 0.9,
-            "reasoning": f"test stub for {intent}",
-        }
-    return _planner
+def _heuristic_returning(intent: str):
+    """Return a classifier stub that emits the given intent."""
+
+    def _classify(_prompt: str):
+        return assistant_graph.RouteDecision(
+            intent=intent,
+            confidence=0.9,
+            use_cloud=False,
+            model=TEST_CHAT_MODEL,
+            tool=None,
+            planner_status="heuristic",
+            reasoning_summary=f"test stub for {intent}",
+            needs_memory=False,
+        )
+
+    return _classify
 
 
 @pytest.mark.asyncio
 async def test_code_write_routes_to_coding_agent_tool(monkeypatch):
     """code-write intent should trigger the confirmation gate, not the executor."""
-    monkeypatch.setattr(assistant_graph, "_call_planner", _planner_returning("code-write"))
+    monkeypatch.setattr(assistant_graph, "classify_intent", _heuristic_returning("code-write"))
 
     graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
     state = _base_state()
@@ -313,7 +302,7 @@ async def test_code_write_routes_to_coding_agent_tool(monkeypatch):
 @pytest.mark.asyncio
 async def test_code_write_voice_prompt_is_short(monkeypatch):
     """Voice confirmation prompt should be ≤ 12-word preview, not full task."""
-    monkeypatch.setattr(assistant_graph, "_call_planner", _planner_returning("code-write"))
+    monkeypatch.setattr(assistant_graph, "classify_intent", _heuristic_returning("code-write"))
 
     graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
     long_task = "Write " + " ".join([f"word{i}" for i in range(30)])
@@ -432,23 +421,8 @@ def _deps_for_weather_stream() -> assistant_graph.AssistantGraphDependencies:
 
 
 @pytest.mark.asyncio
-async def test_heuristic_gate_skips_planner_for_weather(monkeypatch):
-    """High-confidence weather query must bypass _call_planner entirely."""
-    planner_calls: list[str] = []
-
-    async def _spy_planner(prompt: str):
-        planner_calls.append(prompt)
-        # Return a deliberately wrong intent — if this runs, the assertion below fails.
-        return {
-            "intent": "quick-local",
-            "route": "local",
-            "tool": None,
-            "needs_memory": False,
-            "confidence": 0.99,
-            "reasoning": "spy",
-        }
-
-    monkeypatch.setattr(assistant_graph, "_call_planner", _spy_planner)
+async def test_heuristic_routing_for_weather_without_planner():
+    """High-confidence weather query should route correctly with no planner path."""
 
     graph = assistant_graph.build_assistant_graph(_deps_for_weather_stream())
     state = _base_state()
@@ -457,16 +431,13 @@ async def test_heuristic_gate_skips_planner_for_weather(monkeypatch):
     result = await graph.ainvoke(state)
 
     assert result["intent"] == "external-data-needed"
-    assert planner_calls == [], "Planner must not be called when heuristic gate fires"
+    assert result["tool"] == "weather"
 
 
 @pytest.mark.asyncio
-async def test_planner_failure_uses_precomputed_heuristic(monkeypatch):
-    """When _call_planner raises, the pre-computed heuristic is used without re-running classify_intent."""
-    async def _failing_planner(prompt: str):
-        raise RuntimeError("simulated planner timeout")
-
-    monkeypatch.setattr(assistant_graph, "_call_planner", _failing_planner)
+async def test_embedding_router_absence_uses_heuristic_fallback(monkeypatch):
+    """Without an embedding router, routing falls back to heuristic immediately."""
+    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: None)
 
     async def _fake_stream_local(_request, model_name=None):
         yield "fallback response"
@@ -487,7 +458,7 @@ async def test_planner_failure_uses_precomputed_heuristic(monkeypatch):
         cloud_model=TEST_CLOUD_MODEL,
     )
 
-    # "hello" → quick-local (not in _HEURISTIC_GATE) so planner is attempted then fails.
+    # "hello" should route through the heuristic fallback when embedding is unavailable.
     graph = assistant_graph.build_assistant_graph(deps)
     state = _base_state()
     state["message"] = "hello"
@@ -495,24 +466,11 @@ async def test_planner_failure_uses_precomputed_heuristic(monkeypatch):
     result = await graph.ainvoke(state)
 
     assert result["intent"] == "quick-local"
-    assert result["planner_status"] == "fallback"
+    assert result["planner_status"] == "heuristic"
 
 
 @pytest.mark.asyncio
 async def test_embedding_unambiguous_weather_skips_planner(monkeypatch):
-    planner_calls: list[str] = []
-
-    async def _spy_planner(prompt: str):
-        planner_calls.append(prompt)
-        return {
-            "intent": "quick-local",
-            "route": "local",
-            "tool": None,
-            "needs_memory": False,
-            "confidence": 0.99,
-            "reasoning": "planner should not run",
-        }
-
     class _FakeEmbedRouter:
         def classify_embedding(self, _query_embedding):
             return DualClassifierResult(
@@ -538,7 +496,6 @@ async def test_embedding_unambiguous_weather_skips_planner(monkeypatch):
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([1.0, 0.0], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "_call_planner", _spy_planner)
     monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
     monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
 
@@ -548,26 +505,13 @@ async def test_embedding_unambiguous_weather_skips_planner(monkeypatch):
 
     result = await graph.ainvoke(state)
 
-    assert planner_calls == []
     assert result["intent"] == "external-data-needed"
     assert result["tool"] == "weather"
     assert result["planner_status"] == "embedding"
 
 
 @pytest.mark.asyncio
-async def test_embedding_ambiguous_uses_planner(monkeypatch):
-    planner_calls: list[str] = []
-
-    async def _spy_planner(prompt: str):
-        planner_calls.append(prompt)
-        return {
-            "intent": "quick-local",
-            "route": "local",
-            "tool": None,
-            "needs_memory": False,
-            "confidence": 0.95,
-            "reasoning": "planner handled ambiguity",
-        }
+async def test_embedding_ambiguous_uses_heuristic_fallback(monkeypatch):
 
     class _FakeEmbedRouter:
         def classify_embedding(self, _query_embedding):
@@ -594,7 +538,6 @@ async def test_embedding_ambiguous_uses_planner(monkeypatch):
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([0.1, 0.9], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "_call_planner", _spy_planner)
     monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
     monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
 
@@ -604,19 +547,12 @@ async def test_embedding_ambiguous_uses_planner(monkeypatch):
 
     result = await graph.ainvoke(state)
 
-    assert planner_calls == ["hello"]
     assert result["intent"] == "quick-local"
-    assert result["planner_status"] == "embedding_ambiguous_planner"
+    assert result["planner_status"] == "embedding_ambiguous_fallback"
 
 
 @pytest.mark.asyncio
-async def test_embedding_ambiguous_planner_failure_single_attempt(monkeypatch):
-    planner_calls: list[str] = []
-
-    async def _failing_planner(prompt: str):
-        planner_calls.append(prompt)
-        raise RuntimeError("planner timeout")
-
+async def test_embedding_ambiguous_does_not_call_planner_function(monkeypatch):
     class _FakeEmbedRouter:
         def classify_embedding(self, _query_embedding):
             return DualClassifierResult(
@@ -642,7 +578,7 @@ async def test_embedding_ambiguous_planner_failure_single_attempt(monkeypatch):
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([0.2, 0.8], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "_call_planner", _failing_planner)
+    assert not hasattr(assistant_graph, "_call_planner")
     monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
     monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
 
@@ -652,7 +588,6 @@ async def test_embedding_ambiguous_planner_failure_single_attempt(monkeypatch):
 
     result = await graph.ainvoke(state)
 
-    assert planner_calls == ["hello"]
     assert result["intent"] == "quick-local"
     assert result["planner_status"] == "embedding_ambiguous_fallback"
 
@@ -676,4 +611,4 @@ async def test_embedding_snapshot_mismatch_falls_back_to_legacy_router(monkeypat
     result = await graph.ainvoke(state)
 
     assert result["intent"] == "quick-local"
-    assert result["planner_status"] == "planner"
+    assert result["planner_status"] == "heuristic"

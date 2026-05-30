@@ -64,7 +64,7 @@ class TestValidateImage:
 
 # ── Router: vision intent via text patterns ───────────────────────────────────
 
-from router import classify_intent, VISION_MODEL, CHAT_MODEL as _CHAT_MODEL
+from intents import classify_intent, VISION_MODEL, CHAT_MODEL as _CHAT_MODEL
 
 
 class TestVisionIntentFromText:
@@ -100,7 +100,7 @@ class TestVisionIntentOverride:
     def test_image_forces_vision_intent(self):
         """Simulate the intent_classifier override: if image_base64 is in state,
         intent must become 'vision' and use_cloud must be False."""
-        from router import classify_intent
+        from intents import classify_intent
 
         # Text-only decision first
         decision = classify_intent("tell me a joke")
@@ -115,7 +115,7 @@ class TestVisionIntentOverride:
         assert decision.use_cloud is False
 
     def test_no_image_no_override(self):
-        from router import classify_intent
+        from intents import classify_intent
 
         decision = classify_intent("tell me a joke")
         state = {"image_base64": None, "message": "tell me a joke"}

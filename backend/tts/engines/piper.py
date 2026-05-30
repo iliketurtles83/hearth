@@ -9,9 +9,10 @@ from pathlib import Path
 from wave import open as wave_open
 
 from tts import TTSError
+from tts.engines._base import BaseTTSEngine
 
 
-class Engine:
+class Engine(BaseTTSEngine):
     """Piper CLI-backed TTS engine.
 
     Environment variables:
@@ -29,12 +30,15 @@ class Engine:
     def __init__(self) -> None:
         self.piper_bin = os.getenv("TTS_PIPER_BIN", "piper").strip() or "piper"
         self.model_path = os.getenv("TTS_PIPER_MODEL", "").strip()
-        self.speaker = self._parse_optional_int("TTS_PIPER_SPEAKER")
-        self.rate = self._parse_float("TTS_PIPER_RATE", default=1.0)
-        self.pitch = self._parse_float("TTS_PIPER_PITCH", default=1.0)
-        self.noise_scale = self._parse_optional_float("TTS_PIPER_NOISE_SCALE")
-        self.noise_w = self._parse_optional_float("TTS_PIPER_NOISE_W")
-        self.sentence_silence = self._parse_optional_float("TTS_PIPER_SENTENCE_SILENCE")
+        self.speaker = self._parse_optional_int("TTS_PIPER_SPEAKER", error_code="TTS_PIPER_CONFIG_INVALID")
+        self.rate = self._parse_float("TTS_PIPER_RATE", default=1.0, error_code="TTS_PIPER_CONFIG_INVALID")
+        self.pitch = self._parse_float("TTS_PIPER_PITCH", default=1.0, error_code="TTS_PIPER_CONFIG_INVALID")
+        self.noise_scale = self._parse_optional_float("TTS_PIPER_NOISE_SCALE", error_code="TTS_PIPER_CONFIG_INVALID")
+        self.noise_w = self._parse_optional_float("TTS_PIPER_NOISE_W", error_code="TTS_PIPER_CONFIG_INVALID")
+        self.sentence_silence = self._parse_optional_float(
+            "TTS_PIPER_SENTENCE_SILENCE",
+            error_code="TTS_PIPER_CONFIG_INVALID",
+        )
         self.ffmpeg_bin = os.getenv("TTS_FFMPEG_BIN", "ffmpeg").strip() or "ffmpeg"
 
         if not self.model_path:
@@ -57,53 +61,6 @@ class Engine:
                 code="TTS_PIPER_BIN_NOT_FOUND",
                 retryable=False,
             )
-
-    @staticmethod
-    def _parse_float(name: str, default: float) -> float:
-        raw = os.getenv(name, str(default)).strip()
-        try:
-            value = float(raw)
-        except ValueError as exc:
-            raise TTSError(
-                message=f"Invalid {name}: {raw}",
-                code="TTS_PIPER_CONFIG_INVALID",
-                retryable=False,
-            ) from exc
-        if value <= 0:
-            raise TTSError(
-                message=f"{name} must be > 0",
-                code="TTS_PIPER_CONFIG_INVALID",
-                retryable=False,
-            )
-        return value
-
-    @staticmethod
-    def _parse_optional_float(name: str) -> float | None:
-        raw = os.getenv(name, "").strip()
-        if not raw:
-            return None
-        try:
-            return float(raw)
-        except ValueError as exc:
-            raise TTSError(
-                message=f"Invalid {name}: {raw}",
-                code="TTS_PIPER_CONFIG_INVALID",
-                retryable=False,
-            ) from exc
-
-    @staticmethod
-    def _parse_optional_int(name: str) -> int | None:
-        raw = os.getenv(name, "").strip()
-        if not raw:
-            return None
-        try:
-            return int(raw)
-        except ValueError as exc:
-            raise TTSError(
-                message=f"Invalid {name}: {raw}",
-                code="TTS_PIPER_CONFIG_INVALID",
-                retryable=False,
-            ) from exc
 
     def _build_cmd(self, output_path: Path) -> list[str]:
         cmd = [

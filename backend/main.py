@@ -26,7 +26,7 @@ from threading import Lock
 from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
-from router import route as router_route, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
+from intents import CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
 from embedding_router import (
     warmup_embedding_router,
     embedding_router_ready,
@@ -34,6 +34,7 @@ from embedding_router import (
     get_embedding_router_snapshot,
 )
 from memory import MemoryStore
+from routing_config import ROUTING_CONFIG
 from graph import (
     build_assistant_graph,
     AssistantGraphDependencies,
@@ -108,9 +109,9 @@ log = logging.getLogger("assistant")
 SESSION_COOKIE_NAME = os.getenv("CHAT_SESSION_COOKIE", "assistant_session")
 SESSION_IDLE_TTL_SECONDS = int(os.getenv("CHAT_SESSION_IDLE_TTL_SECONDS", "1800"))
 SESSION_MAX_ITEMS = int(os.getenv("CHAT_SESSION_MAX_ITEMS", "200"))
-CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
-CHAT_MAX_TURNS = int(os.getenv("CHAT_MAX_TURNS", "24"))
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
+CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
+OLLAMA_URL = ROUTING_CONFIG.ollama_url
 # Vision model defaults to CHAT_MODEL (gemma:e4b is multimodal)
 OLLAMA_VISION_MODEL: str = (
     os.getenv("OLLAMA_VISION_MODEL")
@@ -122,7 +123,7 @@ CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
 MEMORY_CONSOLIDATION_MODE = os.getenv("MEMORY_CONSOLIDATION_MODE", "on-session-end").strip().lower()
 MEMORY_CONSOLIDATION_INTERVAL_SECONDS = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL_SECONDS", "86400"))
 MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
-ROUTER_EMBEDDING_WARMUP = os.getenv("ROUTER_EMBEDDING_WARMUP", "true").strip().lower() == "true"
+ROUTER_EMBEDDING_WARMUP = ROUTING_CONFIG.router_embedding_warmup
 
 
 def _load_hearth_prompt(filename: str, env_var: str, fallback: str) -> str:
@@ -1001,13 +1002,11 @@ async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[overr
 
 
 # ── LangGraph dependency wiring ───────────────────────────────────────────────
-# Late-binding proxies: each closure looks up the current module-level name at
-# *call* time, so monkeypatch.setattr(main, "router_route", fake) in tests
-# propagates transparently through the graph.
+# Late-binding stream/tool proxies keep graph dependencies patchable in tests.
 
 def _make_graph_deps() -> AssistantGraphDependencies:
-    async def _late_router_route(msg: str):
-        return await router_route(msg)
+    async def _unused_router_route(_msg: str):
+        return None
 
     async def _late_stream_local(req, model_name=None):
         async for chunk in stream_local(req, model_name):  # type: ignore[arg-type]
@@ -1026,7 +1025,7 @@ def _make_graph_deps() -> AssistantGraphDependencies:
 
     return AssistantGraphDependencies(
         memory_store=memory_store,
-        router_route=_late_router_route,
+        router_route=_unused_router_route,
         stream_local=_late_stream_local,
         stream_cloud=_late_stream_cloud,
         stream_local_vision=_late_stream_local_vision,
@@ -1052,7 +1051,7 @@ async def chat(request: ChatRequest, http_request: Request):
     effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
 
     # ── Deterministic music fast-path ─────────────────────────────────────────
-    # Check before router_route() so clear music commands never touch the LLM.
+    # Check before graph routing so clear music commands never touch the LLM.
     music_cmd = parse_music_command(request.message)
     if music_cmd is not None:
         music_cmd["prompt"] = request.message

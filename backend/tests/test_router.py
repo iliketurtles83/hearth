@@ -19,7 +19,7 @@ os.environ.setdefault("MODEL_CLOUD", "claude-sonnet-4-20250514")
 os.environ.setdefault("ROUTE_CONFIDENCE_THRESHOLD", "0.55")
 
 # Import after env is set up
-import router as r
+import intents as r
 
 
 class TestHeuristicClassifier:

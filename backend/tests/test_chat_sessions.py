@@ -386,8 +386,9 @@ async def test_chat_stream_omits_voice_metadata_for_text_source(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(monkeypatch):
-    async def _unexpected_router(_message: str):
-        raise AssertionError("router_route should not run for explicit music commands")
+    class _UnexpectedGraph:
+        async def astream(self, *_args, **_kwargs):
+            raise AssertionError("graph should not run for explicit music commands")
 
     dispatched: list[tuple[str, dict]] = []
 
@@ -401,7 +402,7 @@ async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(mo
             },
         )
 
-    monkeypatch.setattr(main, "router_route", _unexpected_router)
+    monkeypatch.setattr(main.app.state, "assistant_graph", _UnexpectedGraph(), raising=False)
     monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
 
     response = await main.chat(
@@ -429,8 +430,9 @@ async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(mo
 
 @pytest.mark.asyncio
 async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypatch):
-    async def _unexpected_router(_message: str):
-        raise AssertionError("router_route should not run for explicit music commands")
+    class _UnexpectedGraph:
+        async def astream(self, *_args, **_kwargs):
+            raise AssertionError("graph should not run for explicit music commands")
 
     async def _fake_dispatch(_tool_name: str, _params: dict):
         return main.ToolResult(
@@ -446,7 +448,7 @@ async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypat
             },
         )
 
-    monkeypatch.setattr(main, "router_route", _unexpected_router)
+    monkeypatch.setattr(main.app.state, "assistant_graph", _UnexpectedGraph(), raising=False)
     monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
 
     response = await main.chat(

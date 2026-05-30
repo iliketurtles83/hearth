@@ -476,7 +476,7 @@ def test_code_stream_endpoint_sse(authed_client, monkeypatch):
 def test_code_mode_yes_without_pending_write_is_blocked(monkeypatch):
     """Regression: bare 'yes' in code mode must not trigger a phantom write."""
     from graph import build_assistant_graph, AssistantGraphDependencies  # type: ignore[import]
-    from router import RouteDecision  # type: ignore[import]
+    from intents import RouteDecision  # type: ignore[import]
     import memory as memory_mod  # type: ignore[import]
 
     async def _router_route(_message: str):
