@@ -20,7 +20,11 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
 from router import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, VISION_MODEL, RouteDecision, classify_intent, _is_code_intent
-from embedding_router import get_embedding_router, ollama_embed_text
+from embedding_router import (
+    EmbeddingRouterSnapshotMismatchError,
+    get_embedding_router,
+    ollama_embed_text,
+)
 from tools.weather import format_weather_response, is_weather_reasoning
 
 CHAT_TOKEN_BUDGET = int(os.getenv("CHAT_TOKEN_BUDGET", "1500"))
@@ -701,6 +705,7 @@ def build_assistant_graph(
         if ROUTER_EMBEDDING_ENABLED:
             embed_router = get_embedding_router()
             if embed_router is None:
+                log.info("embedding_route.fallback | reason=router_unavailable")
                 try:
                     decision = await _legacy_router_decision()
                 except Exception as exc:
@@ -724,8 +729,35 @@ def build_assistant_graph(
                         timeout_seconds=ROUTER_EMBED_TIMEOUT_MS / 1000.0,
                     )
                     embed_result = embed_router.classify_embedding(query_embedding)
+                    log.info(
+                        "embedding_route.classified | tool=%s tool_score=%.3f tool_gap=%.3f dialogue=%s "
+                        "dialogue_score=%.3f dialogue_gap=%.3f escalate=%s",
+                        embed_result.tool.label,
+                        embed_result.tool.score,
+                        embed_result.tool.gap,
+                        embed_result.dialogue.label,
+                        embed_result.dialogue.score,
+                        embed_result.dialogue.gap,
+                        embed_result.should_escalate,
+                    )
+                except EmbeddingRouterSnapshotMismatchError as exc:
+                    log.warning("embedding_route.snapshot_mismatch | error=%s", exc)
+                    try:
+                        decision = await _legacy_router_decision()
+                    except Exception as legacy_exc:
+                        log.warning("graph.intent_classifier | legacy_router_failed=%s | falling_back=heuristic", legacy_exc)
+                        decision = heuristic
+                        decision.model = _pick_model_for_decision(
+                            decision.intent,
+                            use_cloud=decision.use_cloud,
+                            chat_model=deps.chat_model,
+                            cloud_model=deps.cloud_model,
+                            coder_model=deps.coder_model or deps.chat_model,
+                            vision_model=deps.vision_model or deps.chat_model,
+                        )
+                        decision.planner_status = "fallback"
                 except Exception as exc:
-                    log.warning("graph.intent_classifier | embedding_failed=%s | falling_back=heuristic", exc)
+                    log.warning("embedding_route.fallback | reason=embedding_failed error=%s", exc)
                     try:
                         decision = await _legacy_router_decision()
                     except Exception as legacy_exc:
@@ -747,6 +779,7 @@ def build_assistant_graph(
                         f" dialogue={embed_result.dialogue.label}:{embed_result.dialogue.score:.3f}/gap={embed_result.dialogue.gap:.3f}"
                     )
                     if embed_result.should_escalate and ROUTER_PLANNER_ENABLED:
+                        log.info("embedding_route.ambiguous | action=planner")
                         try:
                             parsed = await _call_planner(state["message"])
                             decision = _decision_from_planner(
@@ -777,6 +810,7 @@ def build_assistant_graph(
                             if not decision.reasoning_summary:
                                 decision.reasoning_summary = reasoning_summary
                     elif embed_result.should_escalate and not ROUTER_PLANNER_ENABLED:
+                        log.info("embedding_route.ambiguous | action=heuristic_disabled_planner")
                         decision = heuristic
                         decision.model = _pick_model_for_decision(
                             decision.intent,

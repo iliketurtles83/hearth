@@ -16,6 +16,12 @@ log = logging.getLogger("assistant.embedding_router")
 TOOL_CLASSES = ("none", "weather", "music", "code", "vision")
 DIALOGUE_CLASSES = ("local", "cloud", "memory-augmented")
 
+ROUTER_EMBED_MODEL = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
+TOOL_AMBIGUITY_GAP_DEFAULT = float(os.getenv("ROUTER_TOOL_AMBIGUITY_GAP", "0.035"))
+DIALOGUE_AMBIGUITY_GAP_DEFAULT = float(os.getenv("ROUTER_DIALOGUE_AMBIGUITY_GAP", "0.03"))
+TOOL_MIN_SIMILARITY_DEFAULT = float(os.getenv("ROUTER_TOOL_MIN_SIMILARITY", "0.15"))
+DIALOGUE_MIN_SIMILARITY_DEFAULT = float(os.getenv("ROUTER_DIALOGUE_MIN_SIMILARITY", "0.15"))
+
 DEFAULT_TOOL_EXEMPLARS: dict[str, tuple[str, ...]] = {
     "none": (
         "Hello there",
@@ -227,6 +233,10 @@ class EmbeddingRouterSnapshot:
     dialogue_rows: int
 
 
+class EmbeddingRouterSnapshotMismatchError(RuntimeError):
+    """Raised when the runtime embed model does not match the router snapshot."""
+
+
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     if matrix.size == 0:
         return matrix
@@ -287,19 +297,27 @@ class EmbeddingIntentRouter:
         *,
         tool_index: ExemplarIndex,
         dialogue_index: ExemplarIndex,
-        tool_ambiguity_gap: float = 0.035,
-        dialogue_ambiguity_gap: float = 0.03,
-        tool_min_similarity: float = 0.15,
-        dialogue_min_similarity: float = 0.15,
+        snapshot_model: str | None = None,
+        tool_ambiguity_gap: float = TOOL_AMBIGUITY_GAP_DEFAULT,
+        dialogue_ambiguity_gap: float = DIALOGUE_AMBIGUITY_GAP_DEFAULT,
+        tool_min_similarity: float = TOOL_MIN_SIMILARITY_DEFAULT,
+        dialogue_min_similarity: float = DIALOGUE_MIN_SIMILARITY_DEFAULT,
     ) -> None:
         self.tool_index = tool_index
         self.dialogue_index = dialogue_index
+        self.snapshot_model = (snapshot_model or "").strip()
         self.tool_ambiguity_gap = tool_ambiguity_gap
         self.dialogue_ambiguity_gap = dialogue_ambiguity_gap
         self.tool_min_similarity = tool_min_similarity
         self.dialogue_min_similarity = dialogue_min_similarity
 
     def classify_embedding(self, query_embedding: np.ndarray) -> DualClassifierResult:
+        runtime_model = os.getenv("ROUTER_EMBED_MODEL", ROUTER_EMBED_MODEL).strip()
+        if self.snapshot_model and runtime_model and self.snapshot_model != runtime_model:
+            raise EmbeddingRouterSnapshotMismatchError(
+                "Embedding router snapshot model mismatch "
+                f"(snapshot={self.snapshot_model}, runtime={runtime_model})"
+            )
         tool = _classify_index(
             query_embedding,
             self.tool_index,
@@ -355,7 +373,7 @@ async def build_embedding_router(
     dialogue_bank = dialogue_exemplars or DEFAULT_DIALOGUE_EXEMPLARS
 
     ollama_url = (base_url or os.getenv("OLLAMA_URL", "http://ollama:11434")).rstrip("/")
-    embed_model = model or os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
+    embed_model = model or os.getenv("ROUTER_EMBED_MODEL", ROUTER_EMBED_MODEL)
 
     all_texts: list[str] = []
     for samples in tool_bank.values():
@@ -379,7 +397,11 @@ async def build_embedding_router(
 
     tool_index = ExemplarIndex.from_embeddings(tool_bank, tool_matrix_rows)
     dialogue_index = ExemplarIndex.from_embeddings(dialogue_bank, dialogue_matrix_rows)
-    router = EmbeddingIntentRouter(tool_index=tool_index, dialogue_index=dialogue_index)
+    router = EmbeddingIntentRouter(
+        tool_index=tool_index,
+        dialogue_index=dialogue_index,
+        snapshot_model=embed_model,
+    )
     snapshot = EmbeddingRouterSnapshot(
         model=embed_model,
         dim=int(tool_index.matrix.shape[1]),

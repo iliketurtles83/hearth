@@ -35,7 +35,11 @@ os.environ["AUTH_DB_PATH"] = os.path.join(_tmp_dir, "auth.db")
 
 
 import graph as assistant_graph  # noqa: E402
-from embedding_router import ClassifierResult, DualClassifierResult  # noqa: E402
+from embedding_router import (  # noqa: E402
+    ClassifierResult,
+    DualClassifierResult,
+    EmbeddingRouterSnapshotMismatchError,
+)
 
 
 TEST_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3:4b")
@@ -651,3 +655,25 @@ async def test_embedding_ambiguous_planner_failure_single_attempt(monkeypatch):
     assert planner_calls == ["hello"]
     assert result["intent"] == "quick-local"
     assert result["planner_status"] == "embedding_ambiguous_fallback"
+
+
+@pytest.mark.asyncio
+async def test_embedding_snapshot_mismatch_falls_back_to_legacy_router(monkeypatch):
+    class _FakeEmbedRouter:
+        def classify_embedding(self, _query_embedding):
+            raise EmbeddingRouterSnapshotMismatchError("snapshot=old runtime=new")
+
+    async def _fake_embed_text(*_args, **_kwargs):
+        return np.asarray([0.1, 0.9], dtype=np.float32)
+
+    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
+    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_local_stream(["ok"]))
+    state = _base_state()
+    state["message"] = "hello"
+
+    result = await graph.ainvoke(state)
+
+    assert result["intent"] == "quick-local"
+    assert result["planner_status"] == "planner"

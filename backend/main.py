@@ -412,6 +412,7 @@ async def _graph_lifespan(_app: FastAPI):
         _app.state.embedding_router_error = ""
         _app.state.embedding_router_snapshot = None
         if ROUTER_EMBEDDING_WARMUP:
+            log.info("embedding_router.startup | status=warming")
             warmup_ok = await warmup_embedding_router()
             _app.state.embedding_router_ready = embedding_router_ready()
             _app.state.embedding_router_error = get_embedding_router_error()
@@ -1427,7 +1428,30 @@ async def get_chat_session_messages(http_request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    embed_ready = bool(getattr(app.state, "embedding_router_ready", False))
+    embed_error = str(getattr(app.state, "embedding_router_error", "") or "")
+    snapshot = getattr(app.state, "embedding_router_snapshot", None)
+    status = "ok"
+    if ROUTER_EMBEDDING_WARMUP and not embed_ready:
+        status = "degraded"
+    return {
+        "status": status,
+        "embedding_router": {
+            "ready": embed_ready,
+            "error": embed_error,
+            "snapshot": (
+                {
+                    "model": snapshot.model,
+                    "dim": snapshot.dim,
+                    "tool_rows": snapshot.tool_rows,
+                    "dialogue_rows": snapshot.dialogue_rows,
+                    "created_at_unix": snapshot.created_at_unix,
+                }
+                if snapshot is not None
+                else None
+            ),
+        },
+    }
 
 
 @app.head("/health")

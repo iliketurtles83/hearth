@@ -84,6 +84,28 @@ def test_similarity_floor_marks_ambiguous() -> None:
     assert result.should_escalate is True
 
 
+def test_router_uses_module_threshold_defaults() -> None:
+    tool_exemplars = {"none": ("hello",)}
+    dialogue_exemplars = {"local": ("hi",)}
+    tool_index = er.ExemplarIndex.from_embeddings(tool_exemplars, [[1.0, 0.0]])
+    dialogue_index = er.ExemplarIndex.from_embeddings(dialogue_exemplars, [[1.0, 0.0]])
+    router = er.EmbeddingIntentRouter(tool_index=tool_index, dialogue_index=dialogue_index)
+
+    assert router.tool_ambiguity_gap == er.TOOL_AMBIGUITY_GAP_DEFAULT
+    assert router.dialogue_ambiguity_gap == er.DIALOGUE_AMBIGUITY_GAP_DEFAULT
+    assert router.tool_min_similarity == er.TOOL_MIN_SIMILARITY_DEFAULT
+    assert router.dialogue_min_similarity == er.DIALOGUE_MIN_SIMILARITY_DEFAULT
+
+
+def test_snapshot_model_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    router = _build_router(tool_gap=0.02, dialogue_gap=0.02)
+    router.snapshot_model = "nomic-embed-text"
+    monkeypatch.setenv("ROUTER_EMBED_MODEL", "mxbai-embed-large")
+
+    with pytest.raises(er.EmbeddingRouterSnapshotMismatchError, match="snapshot model mismatch"):
+        router.classify_embedding(np.asarray([1.0, 0.0], dtype=np.float32))
+
+
 def test_classify_text_uses_embed_callback() -> None:
     router = _build_router(tool_gap=0.02, dialogue_gap=0.02)
 

@@ -288,26 +288,26 @@ def test_required_wake_models_reflect_runtime_constants(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(monkeypatch):
-    async def _fake_router_route(_message: str):
-        return SimpleNamespace(
-            intent="quick-local",
-            confidence=0.99,
-            use_cloud=False,
-            model=main.CHAT_MODEL,
-            planner_status="ok",
-            needs_memory=False,
-            tool=None,
-            reasoning_summary="",
-        )
-
-    async def _fake_stream_local(_request, model_name=None):
-        yield "hello"
-        yield " world"
+    class _FakeGraph:
+        async def astream(self, _state, config=None, stream_mode=None):
+            yield {
+                "meta": {
+                    "model": main.CHAT_MODEL,
+                    "intent": "quick-local",
+                    "confidence": 0.99,
+                    "route_type": "local",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "ok",
+                    "reasoning_summary": "",
+                }
+            }
+            yield {"text": "hello"}
+            yield {"text": " world"}
 
     ingest_sources: list[str] = []
 
-    monkeypatch.setattr(main, "router_route", _fake_router_route)
-    monkeypatch.setattr(main, "stream_local", _fake_stream_local)
+    monkeypatch.setattr(main.app.state, "assistant_graph", _FakeGraph(), raising=False)
     monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
 
     def _fake_ingest(*_args, **kwargs):
@@ -342,23 +342,23 @@ async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(mon
 
 @pytest.mark.asyncio
 async def test_chat_stream_omits_voice_metadata_for_text_source(monkeypatch):
-    async def _fake_router_route(_message: str):
-        return SimpleNamespace(
-            intent="quick-local",
-            confidence=0.99,
-            use_cloud=False,
-            model=main.CHAT_MODEL,
-            planner_status="ok",
-            needs_memory=False,
-            tool=None,
-            reasoning_summary="",
-        )
+    class _FakeGraph:
+        async def astream(self, _state, config=None, stream_mode=None):
+            yield {
+                "meta": {
+                    "model": main.CHAT_MODEL,
+                    "intent": "quick-local",
+                    "confidence": 0.99,
+                    "route_type": "local",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "ok",
+                    "reasoning_summary": "",
+                }
+            }
+            yield {"text": "text only"}
 
-    async def _fake_stream_local(_request, model_name=None):
-        yield "text only"
-
-    monkeypatch.setattr(main, "router_route", _fake_router_route)
-    monkeypatch.setattr(main, "stream_local", _fake_stream_local)
+    monkeypatch.setattr(main.app.state, "assistant_graph", _FakeGraph(), raising=False)
     monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
     monkeypatch.setattr(
         main.memory_store,
@@ -594,6 +594,21 @@ async def test_get_graph_state_denies_foreign_session():
 
     assert response.status_code == 404
     assert _json_body(response)["code"] == "SESSION_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_health_reports_embedding_router_state(monkeypatch):
+    monkeypatch.setattr(main, "ROUTER_EMBEDDING_WARMUP", True)
+    setattr(main.app.state, "embedding_router_ready", False)
+    setattr(main.app.state, "embedding_router_error", "init failed")
+    setattr(main.app.state, "embedding_router_snapshot", None)
+
+    payload = await main.health()
+
+    assert payload["status"] == "degraded"
+    assert payload["embedding_router"]["ready"] is False
+    assert payload["embedding_router"]["error"] == "init failed"
+    assert payload["embedding_router"]["snapshot"] is None
 
 
 @pytest.mark.asyncio
