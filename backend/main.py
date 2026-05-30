@@ -27,6 +27,12 @@ from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
 from router import route as router_route, CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
+from embedding_router import (
+    warmup_embedding_router,
+    embedding_router_ready,
+    get_embedding_router_error,
+    get_embedding_router_snapshot,
+)
 from memory import MemoryStore
 from graph import (
     build_assistant_graph,
@@ -116,6 +122,7 @@ CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
 MEMORY_CONSOLIDATION_MODE = os.getenv("MEMORY_CONSOLIDATION_MODE", "on-session-end").strip().lower()
 MEMORY_CONSOLIDATION_INTERVAL_SECONDS = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL_SECONDS", "86400"))
 MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
+ROUTER_EMBEDDING_WARMUP = os.getenv("ROUTER_EMBEDDING_WARMUP", "true").strip().lower() == "true"
 
 
 def _load_hearth_prompt(filename: str, env_var: str, fallback: str) -> str:
@@ -400,6 +407,25 @@ async def _graph_lifespan(_app: FastAPI):
     ) as checkpointed_graph:
         _assistant_graph = checkpointed_graph
         _app.state.assistant_graph = checkpointed_graph
+
+        _app.state.embedding_router_ready = False
+        _app.state.embedding_router_error = ""
+        _app.state.embedding_router_snapshot = None
+        if ROUTER_EMBEDDING_WARMUP:
+            warmup_ok = await warmup_embedding_router()
+            _app.state.embedding_router_ready = embedding_router_ready()
+            _app.state.embedding_router_error = get_embedding_router_error()
+            _app.state.embedding_router_snapshot = get_embedding_router_snapshot()
+            if warmup_ok:
+                log.info("embedding_router.startup | status=ready")
+            else:
+                log.warning(
+                    "embedding_router.startup | status=degraded error=%s",
+                    _app.state.embedding_router_error or "unknown",
+                )
+        else:
+            log.info("embedding_router.startup | status=skipped")
+
         if MEMORY_CONSOLIDATION_MODE == "interval":
             _consolidation_loop_task = asyncio.create_task(_consolidation_loop())
             log.info(

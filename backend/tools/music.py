@@ -170,10 +170,6 @@ def _beets_columns() -> set[str]:
         conn.close()
 
 
-def _rating_expr() -> str:
-    return "COALESCE(rating, 0.0)" if "rating" in _beets_columns() else "0.0"
-
-
 def _genre_expr() -> str | None:
     """Return the Beets genre-like column expression to query.
 
@@ -208,18 +204,29 @@ def _sync_search(query: str) -> list[dict[str, Any]]:
     """
     pattern = f"%{query}%"
     conn = _open_beets()
-    rating_expr = _rating_expr()
     try:
-        cur = conn.execute(
-            f"""
-            SELECT id, title, artist, album, path, {rating_expr} AS rating
-            FROM items
-            WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
-            ORDER BY rating DESC, title ASC
-            LIMIT ?
-            """,
-            (pattern, pattern, pattern, MUSIC_SEARCH_LIMIT),
-        )
+        if "rating" in _beets_columns():
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                FROM items
+                WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
+                ORDER BY rating DESC, title ASC
+                LIMIT ?
+                """,
+                (pattern, pattern, pattern, MUSIC_SEARCH_LIMIT),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, 0.0 AS rating
+                FROM items
+                WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
+                ORDER BY rating DESC, title ASC
+                LIMIT ?
+                """,
+                (pattern, pattern, pattern, MUSIC_SEARCH_LIMIT),
+            )
         rows = cur.fetchall()
         results = []
         total = len(rows)
@@ -251,17 +258,27 @@ def _sync_get_by_id(song_id: int) -> dict[str, Any] | None:
 def _sync_artist_songs(artist: str) -> list[dict[str, Any]]:
     """Return all songs matching artist LIKE pattern, with rating attached."""
     conn = _open_beets()
-    rating_expr = _rating_expr()
     try:
-        cur = conn.execute(
-            f"""
-            SELECT id, title, artist, album, path, {rating_expr} AS rating
-            FROM items
-            WHERE artist LIKE ?
-            ORDER BY rating DESC, title ASC
-            """,
-            (f"%{artist}%",),
-        )
+        if "rating" in _beets_columns():
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                FROM items
+                WHERE artist LIKE ?
+                ORDER BY rating DESC, title ASC
+                """,
+                (f"%{artist}%",),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, 0.0 AS rating
+                FROM items
+                WHERE artist LIKE ?
+                ORDER BY rating DESC, title ASC
+                """,
+                (f"%{artist}%",),
+            )
         rows = cur.fetchall()
         return [
             {**_row_to_track(row, 0.0), "rating": float(row["rating"] or 0.0)}
@@ -279,18 +296,29 @@ def _sync_search_by_title_artist(title: str, artist: str) -> list[dict[str, Any]
     Raises sqlite3.OperationalError if the DB is temporarily locked.
     """
     conn = _open_beets()
-    rating_expr = _rating_expr()
     try:
-        cur = conn.execute(
-            f"""
-            SELECT id, title, artist, album, path, {rating_expr} AS rating
-            FROM items
-            WHERE title LIKE ? AND artist LIKE ?
-            ORDER BY rating DESC, title ASC
-            LIMIT ?
-            """,
-            (f"%{title}%", f"%{artist}%", MUSIC_SEARCH_LIMIT),
-        )
+        if "rating" in _beets_columns():
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                FROM items
+                WHERE title LIKE ? AND artist LIKE ?
+                ORDER BY rating DESC, title ASC
+                LIMIT ?
+                """,
+                (f"%{title}%", f"%{artist}%", MUSIC_SEARCH_LIMIT),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, 0.0 AS rating
+                FROM items
+                WHERE title LIKE ? AND artist LIKE ?
+                ORDER BY rating DESC, title ASC
+                LIMIT ?
+                """,
+                (f"%{title}%", f"%{artist}%", MUSIC_SEARCH_LIMIT),
+            )
         rows = cur.fetchall()
         total = len(rows)
         return [
@@ -313,17 +341,27 @@ def _sync_search_by_year_range(year_start: int, year_end: int) -> list[dict[str,
         return []
 
     conn = _open_beets()
-    rating_expr = _rating_expr()
     try:
-        cur = conn.execute(
-            f"""
-            SELECT id, title, artist, album, path, {rating_expr} AS rating
-            FROM items
-            WHERE year BETWEEN ? AND ?
-            ORDER BY rating DESC, title ASC
-            """,
-            (year_start, year_end),
-        )
+        if "rating" in _beets_columns():
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                FROM items
+                WHERE year BETWEEN ? AND ?
+                ORDER BY rating DESC, title ASC
+                """,
+                (year_start, year_end),
+            )
+        else:
+            cur = conn.execute(
+                """
+                SELECT id, title, artist, album, path, 0.0 AS rating
+                FROM items
+                WHERE year BETWEEN ? AND ?
+                ORDER BY rating DESC, title ASC
+                """,
+                (year_start, year_end),
+            )
         rows = cur.fetchall()
         return [_row_to_track(row, 0.9) for row in rows]
     finally:
@@ -342,17 +380,50 @@ def _sync_genre_songs(genre: str) -> list[dict[str, Any]]:
         return []
 
     conn = _open_beets()
-    rating_expr = _rating_expr()
     try:
-        cur = conn.execute(
-            f"""
-            SELECT id, title, artist, album, path, {rating_expr} AS rating
-            FROM items
-            WHERE {genre_expr} LIKE ?
-            ORDER BY rating DESC, title ASC
-            """,
-            (f"%{genre}%",),
-        )
+        has_rating = "rating" in _beets_columns()
+        if genre_expr == "genre":
+            if has_rating:
+                cur = conn.execute(
+                    """
+                    SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                    FROM items
+                    WHERE genre LIKE ?
+                    ORDER BY rating DESC, title ASC
+                    """,
+                    (f"%{genre}%",),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT id, title, artist, album, path, 0.0 AS rating
+                    FROM items
+                    WHERE genre LIKE ?
+                    ORDER BY rating DESC, title ASC
+                    """,
+                    (f"%{genre}%",),
+                )
+        else:
+            if has_rating:
+                cur = conn.execute(
+                    """
+                    SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                    FROM items
+                    WHERE genres LIKE ?
+                    ORDER BY rating DESC, title ASC
+                    """,
+                    (f"%{genre}%",),
+                )
+            else:
+                cur = conn.execute(
+                    """
+                    SELECT id, title, artist, album, path, 0.0 AS rating
+                    FROM items
+                    WHERE genres LIKE ?
+                    ORDER BY rating DESC, title ASC
+                    """,
+                    (f"%{genre}%",),
+                )
         rows = cur.fetchall()
         return [
             {**_row_to_track(row, 0.0), "rating": float(row["rating"] or 0.0)}

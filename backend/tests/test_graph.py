@@ -6,6 +6,7 @@ import tempfile
 import types
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 
@@ -34,6 +35,7 @@ os.environ["AUTH_DB_PATH"] = os.path.join(_tmp_dir, "auth.db")
 
 
 import graph as assistant_graph  # noqa: E402
+from embedding_router import ClassifierResult, DualClassifierResult  # noqa: E402
 
 
 TEST_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3:4b")
@@ -490,3 +492,162 @@ async def test_planner_failure_uses_precomputed_heuristic(monkeypatch):
 
     assert result["intent"] == "quick-local"
     assert result["planner_status"] == "fallback"
+
+
+@pytest.mark.asyncio
+async def test_embedding_unambiguous_weather_skips_planner(monkeypatch):
+    planner_calls: list[str] = []
+
+    async def _spy_planner(prompt: str):
+        planner_calls.append(prompt)
+        return {
+            "intent": "quick-local",
+            "route": "local",
+            "tool": None,
+            "needs_memory": False,
+            "confidence": 0.99,
+            "reasoning": "planner should not run",
+        }
+
+    class _FakeEmbedRouter:
+        def classify_embedding(self, _query_embedding):
+            return DualClassifierResult(
+                tool=ClassifierResult(
+                    label="weather",
+                    score=0.92,
+                    second_label="none",
+                    second_score=0.41,
+                    gap=0.51,
+                    ambiguous=False,
+                ),
+                dialogue=ClassifierResult(
+                    label="local",
+                    score=0.74,
+                    second_label="memory-augmented",
+                    second_score=0.30,
+                    gap=0.44,
+                    ambiguous=False,
+                ),
+                should_escalate=False,
+            )
+
+    async def _fake_embed_text(*_args, **_kwargs):
+        return np.asarray([1.0, 0.0], dtype=np.float32)
+
+    monkeypatch.setattr(assistant_graph, "_call_planner", _spy_planner)
+    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
+    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_weather_stream())
+    state = _base_state()
+    state["message"] = "weather in london"
+
+    result = await graph.ainvoke(state)
+
+    assert planner_calls == []
+    assert result["intent"] == "external-data-needed"
+    assert result["tool"] == "weather"
+    assert result["planner_status"] == "embedding"
+
+
+@pytest.mark.asyncio
+async def test_embedding_ambiguous_uses_planner(monkeypatch):
+    planner_calls: list[str] = []
+
+    async def _spy_planner(prompt: str):
+        planner_calls.append(prompt)
+        return {
+            "intent": "quick-local",
+            "route": "local",
+            "tool": None,
+            "needs_memory": False,
+            "confidence": 0.95,
+            "reasoning": "planner handled ambiguity",
+        }
+
+    class _FakeEmbedRouter:
+        def classify_embedding(self, _query_embedding):
+            return DualClassifierResult(
+                tool=ClassifierResult(
+                    label="none",
+                    score=0.52,
+                    second_label="weather",
+                    second_score=0.50,
+                    gap=0.02,
+                    ambiguous=True,
+                ),
+                dialogue=ClassifierResult(
+                    label="local",
+                    score=0.62,
+                    second_label="cloud",
+                    second_score=0.61,
+                    gap=0.01,
+                    ambiguous=True,
+                ),
+                should_escalate=True,
+            )
+
+    async def _fake_embed_text(*_args, **_kwargs):
+        return np.asarray([0.1, 0.9], dtype=np.float32)
+
+    monkeypatch.setattr(assistant_graph, "_call_planner", _spy_planner)
+    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
+    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_local_stream(["ok"]))
+    state = _base_state()
+    state["message"] = "hello"
+
+    result = await graph.ainvoke(state)
+
+    assert planner_calls == ["hello"]
+    assert result["intent"] == "quick-local"
+    assert result["planner_status"] == "embedding_ambiguous_planner"
+
+
+@pytest.mark.asyncio
+async def test_embedding_ambiguous_planner_failure_single_attempt(monkeypatch):
+    planner_calls: list[str] = []
+
+    async def _failing_planner(prompt: str):
+        planner_calls.append(prompt)
+        raise RuntimeError("planner timeout")
+
+    class _FakeEmbedRouter:
+        def classify_embedding(self, _query_embedding):
+            return DualClassifierResult(
+                tool=ClassifierResult(
+                    label="none",
+                    score=0.55,
+                    second_label="weather",
+                    second_score=0.53,
+                    gap=0.02,
+                    ambiguous=True,
+                ),
+                dialogue=ClassifierResult(
+                    label="local",
+                    score=0.59,
+                    second_label="cloud",
+                    second_score=0.58,
+                    gap=0.01,
+                    ambiguous=True,
+                ),
+                should_escalate=True,
+            )
+
+    async def _fake_embed_text(*_args, **_kwargs):
+        return np.asarray([0.2, 0.8], dtype=np.float32)
+
+    monkeypatch.setattr(assistant_graph, "_call_planner", _failing_planner)
+    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
+    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+
+    graph = assistant_graph.build_assistant_graph(_deps_for_local_stream(["ok"]))
+    state = _base_state()
+    state["message"] = "hello"
+
+    result = await graph.ainvoke(state)
+
+    assert planner_calls == ["hello"]
+    assert result["intent"] == "quick-local"
+    assert result["planner_status"] == "embedding_ambiguous_fallback"

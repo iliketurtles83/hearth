@@ -719,33 +719,49 @@ class MemoryStore:
         offset: int = 0,
         consolidated: bool | None = None,
     ) -> dict[str, Any]:
-        where_sql = "WHERE user_id = ?"
-        args: list[Any] = [user_id]
-        if consolidated is not None:
-            where_sql += " AND consolidated = ?"
-            args.append(1 if consolidated else 0)
-
         with self._lock:
             cur = self._conn.cursor()
-            rows = cur.execute(
-                f"""
-                SELECT id, session_id, summary, created_at, consolidated
-                FROM summaries
-                {where_sql}
-                ORDER BY created_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                tuple(args + [limit, offset]),
-            ).fetchall()
+            if consolidated is None:
+                rows = cur.execute(
+                    """
+                    SELECT id, session_id, summary, created_at, consolidated
+                    FROM summaries
+                    WHERE user_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (user_id, limit, offset),
+                ).fetchall()
 
-            total = cur.execute(
-                f"""
-                SELECT COUNT(*) AS total
-                FROM summaries
-                {where_sql}
-                """,
-                tuple(args),
-            ).fetchone()["total"]
+                total = cur.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM summaries
+                    WHERE user_id = ?
+                    """,
+                    (user_id,),
+                ).fetchone()["total"]
+            else:
+                consolidated_flag = 1 if consolidated else 0
+                rows = cur.execute(
+                    """
+                    SELECT id, session_id, summary, created_at, consolidated
+                    FROM summaries
+                    WHERE user_id = ? AND consolidated = ?
+                    ORDER BY created_at DESC
+                    LIMIT ? OFFSET ?
+                    """,
+                    (user_id, consolidated_flag, limit, offset),
+                ).fetchall()
+
+                total = cur.execute(
+                    """
+                    SELECT COUNT(*) AS total
+                    FROM summaries
+                    WHERE user_id = ? AND consolidated = ?
+                    """,
+                    (user_id, consolidated_flag),
+                ).fetchone()["total"]
 
         items = [
             {
