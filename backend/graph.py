@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import json
 import logging
 import os
@@ -13,6 +12,26 @@ from typing import Any, AsyncIterator, Awaitable, Callable, TypedDict
 
 log = logging.getLogger("assistant.graph")
 
+# Keep strong references to fire-and-forget background tasks so they are not
+# garbage-collected before completion, and surface any exceptions they raise.
+_background_tasks: set = set()
+
+
+def _track_background_task(task) -> None:
+    _background_tasks.add(task)
+
+    def _on_done(t) -> None:
+        _background_tasks.discard(t)
+        try:
+            exc = t.exception()
+        except Exception:
+            return
+        if exc is not None:
+            log.warning("Background task failed: %r", exc)
+
+    task.add_done_callback(_on_done)
+
+
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -20,11 +39,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from intents import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, VISION_MODEL, RouteDecision, classify_intent, _is_code_intent
 from embedding_router import (
     EmbeddingRouterSnapshotMismatchError,
-    get_embedding_router,
     ollama_embed_text,
 )
 from routing_config import ROUTING_CONFIG
 from tools.weather import format_weather_response, is_weather_reasoning
+from tools.workspace import make_unified_diff, resolve_workspace_path
 
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
@@ -61,6 +80,7 @@ class AssistantState(TypedDict, total=False):
     cloud_messages: list[dict[str, Any]]
     response_text: str
     response_model: str
+    memory_result: dict[str, Any]
     # Code tool
     active_files: list[str]          # files the coder has read/touched this turn
     code_context: str                 # tree-sitter snippets injected into coder prompt
@@ -86,6 +106,7 @@ class PromptRequest:
 @dataclass
 class AssistantGraphDependencies:
     memory_store: Any
+    embedding_router: Any | None
     router_route: Callable[[str], Awaitable[Any]]
     stream_local: Callable[[PromptRequest, str], AsyncIterator[str]]
     stream_cloud: Callable[[str, list[dict[str, Any]]], AsyncIterator[str]]
@@ -366,25 +387,10 @@ def build_assistant_graph(
 
     def _resolve_workspace_path(relative_path: str) -> str:
         """Resolve a path within the workspace root.  Raises ValueError on traversal."""
-        root = os.path.realpath(_workspace_root)
-        candidate = os.path.realpath(os.path.join(root, relative_path))
-        if not (candidate == root or candidate.startswith(root + os.sep)):
-            raise ValueError(
-                f"Path traversal blocked: {relative_path!r} resolves outside workspace root"
-            )
-        return candidate
+        return resolve_workspace_path(_workspace_root, relative_path)
 
     def _make_unified_diff(relative_path: str, original: str, proposed: str) -> str:
-        lines = list(
-            difflib.unified_diff(
-                original.splitlines(keepends=True),
-                proposed.splitlines(keepends=True),
-                fromfile=f"a/{relative_path}",
-                tofile=f"b/{relative_path}",
-                lineterm="\n",
-            )
-        )
-        return "".join(lines) if lines else ""
+        return make_unified_diff(relative_path, original, proposed)
 
     def _write_summary_for_voice(relative_path: str, diff_text: str) -> str:
         additions = 0
@@ -559,7 +565,7 @@ def build_assistant_graph(
             return fallback
 
         if ROUTER_EMBEDDING_ENABLED:
-            embed_router = get_embedding_router()
+            embed_router = deps.embedding_router
             if embed_router is None:
                 log.info("embedding_route.fallback | reason=router_unavailable")
                 decision = _heuristic_router_decision()
@@ -644,6 +650,32 @@ def build_assistant_graph(
             "needs_memory": decision.needs_memory,
             "route_type": route_type,
         }
+
+    async def history_loader(state: AssistantState) -> dict[str, Any]:
+        session_id = str(state.get("session_id", ""))
+        user_id = str(state.get("user_id", ""))
+        if not session_id or not user_id:
+            return {"history": [], "session_summary": ""}
+
+        turns = await asyncio.to_thread(
+            deps.memory_store.get_session_turns,
+            session_id,
+            user_id,
+            CHAT_MAX_TURNS * 2,
+        )
+        session_summary = await asyncio.to_thread(
+            deps.memory_store.get_latest_session_summary,
+            session_id,
+            user_id,
+        )
+        history = [
+            {
+                "role": str(turn.get("role", "")),
+                "content": str(turn.get("content", "")),
+            }
+            for turn in turns
+        ]
+        return {"history": history, "session_summary": str(session_summary or "")}
 
     async def memory_retrieval(state: AssistantState) -> dict[str, Any]:
         history = list(state.get("history", []))
@@ -1478,6 +1510,76 @@ def build_assistant_graph(
 
         return {"response_text": response_text.strip(), "response_model": response_model}
 
+    async def memory_writer(state: AssistantState) -> dict[str, Any]:
+        writer = get_stream_writer()
+        user_id = str(state.get("user_id", ""))
+        session_id = str(state.get("session_id", ""))
+        message = str(state.get("message", "") or "")
+        response_text = str(state.get("response_text", "") or "").strip()
+
+        if not user_id or not session_id:
+            return {"memory_result": {}}
+
+        # 1) Persist the turn in conversation_log.
+        await asyncio.to_thread(
+            deps.memory_store.log_turn,
+            session_id,
+            user_id,
+            "user",
+            message,
+        )
+        if response_text:
+            await asyncio.to_thread(
+                deps.memory_store.log_turn,
+                session_id,
+                user_id,
+                "assistant",
+                response_text,
+            )
+
+        # 2) Extract explicit/inline memory from the user message.
+        raw_memory_result = await asyncio.to_thread(
+            deps.memory_store.ingest_user_message,
+            user_id,
+            message,
+            str(state.get("source", "text") or "text"),
+        )
+        memory_payload = {
+            "status": raw_memory_result.get("status", "none"),
+            "saved": len(raw_memory_result.get("saved", [])),
+            "blocked": len(raw_memory_result.get("blocked", [])),
+            "needs_confirmation": len(raw_memory_result.get("needs_confirmation", [])),
+            "deleted": int(raw_memory_result.get("deleted", 0) or 0),
+            "explicit": bool(raw_memory_result.get("explicit", False)),
+            "hint": (
+                "Memory needs confirmation. Say 'remember this' to store it."
+                if raw_memory_result.get("status") == "needs-confirmation"
+                else ""
+            ),
+        }
+
+        if memory_payload["status"] != "none" or memory_payload["hint"]:
+            writer({"memory": memory_payload})
+
+        # 3) Threshold-based consolidation trigger.
+        unconsolidated = await asyncio.to_thread(
+            deps.memory_store.count_unconsolidated,
+            user_id,
+        )
+        consolidation_threshold = int(os.getenv("MEMORY_CONSOLIDATION_THRESHOLD", "3"))
+        if unconsolidated >= consolidation_threshold:
+            consolidation_batch = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
+            task = asyncio.create_task(
+                asyncio.to_thread(
+                    deps.memory_store.consolidate_pending,
+                    user_id,
+                    consolidation_batch,
+                )
+            )
+            _track_background_task(task)
+
+        return {"memory_result": memory_payload}
+
     # ── Edge routing helpers ───────────────────────────────────────────────────
 
     def _after_intent_classifier(state: AssistantState) -> str:
@@ -1496,6 +1598,7 @@ def build_assistant_graph(
 
     # ── Wire the graph ─────────────────────────────────────────────────────────
 
+    graph.add_node("history_loader", history_loader)
     graph.add_node("intent_classifier", intent_classifier)
     graph.add_node("memory_retrieval", memory_retrieval)
     graph.add_node("tool_router", tool_router)
@@ -1504,8 +1607,10 @@ def build_assistant_graph(
     graph.add_node("coding_agent_tool", coding_agent_tool)
     graph.add_node("coding_agent_executor", coding_agent_executor)
     graph.add_node("responder", responder)
+    graph.add_node("memory_writer", memory_writer)
 
-    graph.add_edge(START, "intent_classifier")
+    graph.add_edge(START, "history_loader")
+    graph.add_edge("history_loader", "intent_classifier")
     graph.add_conditional_edges("intent_classifier", _after_intent_classifier, {
         "memory_retrieval": "memory_retrieval",
         "write_executor": "write_executor",
@@ -1517,11 +1622,12 @@ def build_assistant_graph(
         "code_tool": "code_tool",
         "responder": "responder",
     })
-    graph.add_edge("code_tool", END)
-    graph.add_edge("write_executor", END)
-    graph.add_edge("coding_agent_tool", END)
-    graph.add_edge("coding_agent_executor", END)
-    graph.add_edge("responder", END)
+    graph.add_edge("code_tool", "memory_writer")
+    graph.add_edge("write_executor", "memory_writer")
+    graph.add_edge("coding_agent_tool", "memory_writer")
+    graph.add_edge("coding_agent_executor", "memory_writer")
+    graph.add_edge("responder", "memory_writer")
+    graph.add_edge("memory_writer", END)
 
     return graph.compile(checkpointer=checkpointer)
 

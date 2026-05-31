@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable
+from typing import Callable
 
 import httpx
 import numpy as np
@@ -411,64 +410,3 @@ async def build_embedding_router(
     )
     return router, snapshot
 
-
-_router_cache: EmbeddingIntentRouter | None = None
-_router_snapshot: EmbeddingRouterSnapshot | None = None
-_router_error: str = ""
-_router_lock = asyncio.Lock()
-
-
-def get_embedding_router() -> EmbeddingIntentRouter | None:
-    return _router_cache
-
-
-def get_embedding_router_snapshot() -> EmbeddingRouterSnapshot | None:
-    return _router_snapshot
-
-
-def get_embedding_router_error() -> str:
-    return _router_error
-
-
-def embedding_router_ready() -> bool:
-    return _router_cache is not None
-
-
-async def warmup_embedding_router(
-    *,
-    force_refresh: bool = False,
-    router_factory: Callable[..., Awaitable[tuple[EmbeddingIntentRouter, EmbeddingRouterSnapshot]]] = build_embedding_router,
-) -> bool:
-    global _router_cache, _router_snapshot, _router_error
-
-    if _router_cache is not None and not force_refresh:
-        return True
-
-    async with _router_lock:
-        if _router_cache is not None and not force_refresh:
-            return True
-
-        started = time.time()
-        try:
-            router, snapshot = await router_factory()
-        except Exception as exc:
-            _router_error = str(exc)
-            if force_refresh:
-                _router_cache = None
-                _router_snapshot = None
-            log.warning("embedding_router.warmup_failed | error=%s", exc)
-            return False
-
-        _router_cache = router
-        _router_snapshot = snapshot
-        _router_error = ""
-        elapsed_ms = int((time.time() - started) * 1000)
-        log.info(
-            "embedding_router.warmup_ready | model=%s dim=%d tool_rows=%d dialogue_rows=%d elapsed_ms=%d",
-            snapshot.model,
-            snapshot.dim,
-            snapshot.tool_rows,
-            snapshot.dialogue_rows,
-            elapsed_ms,
-        )
-        return True

@@ -14,7 +14,6 @@ import importlib.util
 import os
 import json
 import logging
-import re
 import shutil
 import sqlite3
 import subprocess
@@ -26,13 +25,14 @@ from threading import Lock
 from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
+
+# Load .env BEFORE importing local modules — intents, routing_config, memory and
+# other modules read os.getenv() at import time, so the environment must be
+# populated first or those module-level constants capture stale defaults.
+load_dotenv()
+
 from intents import CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
-from embedding_router import (
-    warmup_embedding_router,
-    embedding_router_ready,
-    get_embedding_router_error,
-    get_embedding_router_snapshot,
-)
+from embedding_router import build_embedding_router
 from memory import MemoryStore
 from routing_config import ROUTING_CONFIG
 from graph import (
@@ -98,8 +98,6 @@ memory_store = MemoryStore(
     chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
 )
 
-load_dotenv()
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -117,13 +115,7 @@ OLLAMA_VISION_MODEL: str = (
     os.getenv("OLLAMA_VISION_MODEL")
     or CHAT_MODEL
 )
-CHAT_SUMMARY_TRIGGER_MESSAGES = int(os.getenv("CHAT_SUMMARY_TRIGGER_MESSAGES", "18"))
-CHAT_SUMMARY_KEEP_RECENT_MESSAGES = int(os.getenv("CHAT_SUMMARY_KEEP_RECENT_MESSAGES", "8"))
-CHAT_SUMMARY_MAX_CHARS = int(os.getenv("CHAT_SUMMARY_MAX_CHARS", "1400"))
-MEMORY_CONSOLIDATION_MODE = os.getenv("MEMORY_CONSOLIDATION_MODE", "on-session-end").strip().lower()
-MEMORY_CONSOLIDATION_INTERVAL_SECONDS = int(os.getenv("MEMORY_CONSOLIDATION_INTERVAL_SECONDS", "86400"))
 MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
-ROUTER_EMBEDDING_WARMUP = ROUTING_CONFIG.router_embedding_warmup
 
 
 def _load_hearth_prompt(filename: str, env_var: str, fallback: str) -> str:
@@ -189,11 +181,9 @@ _CORS_CREDENTIALS: bool = _CORS_ORIGINS != ["*"]
 SESSION_COOKIE_SECURE: bool = os.getenv("SESSION_COOKIE_SECURE", "false").lower() == "true"
 AUTH_COOKIE_NAME: str = os.getenv("AUTH_COOKIE_NAME", "auth_token")
 
-_session_store_lock = Lock()
-_session_store: dict[str, dict] = {}
+
 _code_write_lock = Lock()
 _pending_code_writes: dict[str, dict] = {}
-_consolidation_loop_task: asyncio.Task | None = None
 
 # ── Auth service (shared singleton) ───────────────────────────────────────────
 _auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
@@ -324,6 +314,37 @@ _validate_startup()
 # that have no valid token.
 _UNPROTECTED_PATHS = frozenset(["/health", "/", "/transcribe", "/ws/wake"])
 
+# Path prefixes that correspond to JSON API routes and must always be
+# auth-checked, even for browser navigations.  Frontend API calls use fetch()
+# (Sec-Fetch-Mode: cors/same-origin), so they never look like navigations.
+_API_PATH_PREFIXES = (
+    "/chat",
+    "/code",
+    "/graph",
+    "/memory",
+    "/music",
+    "/weather",
+    "/tts",
+    "/auth/me",
+    "/auth/logout",
+)
+
+
+def _is_browser_navigation(request: Request) -> bool:
+    """True for a top-level browser navigation (page load / deep-link refresh).
+
+    Browsers set ``Sec-Fetch-Mode: navigate`` for address-bar navigations,
+    link clicks, and refreshes.  fetch()/XHR calls use ``cors``/``same-origin``
+    instead, so this reliably distinguishes a page request from an API call.
+    Falls back to the Accept header for older clients that omit Sec-Fetch-*.
+    """
+    if request.method != "GET":
+        return False
+    fetch_mode = request.headers.get("sec-fetch-mode")
+    if fetch_mode:
+        return fetch_mode == "navigate"
+    return "text/html" in request.headers.get("accept", "")
+
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -360,6 +381,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
             or path in ("/auth/login", "/auth/register")
             or (ext and ext.lower() in static_exts)
         ):
+            request.state.user_id = None
+            return await call_next(request)
+
+        # Browser navigations (page loads / deep-link refreshes) to non-API
+        # paths must reach the SPA catch-all so it can serve index.html, not a
+        # 401 JSON body.  The SPA bootstraps and authenticates client-side.
+        # API routes stay protected because fetch() requests are not navigations.
+        if _is_browser_navigation(request) and not path.startswith(_API_PATH_PREFIXES):
             request.state.user_id = None
             return await call_next(request)
 
@@ -401,46 +430,27 @@ _assistant_graph = None  # type: ignore[assignment]
 
 @asynccontextmanager
 async def _graph_lifespan(_app: FastAPI):
-    global _assistant_graph, _consolidation_loop_task
+    global _assistant_graph
+    embed_router = None
+    try:
+        embed_router, embed_snapshot = await build_embedding_router()
+        log.info(
+            "embedding_router.ready | model=%s dim=%d",
+            embed_snapshot.model,
+            embed_snapshot.dim,
+        )
+    except Exception as exc:
+        log.warning("embedding_router.failed | error=%s | using heuristic fallback", exc)
+
     async with create_assistant_graph(
-        _make_graph_deps(),
+        _make_graph_deps(embedding_router=embed_router),
         checkpoint_path=default_checkpoint_path(),
     ) as checkpointed_graph:
         _assistant_graph = checkpointed_graph
         _app.state.assistant_graph = checkpointed_graph
-
-        _app.state.embedding_router_ready = False
-        _app.state.embedding_router_error = ""
-        _app.state.embedding_router_snapshot = None
-        if ROUTER_EMBEDDING_WARMUP:
-            log.info("embedding_router.startup | status=warming")
-            warmup_ok = await warmup_embedding_router()
-            _app.state.embedding_router_ready = embedding_router_ready()
-            _app.state.embedding_router_error = get_embedding_router_error()
-            _app.state.embedding_router_snapshot = get_embedding_router_snapshot()
-            if warmup_ok:
-                log.info("embedding_router.startup | status=ready")
-            else:
-                log.warning(
-                    "embedding_router.startup | status=degraded error=%s",
-                    _app.state.embedding_router_error or "unknown",
-                )
-        else:
-            log.info("embedding_router.startup | status=skipped")
-
-        if MEMORY_CONSOLIDATION_MODE == "interval":
-            _consolidation_loop_task = asyncio.create_task(_consolidation_loop())
-            log.info(
-                "memory.consolidation.loop_started | mode=interval interval_seconds=%d",
-                max(60, MEMORY_CONSOLIDATION_INTERVAL_SECONDS),
-            )
+        _app.state.embedding_router = embed_router
         log.info("graph.ready | checkpointer=sqlite path=%s", default_checkpoint_path())
-        try:
-            yield
-        finally:
-            if _consolidation_loop_task:
-                _consolidation_loop_task.cancel()
-                _consolidation_loop_task = None
+        yield
 
 app = FastAPI(lifespan=_graph_lifespan)
 
@@ -585,344 +595,6 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _cleanup_expired_sessions(now: float) -> None:
-    expired = [
-        session_id
-        for session_id, session in _session_store.items()
-        if now - session["updated_at"] > SESSION_IDLE_TTL_SECONDS
-    ]
-    for session_id in expired:
-        del _session_store[session_id]
-    if expired:
-        log.info("chat.session.evicted_expired | count=%d", len(expired))
-
-
-def _evict_oldest_sessions_if_needed() -> None:
-    if len(_session_store) <= SESSION_MAX_ITEMS:
-        return
-    overflow = len(_session_store) - SESSION_MAX_ITEMS
-    oldest_first = sorted(_session_store.items(), key=lambda item: item[1]["updated_at"])
-    for session_id, _ in oldest_first[:overflow]:
-        del _session_store[session_id]
-    log.info("chat.session.evicted_capacity | count=%d", overflow)
-
-
-def _session_owned_by(session: dict | None, user_id: str) -> bool:
-    return bool(session) and str(session.get("user_id") or "") == user_id
-
-
-def _get_or_create_session(user_id: str, session_id: str | None) -> tuple[str, bool]:
-    now = time.time()
-    with _session_store_lock:
-        _cleanup_expired_sessions(now)
-        existing_session = _session_store.get(session_id) if session_id else None
-        effective_id = session_id if session_id and _session_owned_by(existing_session, user_id) else str(uuid4())
-        created = effective_id not in _session_store
-        if created:
-            _session_store[effective_id] = {
-                "user_id": user_id,
-                "messages": [],
-                "summary": "",
-                "summary_message_count": 0,
-                "created_at": now,
-                "updated_at": now,
-            }
-            log.info("chat.session.created | session_id=%s user_id=%s", effective_id, user_id)
-        _evict_oldest_sessions_if_needed()
-        return effective_id, created
-
-
-def _select_history_for_budget(
-    messages: list[dict],
-    system: str,
-    current_user_message: str,
-    summary_text: str,
-) -> tuple[list[dict], int, bool, int]:
-    summary_tokens = _estimate_tokens(summary_text) if summary_text else 0
-    history_budget = max(
-        0,
-        CHAT_TOKEN_BUDGET
-        - _estimate_tokens(system)
-        - _estimate_tokens(current_user_message)
-        - summary_tokens
-        - 32,
-    )
-    selected_reversed: list[dict] = []
-    used_tokens = 0
-    truncated = False
-    max_messages = max(1, CHAT_MAX_TURNS * 2)
-    candidates = messages[-max_messages:]
-
-    for message in reversed(candidates):
-        cost = _estimate_tokens(message["content"]) + 4
-        if used_tokens + cost > history_budget:
-            truncated = True
-            continue
-        selected_reversed.append(message)
-        used_tokens += cost
-
-    selected = list(reversed(selected_reversed))
-    if len(messages) > len(selected):
-        truncated = True
-    return selected, used_tokens, truncated, summary_tokens
-
-
-def _normalize_summary_line(text: str, max_len: int = 200) -> str:
-    compact = re.sub(r"\s+", " ", text or "").strip()
-    if len(compact) <= max_len:
-        return compact
-    return compact[: max_len - 1].rstrip() + "…"
-
-
-def _summarize_messages_chunk(messages: list[dict]) -> str:
-    lines: list[str] = []
-    for message in messages:
-        role = message.get("role")
-        content = _normalize_summary_line(str(message.get("content", "")))
-        if not content:
-            continue
-        if role == "user":
-            lines.append(f"- User: {content}")
-        elif role == "assistant":
-            lines.append(f"- Assistant: {content}")
-        if len(lines) >= 14:
-            break
-    return "\n".join(lines)
-
-
-def _truncate_summary(summary: str) -> str:
-    if len(summary) <= CHAT_SUMMARY_MAX_CHARS:
-        return summary
-    tail = summary[-CHAT_SUMMARY_MAX_CHARS :]
-    first_newline = tail.find("\n")
-    if first_newline > 0:
-        return tail[first_newline + 1 :]
-    return tail
-
-
-def _build_episodic_record_text(session: dict) -> str:
-    session_summary = str(session.get("summary", "") or "").strip()
-    messages = list(session.get("messages", []))
-    recent = _summarize_messages_chunk(messages[-14:]) if messages else ""
-
-    if session_summary and recent:
-        merged = f"{session_summary}\n{recent}".strip()
-    else:
-        merged = session_summary or recent
-    return _truncate_summary(merged.strip())
-
-
-async def _persist_session_episodic_snapshot(session_id: str, session_snapshot: dict, reason: str) -> None:
-    user_id = str(session_snapshot.get("user_id") or "")
-    if not user_id:
-        return
-
-    summary_text = _build_episodic_record_text(session_snapshot)
-    if not summary_text:
-        return
-
-    try:
-        row_id = await asyncio.to_thread(memory_store.save_summary, user_id, session_id, summary_text)
-        log.info(
-            "memory.episodic.saved | session_id=%s user_id=%s row_id=%s reason=%s",
-            session_id,
-            user_id,
-            row_id,
-            reason,
-        )
-    except Exception as exc:
-        log.error(
-            "memory.episodic.save_failed | session_id=%s user_id=%s reason=%s error=%s",
-            session_id,
-            user_id,
-            reason,
-            exc,
-        )
-        return
-
-    if MEMORY_CONSOLIDATION_MODE != "on-session-end":
-        return
-
-    try:
-        stats = await asyncio.to_thread(
-            memory_store.consolidate_pending,
-            user_id,
-            MEMORY_CONSOLIDATION_BATCH_SIZE,
-        )
-        log.info(
-            "memory.consolidation.on_session_end | user_id=%s processed=%d promoted=%d blocked=%d",
-            user_id,
-            int(stats.get("processed", 0)),
-            int(stats.get("promoted", 0)),
-            int(stats.get("blocked", 0)),
-        )
-    except Exception as exc:
-        log.error("memory.consolidation.failed | user_id=%s error=%s", user_id, exc)
-
-
-def _spawn_episodic_persist_task(session_id: str, session_snapshot: dict, reason: str) -> None:
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return
-    loop.create_task(_persist_session_episodic_snapshot(session_id, session_snapshot, reason))
-
-
-async def _consolidation_loop() -> None:
-    interval = max(60, MEMORY_CONSOLIDATION_INTERVAL_SECONDS)
-    while True:
-        await asyncio.sleep(interval)
-        try:
-            stats = await asyncio.to_thread(memory_store.consolidate_pending, None, MEMORY_CONSOLIDATION_BATCH_SIZE)
-            log.info(
-                "memory.consolidation.interval | processed=%d promoted=%d blocked=%d",
-                int(stats.get("processed", 0)),
-                int(stats.get("promoted", 0)),
-                int(stats.get("blocked", 0)),
-            )
-        except Exception as exc:
-            log.error("memory.consolidation.interval_failed | error=%s", exc)
-
-
-def _update_session_summary_if_needed(session_id: str) -> tuple[bool, int, int]:
-    now = time.time()
-    with _session_store_lock:
-        session = _session_store.get(session_id)
-        if not session:
-            return False, 0, 0
-
-        messages = list(session.get("messages", []))
-        keep_recent = max(2, CHAT_SUMMARY_KEEP_RECENT_MESSAGES)
-        trigger = max(keep_recent + 2, CHAT_SUMMARY_TRIGGER_MESSAGES)
-        if len(messages) <= trigger:
-            return False, int(session.get("summary_message_count", 0) or 0), len(session.get("summary", ""))
-
-        older = messages[:-keep_recent]
-        if not older:
-            return False, int(session.get("summary_message_count", 0) or 0), len(session.get("summary", ""))
-
-        already_summarized = int(session.get("summary_message_count", 0) or 0)
-        if already_summarized >= len(older):
-            return False, already_summarized, len(session.get("summary", ""))
-
-        new_slice = older[already_summarized:]
-        chunk_summary = _summarize_messages_chunk(new_slice)
-        if not chunk_summary:
-            return False, already_summarized, len(session.get("summary", ""))
-
-        existing_summary = str(session.get("summary", "") or "")
-        combined = (
-            f"{existing_summary}\n{chunk_summary}".strip()
-            if existing_summary
-            else chunk_summary
-        )
-        combined = _truncate_summary(combined)
-
-        session["summary"] = combined
-        session["summary_message_count"] = len(older)
-        session["updated_at"] = now
-        _session_store[session_id] = session
-        return True, len(older), len(combined)
-
-
-def _build_local_prompt(history: list[dict], current_user_message: str) -> str:
-    if not history:
-        return current_user_message
-
-    role_map = {"user": "User", "assistant": "Assistant"}
-    lines = ["Conversation so far:"]
-    for message in history:
-        role = role_map.get(message.get("role", ""), "User")
-        lines.append(f"{role}: {message['content']}")
-    lines.append("")
-    lines.append(f"User: {current_user_message}")
-    lines.append("Assistant:")
-    return "\n".join(lines)
-
-
-def _augment_system_with_session_summary(system: str, summary_text: str) -> str:
-    if not summary_text:
-        return system
-    return "\n".join(
-        [
-            system,
-            "",
-            "Session summary of older messages (use as context for continuity):",
-            summary_text,
-        ]
-    )
-
-
-def _augment_system_with_memories(system: str, memory_hits: list[dict]) -> str:
-    if not memory_hits:
-        return system
-
-    lines = [
-        system,
-        "",
-        "Relevant user memory (apply only if directly helpful to this request):",
-        "If a memory item is not clearly relevant, ignore it.",
-    ]
-    for hit in memory_hits[:5]:
-        lines.append(f"- {hit['text']}")
-    return "\n".join(lines)
-
-
-def _should_inject_memory(decision_intent: str, memory_hits: list[dict], user_message: str) -> bool:
-    if not memory_hits:
-        return False
-    if decision_intent == "memory-needed":
-        return True
-
-    # For non-memory intents, only inject when there is strong lexical overlap.
-    terms = [t for t in re.findall(r"[a-z0-9]+", user_message.lower()) if len(t) > 2][:10]
-    if not terms:
-        return False
-
-    top_text = " ".join(str(h.get("text", "")).lower() for h in memory_hits[:3])
-    overlap = sum(1 for t in terms if t in top_text)
-    return overlap >= 2
-
-
-def _session_preview_text(messages: list[dict]) -> str:
-    for msg in messages:
-        if msg.get("role") == "user":
-            return msg.get("content", "")[:80]
-    return ""
-
-
-def _list_sessions(user_id: str) -> list[dict]:
-    with _session_store_lock:
-        ordered = sorted(
-            (
-                (sid, data)
-                for sid, data in _session_store.items()
-                if _session_owned_by(data, user_id)
-            ),
-            key=lambda item: item[1]["updated_at"],
-            reverse=True,
-        )
-        return [
-            {
-                "session_id": sid,
-                "created_at": data["created_at"],
-                "updated_at": data["updated_at"],
-                "message_count": len(data.get("messages", [])),
-                "preview": _session_preview_text(data.get("messages", [])),
-            }
-            for sid, data in ordered
-        ]
-
-
-def _append_session_message(session_id: str, role: str, content: str) -> None:
-    now = time.time()
-    with _session_store_lock:
-        session = _session_store.get(session_id)
-        if not session:
-            return
-        session["messages"].append({"role": role, "content": content, "ts": now})
-        session["updated_at"] = now
-
 async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/generate", json={
@@ -931,6 +603,7 @@ async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
             "system": request.system,
             "stream": True,
         }) as resp:
+            resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line:
                     data = json.loads(line)
@@ -1004,7 +677,7 @@ async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[overr
 # ── LangGraph dependency wiring ───────────────────────────────────────────────
 # Late-binding stream/tool proxies keep graph dependencies patchable in tests.
 
-def _make_graph_deps() -> AssistantGraphDependencies:
+def _make_graph_deps(*, embedding_router=None) -> AssistantGraphDependencies:
     async def _unused_router_route(_msg: str):
         return None
 
@@ -1025,6 +698,7 @@ def _make_graph_deps() -> AssistantGraphDependencies:
 
     return AssistantGraphDependencies(
         memory_store=memory_store,
+        embedding_router=embedding_router,
         router_route=_unused_router_route,
         stream_local=_late_stream_local,
         stream_cloud=_late_stream_cloud,
@@ -1046,7 +720,8 @@ log.info("graph.ready | checkpointer=none (no-checkpoint mode; Slice 5 adds Asyn
 async def chat(request: ChatRequest, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
+    session_id = cookie_session_id or str(uuid4())
+    session_created = cookie_session_id is None
     chat_source = _normalize_chat_source(request.source)
     effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
 
@@ -1072,9 +747,19 @@ async def chat(request: ChatRequest, http_request: Request):
                 session_id, music_cmd.get("action"), tool_result.ok, tool_result.retryable,
             )
             response_text = format_music_response(tool_result, music_cmd)
+            # Persist the turn so music interactions appear in session history and
+            # provide follow-up context (mirrors graph.memory_writer logging).
+            if user_id:
+                try:
+                    await asyncio.to_thread(
+                        memory_store.log_turn, session_id, user_id, "user", request.message
+                    )
+                    await asyncio.to_thread(
+                        memory_store.log_turn, session_id, user_id, "assistant", response_text
+                    )
+                except Exception as exc:
+                    log.warning("chat.music_fast.log_turn | session_id=%s error=%s", session_id, exc)
             yield f"data: {json.dumps({'text': response_text})}\n\n"
-            _append_session_message(session_id, "user", request.message)
-            _append_session_message(session_id, "assistant", response_text)
             yield "data: [DONE]\n\n"
 
         fast_response = StreamingResponse(generate_music(), media_type="text/event-stream")
@@ -1082,23 +767,11 @@ async def chat(request: ChatRequest, http_request: Request):
         return fast_response
     # ── End music fast-path ───────────────────────────────────────────────────
 
-    summary_updated, summary_message_count, summary_char_count = _update_session_summary_if_needed(session_id)
-
     # Validate image payload if present
     image_error = _validate_image(request.image_base64, request.image_mime)
     if image_error:
         log.warning("chat.image_invalid | session_id=%s reason=%s", session_id, image_error)
         return JSONResponse({"error": image_error, "code": "INVALID_IMAGE"}, status_code=422)
-
-    with _session_store_lock:
-        session = _session_store[session_id]
-        session_messages = list(session["messages"])
-        session_summary = str(session.get("summary", "") or "")
-
-    previous_user_message = next(
-        (m.get("content", "") for m in reversed(session_messages) if m.get("role") == "user"),
-        None,
-    )
 
     graph_state = {
         "user_id": user_id,
@@ -1107,8 +780,6 @@ async def chat(request: ChatRequest, http_request: Request):
         "system": effective_system,
         "source": chat_source,
         "modality": "voice" if chat_source == "voice" else "chat",
-        "history": session_messages,
-        "session_summary": session_summary,
         # Pass image through state (ephemeral, not persisted to memory)
         "image_base64": request.image_base64,
         "image_mime": request.image_mime,
@@ -1139,12 +810,10 @@ async def chat(request: ChatRequest, http_request: Request):
                     route_for_log = meta.get("route_type", "local")
                     log.info(
                         "chat.route | session_id=%s source=%s intent=%s confidence=%.3f route=%s model=%s "
-                        "planner_status=%s needs_memory=%s tool=%s total_messages=%d "
-                        "summary_updated=%s summary_message_count=%d summary_chars=%d",
+                        "planner_status=%s needs_memory=%s tool=%s",
                         session_id, chat_source, intent_for_log, confidence_for_log, route_for_log,
                         active_model, meta.get("planner_status", ""), meta.get("needs_memory", False),
-                        meta.get("tool"), len(session_messages), summary_updated,
-                        summary_message_count, summary_char_count,
+                        meta.get("tool"),
                     )
                     if meta.get("reasoning_summary"):
                         log.debug("chat.planner_reasoning | session_id=%s reasoning=%s", session_id, meta["reasoning_summary"])
@@ -1158,6 +827,8 @@ async def chat(request: ChatRequest, http_request: Request):
                 elif "notice" in event:
                     fallback_used = True
                     yield f"data: {json.dumps({'notice': event['notice']})}\n\n"
+                elif "memory" in event:
+                    yield f"data: {json.dumps({'memory': event['memory']})}\n\n"
                 elif event.get("fallback"):
                     active_model = event.get("model", CHAT_MODEL)
                     yield f"data: {json.dumps(event)}\n\n"
@@ -1174,46 +845,6 @@ async def chat(request: ChatRequest, http_request: Request):
             session_id, intent_for_log, confidence_for_log, route_for_log,
             active_model, fallback_used, first_token_ms, completion_ms,
             _estimate_tokens(assistant_accumulated),
-        )
-
-        _append_session_message(session_id, "user", request.message)
-        _append_session_message(session_id, "assistant", assistant_accumulated.strip())
-
-        memory_result = memory_store.ingest_user_message(
-            user_id,
-            request.message,
-            source=chat_source,
-            previous_user_message=previous_user_message,
-        )
-        log.info(
-            "chat.memory | session_id=%s status=%s saved=%d blocked=%d needs_confirmation=%d candidates=%d explicit=%s",
-            session_id,
-            memory_result.get("status", "none"),
-            len(memory_result.get("saved", [])),
-            len(memory_result.get("blocked", [])),
-            len(memory_result.get("needs_confirmation", [])),
-            int(memory_result.get("candidates", 0)),
-            bool(memory_result.get("explicit", False)),
-        )
-
-        yield (
-            "data: "
-            + json.dumps({
-                "memory": {
-                    "status": memory_result.get("status", "none"),
-                    "saved": len(memory_result.get("saved", [])),
-                    "blocked": len(memory_result.get("blocked", [])),
-                    "needs_confirmation": len(memory_result.get("needs_confirmation", [])),
-                    "deleted": int(memory_result.get("deleted", 0) or 0),
-                    "explicit": bool(memory_result.get("explicit", False)),
-                    "hint": (
-                        "Memory needs confirmation. Say 'remember this' to store it."
-                        if memory_result.get("status") == "needs-confirmation"
-                        else ""
-                    ),
-                }
-            })
-            + "\n\n"
         )
 
         voice_meta = _voice_tts_metadata(chat_source)
@@ -1234,11 +865,6 @@ async def chat(request: ChatRequest, http_request: Request):
 
 @app.get("/graph/state/{session_id}")
 async def get_graph_state(session_id: str, http_request: Request):
-    user_id: str = http_request.state.user_id
-    with _session_store_lock:
-        if not _session_owned_by(_session_store.get(session_id), user_id):
-            return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
-
     graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
     if graph_runner is None:
         return _error_response("Graph not initialized", "GRAPH_UNAVAILABLE", True, status_code=503)
@@ -1262,120 +888,49 @@ async def get_graph_state(session_id: str, http_request: Request):
     )
 
 
-@app.delete("/chat/session")
-async def reset_chat_session(http_request: Request):
-    user_id: str = http_request.state.user_id
-    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id, created = _get_or_create_session(user_id, cookie_session_id)
-    snapshot: dict | None = None
-    with _session_store_lock:
-        session = _session_store.get(session_id, {"messages": [], "summary": "", "summary_message_count": 0})
-        cleared_messages = len(session["messages"])
-        if cleared_messages > 0 or str(session.get("summary", "") or "").strip():
-            snapshot = dict(session)
-            snapshot["messages"] = list(session.get("messages", []))
-        session["messages"] = []
-        session["summary"] = ""
-        session["summary_message_count"] = 0
-        session["updated_at"] = time.time()
-        _session_store[session_id] = session
-
-    if snapshot is not None:
-        _spawn_episodic_persist_task(session_id, snapshot, "session_reset")
-
-    log.info(
-        "chat.session.reset | session_id=%s cleared_messages=%d was_new=%s",
-        session_id,
-        cleared_messages,
-        created,
-    )
-    response = JSONResponse({"ok": True, "session_id": session_id, "cleared_messages": cleared_messages})
-    _set_session_cookie(response, session_id)
-    return response
+async def _clear_checkpoint_thread(session_id: str) -> None:
+    graph_runner = getattr(app.state, "assistant_graph", None)
+    if graph_runner is None:
+        return
+    checkpointer = getattr(graph_runner, "checkpointer", None)
+    if checkpointer is None:
+        return
+    try:
+        if hasattr(checkpointer, "adelete_thread"):
+            await checkpointer.adelete_thread(session_id)
+        elif hasattr(checkpointer, "delete_thread"):
+            await asyncio.to_thread(checkpointer.delete_thread, session_id)
+    except Exception as exc:
+        log.warning("checkpoint_cleanup_failed | session_id=%s | %s", session_id, exc)
 
 
 @app.get("/chat/sessions")
 async def list_chat_sessions(http_request: Request):
     user_id: str = http_request.state.user_id
-    current_session = http_request.cookies.get(SESSION_COOKIE_NAME)
-    with _session_store_lock:
-        current_owned = _session_owned_by(_session_store.get(current_session), user_id) if current_session else False
+    current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    sessions = memory_store.list_sessions(user_id)
     return JSONResponse(
         {
-            "sessions": _list_sessions(user_id),
-            "current_session_id": current_session if current_owned else None,
+            "sessions": sessions,
+            "current_session_id": current_session_id,
         }
     )
 
 
-@app.delete("/chat/sessions/{session_id}")
-async def delete_chat_session(session_id: str, http_request: Request):
+@app.get("/chat/session/messages")
+async def get_chat_session_messages(http_request: Request):
     user_id: str = http_request.state.user_id
-    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    active_session_id: str | None = None
-    snapshot: dict | None = None
-
-    with _session_store_lock:
-        session = _session_store.get(session_id)
-        if not _session_owned_by(session, user_id):
-            return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
-        if session and (len(session.get("messages", [])) > 0 or str(session.get("summary", "") or "").strip()):
-            snapshot = dict(session)
-            snapshot["messages"] = list(session.get("messages", []))
-        del _session_store[session_id]
-
-        # If the deleted session was active, prefer an existing remaining session.
-        if cookie_session_id == session_id:
-            owned_sessions = [
-                (sid, data)
-                for sid, data in _session_store.items()
-                if _session_owned_by(data, user_id)
-            ]
-            if owned_sessions:
-                active_session_id = max(
-                    owned_sessions,
-                    key=lambda item: item[1]["updated_at"],
-                )[0]
-
-    if snapshot is not None:
-        _spawn_episodic_persist_task(session_id, snapshot, "session_delete")
-
-    log.info("chat.session.deleted | session_id=%s user_id=%s", session_id, user_id)
-
-    # If the deleted session was active and nothing remains, create a fresh session.
-    if cookie_session_id == session_id and active_session_id is None:
-        active_session_id, _ = _get_or_create_session(user_id, None)
-
-    payload = {"ok": True, "session_id": session_id}
-    if active_session_id:
-        payload["active_session_id"] = active_session_id
-    response = JSONResponse(payload)
-
-    if active_session_id:
-        _set_session_cookie(response, active_session_id)
+    session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
+    turns = memory_store.get_session_turns(session_id, user_id, limit=500)
+    response = JSONResponse({"session_id": session_id, "messages": turns})
+    _set_session_cookie(response, session_id)
     return response
 
 
 @app.post("/chat/session/new")
 async def create_chat_session(http_request: Request):
-    user_id: str = http_request.state.user_id
-    previous_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    previous_snapshot: dict | None = None
-
-    if previous_session_id:
-        with _session_store_lock:
-            prev = _session_store.get(previous_session_id)
-            if _session_owned_by(prev, user_id) and prev and (
-                len(prev.get("messages", [])) > 0 or str(prev.get("summary", "") or "").strip()
-            ):
-                previous_snapshot = dict(prev)
-                previous_snapshot["messages"] = list(prev.get("messages", []))
-
-    session_id, _ = _get_or_create_session(user_id, None)
-
-    if previous_snapshot is not None and previous_session_id and previous_session_id != session_id:
-        _spawn_episodic_persist_task(previous_session_id, previous_snapshot, "session_new")
-
+    _ = http_request
+    session_id = str(uuid4())
     response = JSONResponse({"ok": True, "session_id": session_id})
     _set_session_cookie(response, session_id)
     return response
@@ -1384,72 +939,56 @@ async def create_chat_session(http_request: Request):
 @app.post("/chat/session/select")
 async def select_chat_session(payload: SessionSelectRequest, http_request: Request):
     user_id: str = http_request.state.user_id
-    current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    previous_snapshot: dict | None = None
-
-    with _session_store_lock:
-        if not _session_owned_by(_session_store.get(payload.session_id), user_id):
-            return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
-
-        prev = _session_store.get(current_session_id) if current_session_id else None
-        if (
-            current_session_id
-            and current_session_id != payload.session_id
-            and _session_owned_by(prev, user_id)
-            and prev
-            and (len(prev.get("messages", [])) > 0 or str(prev.get("summary", "") or "").strip())
-        ):
-            previous_snapshot = dict(prev)
-            previous_snapshot["messages"] = list(prev.get("messages", []))
-
-    if previous_snapshot is not None and current_session_id:
-        _spawn_episodic_persist_task(current_session_id, previous_snapshot, "session_switch")
+    sessions = memory_store.list_sessions(user_id)
+    if not any(s.get("session_id") == payload.session_id for s in sessions):
+        return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
 
     response = JSONResponse({"ok": True, "session_id": payload.session_id})
     _set_session_cookie(response, payload.session_id)
     return response
 
 
-@app.get("/chat/session/messages")
-async def get_chat_session_messages(http_request: Request):
+@app.delete("/chat/sessions/{session_id}")
+async def delete_chat_session(session_id: str, http_request: Request):
     user_id: str = http_request.state.user_id
-    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id, _ = _get_or_create_session(user_id, cookie_session_id)
-    with _session_store_lock:
-        messages = list(_session_store.get(session_id, {}).get("messages", []))
-    # Set the session cookie so the browser anchors to this session after every
-    # page load. Without this, POST /chat could pick up a stale/missing cookie
-    # and silently create a new session, losing context on refresh.
-    response = JSONResponse({"session_id": session_id, "messages": messages})
+    current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+
+    memory_store.delete_session(session_id, user_id)
+    await _clear_checkpoint_thread(session_id)
+
+    next_session_id: str | None = None
+    if current_session_id == session_id:
+        sessions = memory_store.list_sessions(user_id)
+        next_session_id = sessions[0]["session_id"] if sessions else str(uuid4())
+
+    payload: dict[str, object] = {"ok": True, "session_id": session_id}
+    if next_session_id:
+        payload["active_session_id"] = next_session_id
+
+    response = JSONResponse(payload)
+    if next_session_id:
+        _set_session_cookie(response, next_session_id)
+    return response
+
+
+@app.delete("/chat/session")
+async def reset_chat_session(http_request: Request):
+    user_id: str = http_request.state.user_id
+    session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
+    memory_store.reset_session(session_id, user_id)
+    await _clear_checkpoint_thread(session_id)
+    response = JSONResponse({"ok": True, "session_id": session_id})
     _set_session_cookie(response, session_id)
     return response
 
 
 @app.get("/health")
 async def health():
-    embed_ready = bool(getattr(app.state, "embedding_router_ready", False))
-    embed_error = str(getattr(app.state, "embedding_router_error", "") or "")
-    snapshot = getattr(app.state, "embedding_router_snapshot", None)
-    status = "ok"
-    if ROUTER_EMBEDDING_WARMUP and not embed_ready:
-        status = "degraded"
+    graph_ready = getattr(app.state, "assistant_graph", None) is not None
+    embed_router = getattr(app.state, "embedding_router", None)
     return {
-        "status": status,
-        "embedding_router": {
-            "ready": embed_ready,
-            "error": embed_error,
-            "snapshot": (
-                {
-                    "model": snapshot.model,
-                    "dim": snapshot.dim,
-                    "tool_rows": snapshot.tool_rows,
-                    "dialogue_rows": snapshot.dialogue_rows,
-                    "created_at_unix": snapshot.created_at_unix,
-                }
-                if snapshot is not None
-                else None
-            ),
-        },
+        "status": "ok" if graph_ready else "starting",
+        "embedding_router": embed_router is not None,
     }
 
 
@@ -1508,11 +1047,22 @@ async def wake_websocket(ws: WebSocket):
 
 
 # ── Transcription endpoint ─────────────────────────────────────────────────────
+_MAX_TRANSCRIBE_BYTES = int(os.getenv("MAX_TRANSCRIBE_BYTES", str(25 * 1024 * 1024)))  # 25 MB
+
+
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
+    # /transcribe is unauthenticated (voice wake flow), so cap the upload size to
+    # avoid an unbounded-read / compute-DoS surface before touching Whisper.
+    raw = await audio.read(_MAX_TRANSCRIBE_BYTES + 1)
+    if len(raw) > _MAX_TRANSCRIBE_BYTES:
+        return JSONResponse(
+            {"error": f"Audio too large. Maximum is {_MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB."},
+            status_code=413,
+        )
     whisper = get_whisper_model()
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(await audio.read())
+        tmp.write(raw)
         tmp_path = tmp.name
     try:
         segments, _ = whisper.transcribe(tmp_path, language="en", vad_filter=True)
@@ -1526,14 +1076,10 @@ async def transcribe(audio: UploadFile = File(...)):
 async def code(request: CodeRequest, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id, session_created = _get_or_create_session(user_id, cookie_session_id)
+    session_id = cookie_session_id or str(uuid4())
+    session_created = cookie_session_id is None
     code_source = _normalize_chat_source(request.source)
     effective_system = request.system or CODE_DEFAULT_SYSTEM_PROMPT
-
-    with _session_store_lock:
-        session = _session_store[session_id]
-        session_messages = list(session["messages"])
-        session_summary = str(session.get("summary", "") or "")
 
     graph_state = {
         "user_id": user_id,
@@ -1541,8 +1087,6 @@ async def code(request: CodeRequest, http_request: Request):
         "message": request.message,
         "system": effective_system,
         "source": code_source,
-        "history": session_messages,
-        "session_summary": session_summary,
         "force_code": True,
     }
 
@@ -1571,9 +1115,6 @@ async def code(request: CodeRequest, http_request: Request):
         except Exception as exc:
             log.error("code.graph_error | session_id=%s error=%s", session_id, exc)
             yield f"data: {json.dumps({'text': f'⚠ Error: {exc}'})}\n\n"
-
-        _append_session_message(session_id, "user", request.message)
-        _append_session_message(session_id, "assistant", assistant_accumulated.strip())
 
         voice_meta = _voice_tts_metadata(code_source)
         if voice_meta is not None:

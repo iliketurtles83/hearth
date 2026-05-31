@@ -1,3 +1,12 @@
+"""Memory storage and retrieval.
+
+Storage contract:
+- SQLite is the canonical store for structured memory state (facts, preferences,
+    summaries, and consolidation state).
+- Chroma is a retrieval index for semantic recall and is populated from canonical
+    memory content; it is not the source of truth for persisted user memory.
+"""
+
 import os
 import re
 import sqlite3
@@ -96,57 +105,10 @@ class MemoryStore:
 
         self._embedder = HashEmbeddingFunction()
         self._chroma = chromadb.PersistentClient(path=self.chroma_path)
-        self._migrate_collection_name()
         self._collection = self._chroma.get_or_create_collection(
             name="conversation_memory",
             embedding_function=self._embedder,
         )
-
-    def _migrate_collection_name(self) -> None:
-        """One-time migration: copy assistant_memories → conversation_memory then delete the old collection.
-
-        Safe to call on every startup — becomes a no-op once migration is done.
-        """
-        import logging as _logging
-        _log = _logging.getLogger("assistant.memory")
-        try:
-            existing_names = [c.name for c in self._chroma.list_collections()]
-        except Exception:
-            return
-
-        has_old = "assistant_memories" in existing_names
-        has_new = "conversation_memory" in existing_names
-
-        if not has_old:
-            return  # nothing to migrate
-
-        if has_old and has_new:
-            _log.warning(
-                "memory: both 'assistant_memories' and 'conversation_memory' exist — "
-                "using 'conversation_memory' as authoritative; 'assistant_memories' left intact"
-            )
-            return
-
-        # Copy all documents from old collection into new collection.
-        old_col = self._chroma.get_collection(name="assistant_memories", embedding_function=self._embedder)
-        new_col = self._chroma.get_or_create_collection(name="conversation_memory", embedding_function=self._embedder)
-
-        try:
-            result = old_col.get(include=["documents", "metadatas"])
-            ids = result.get("ids") or []
-            if ids:
-                new_col.upsert(
-                    ids=ids,
-                    documents=result.get("documents") or [],
-                    metadatas=result.get("metadatas") or [],
-                )
-            self._chroma.delete_collection("assistant_memories")
-            _log.info(
-                "memory: migrated %d documents from 'assistant_memories' to 'conversation_memory'",
-                len(ids),
-            )
-        except Exception as exc:
-            _log.error("memory: migration failed (%s) — leaving both collections intact", exc)
 
     _SENSITIVE_SECRET_PATTERNS = [
         r"\b(api[_-]?key|token|password|secret|passwd|bearer)\b",
@@ -198,6 +160,15 @@ class MemoryStore:
                     consolidated INTEGER NOT NULL DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS conversation_log (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id  TEXT NOT NULL,
+                    user_id     TEXT NOT NULL,
+                    role        TEXT NOT NULL,
+                    content     TEXT NOT NULL,
+                    ts          REAL NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_facts_user_id
                     ON facts(user_id);
                 CREATE INDEX IF NOT EXISTS idx_preferences_user_id
@@ -208,6 +179,10 @@ class MemoryStore:
                     ON summaries(user_id);
                 CREATE INDEX IF NOT EXISTS idx_summaries_session_id
                     ON summaries(session_id);
+                CREATE INDEX IF NOT EXISTS idx_convlog_session_user_ts
+                    ON conversation_log(session_id, user_id, ts);
+                CREATE INDEX IF NOT EXISTS idx_convlog_user_ts
+                    ON conversation_log(user_id, ts DESC);
                 """
             )
             # Live-instance migration: add 'consolidated' column if it doesn't exist yet.
@@ -218,6 +193,138 @@ class MemoryStore:
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+    def log_turn(self, session_id: str, user_id: str, role: str, content: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO conversation_log (session_id, user_id, role, content, ts)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (session_id, user_id, role, content, now),
+            )
+            self._conn.commit()
+
+    def get_session_turns(self, session_id: str, user_id: str, limit: int = 500) -> list[dict[str, Any]]:
+        safe_limit = max(1, int(limit))
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT role, content, ts
+                FROM conversation_log
+                WHERE session_id = ? AND user_id = ?
+                ORDER BY ts ASC
+                LIMIT ?
+                """,
+                (session_id, user_id, safe_limit),
+            ).fetchall()
+        return [
+            {
+                "role": str(r["role"]),
+                "content": str(r["content"]),
+                "ts": float(r["ts"]),
+            }
+            for r in rows
+        ]
+
+    def list_sessions(self, user_id: str) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT
+                    c1.session_id AS session_id,
+                    MIN(c1.ts) AS created_at,
+                    MAX(c1.ts) AS updated_at,
+                    COUNT(*) AS message_count,
+                    (
+                        SELECT c2.content
+                        FROM conversation_log c2
+                        WHERE c2.session_id = c1.session_id
+                          AND c2.user_id = ?
+                          AND c2.role = 'user'
+                        ORDER BY c2.ts ASC
+                        LIMIT 1
+                    ) AS preview
+                FROM conversation_log c1
+                WHERE c1.user_id = ?
+                GROUP BY c1.session_id
+                ORDER BY updated_at DESC
+                """,
+                (user_id, user_id),
+            ).fetchall()
+        return [
+            {
+                "session_id": str(r["session_id"]),
+                "created_at": float(r["created_at"]),
+                "updated_at": float(r["updated_at"]),
+                "message_count": int(r["message_count"]),
+                "preview": str(r["preview"] or "")[:120],
+            }
+            for r in rows
+        ]
+
+    def delete_session(self, session_id: str, user_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            self._conn.execute(
+                "DELETE FROM summaries WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            self._conn.commit()
+
+    def reset_session(self, session_id: str, user_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            self._conn.execute(
+                "DELETE FROM summaries WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            self._conn.commit()
+
+    def get_latest_session_summary(self, session_id: str, user_id: str) -> str:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT summary
+                FROM summaries
+                WHERE session_id = ? AND user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id, user_id),
+            ).fetchone()
+        return str(row["summary"]) if row and row["summary"] is not None else ""
+
+    def count_unconsolidated(self, user_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM summaries
+                WHERE user_id = ? AND consolidated = 0
+                """,
+                (user_id,),
+            ).fetchone()
+        return int(row["c"] if row is not None else 0)
+
+    def count_session_turns(self, session_id: str, user_id: str) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM conversation_log
+                WHERE session_id = ? AND user_id = ?
+                """,
+                (session_id, user_id),
+            ).fetchone()
+        return int(row["c"] if row is not None else 0)
 
     def _is_sensitive(self, text: str) -> bool:
         t = text.lower()
@@ -433,20 +540,16 @@ class MemoryStore:
         Returns:
             List of MemoryCandidate objects, or empty list on error.
         """
+        # This wrapper is always invoked from a worker thread (e.g. via
+        # asyncio.to_thread in consolidate_pending), so there is no running event
+        # loop here. Run the coroutine on a fresh loop owned by this thread.
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
         try:
-            # Try to get the running loop; if we're in a thread, this raises RuntimeError.
-            loop = asyncio.get_running_loop()
-            # If we got here, we're in an async context; create a task and wait for it.
-            # This is uncommon but supported.
             return loop.run_until_complete(self._llm_extract_candidates(text, source))
-        except RuntimeError:
-            # We're in a sync context (thread); create a new event loop.
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            try:
-                return loop.run_until_complete(self._llm_extract_candidates(text, source))
-            finally:
-                loop.close()
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
 
     def _upsert_chroma(self, memory_id: str, text: str, metadata: dict[str, Any]) -> None:
         self._collection.upsert(ids=[memory_id], documents=[text], metadatas=[metadata])
@@ -780,6 +883,8 @@ class MemoryStore:
 
     def consolidate_pending(self, user_id: str | None = None, limit: int = 50) -> dict[str, int]:
         now = time.time()
+        # Phase 1: read the pending summaries under the lock, then release it so
+        # the blocking LLM extraction does not stall every other memory operation.
         with self._lock:
             cur = self._conn.cursor()
             if user_id:
@@ -805,16 +910,24 @@ class MemoryStore:
                     (limit,),
                 ).fetchall()
 
-            processed = 0
-            promoted = 0
-            blocked = 0
-            for row in rows:
-                summary_id = int(row["id"])
-                summary_text = str(row["summary"] or "")
-                summary_user_id = str(row["user_id"])
-                # Phase 12b: Use LLM-based extraction instead of regex for richer candidates
-                candidates = self._extract_candidates_llm_sync(summary_text, source="consolidation")
+        # Phase 2: run the (blocking) LLM extraction for every summary WITHOUT
+        # holding the lock.  Build a flat work list of writes to apply afterwards.
+        extracted: list[tuple[int, str, list[MemoryCandidate]]] = []
+        for row in rows:
+            summary_id = int(row["id"])
+            summary_text = str(row["summary"] or "")
+            summary_user_id = str(row["user_id"])
+            # Phase 12b: Use LLM-based extraction instead of regex for richer candidates
+            candidates = self._extract_candidates_llm_sync(summary_text, source="consolidation")
+            extracted.append((summary_id, summary_user_id, candidates))
 
+        # Phase 3: apply all DB + Chroma writes under the lock (no LLM calls here).
+        processed = 0
+        promoted = 0
+        blocked = 0
+        with self._lock:
+            cur = self._conn.cursor()
+            for summary_id, summary_user_id, candidates in extracted:
                 for c in candidates:
                     text = f"{c.key}: {c.value}"
                     if self._is_sensitive(text):

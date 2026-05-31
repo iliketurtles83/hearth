@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import difflib
 import os
 import time
 from pathlib import Path
@@ -12,6 +11,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from app_schemas import WriteRequest
+from tools.workspace import WorkspacePathError, make_unified_diff, resolve_workspace_path
 
 
 def create_code_file_router(
@@ -29,23 +29,13 @@ def create_code_file_router(
         return root
 
     def _safe_resolve(root: str, relative: str) -> str:
-        real_root = os.path.realpath(root)
-        candidate = os.path.realpath(os.path.join(real_root, relative))
-        if not (candidate == real_root or candidate.startswith(real_root + os.sep)):
-            raise HTTPException(status_code=400, detail="Path traversal is not allowed")
-        return candidate
+        try:
+            return resolve_workspace_path(root, relative)
+        except WorkspacePathError as exc:
+            raise HTTPException(status_code=400, detail="Path traversal is not allowed") from exc
 
     def _make_unified_diff(relative_path: str, original: str, proposed: str) -> str:
-        lines = list(
-            difflib.unified_diff(
-                original.splitlines(keepends=True),
-                proposed.splitlines(keepends=True),
-                fromfile=f"a/{relative_path}",
-                tofile=f"b/{relative_path}",
-                lineterm="\n",
-            )
-        )
-        return "".join(lines) if lines else ""
+        return make_unified_diff(relative_path, original, proposed)
 
     @router.get("/code/files", summary="List workspace files")
     async def list_code_files(sub_path: str = ""):

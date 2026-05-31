@@ -5,7 +5,6 @@ Verifies:
 2. Code context indexed into 'code_context' does not appear in chat memory retrieval.
 3. Chat facts stored in 'conversation_memory' do not appear in code context queries.
 4. The summaries table has the 'consolidated' column (Phase 12 prerequisite).
-5. Existing 'assistant_memories' data is auto-migrated to 'conversation_memory' on init.
 """
 from __future__ import annotations
 
@@ -144,49 +143,3 @@ def test_save_summary_stores_row(tmp_path):
     assert row["consolidated"] == 0
 
 
-# ── 5. Auto-migration: assistant_memories → conversation_memory ───────────────
-
-
-def test_migration_from_assistant_memories(tmp_path):
-    """Pre-existing 'assistant_memories' data is copied to 'conversation_memory' on init."""
-    pytest.importorskip("chromadb", reason="chromadb not installed")
-    import chromadb as _chromadb
-    import numpy as np
-    from chromadb.api.types import Documents, EmbeddingFunction
-
-    chroma_dir = tmp_path / "chroma"
-    chroma_dir.mkdir()
-
-    # Create the legacy collection and insert a document directly.
-    class _TrivialEmbedder(EmbeddingFunction):
-        def __call__(self, input: Documents) -> list[list[float]]:
-            return [[0.1] * 192 for _ in input]
-
-    client = _chromadb.PersistentClient(path=str(chroma_dir))
-    old_col = client.get_or_create_collection(
-        name="assistant_memories", embedding_function=_TrivialEmbedder()
-    )
-    old_col.upsert(
-        ids=["facts:1"],
-        documents=["name: migration_test_sentinel"],
-        metadatas=[{"user_id": "alice"}],
-    )
-    del old_col, client  # close the client so the new one can open the same path
-
-    # Construct MemoryStore — migration must run automatically.
-    mem = MemoryStore(
-        db_path=str(tmp_path / "memory.db"),
-        chroma_path=str(chroma_dir),
-    )
-
-    # The old collection must be gone.
-    existing_names = [c.name for c in mem._chroma.list_collections()]
-    assert "assistant_memories" not in existing_names, (
-        f"Old 'assistant_memories' collection still exists after migration: {existing_names}"
-    )
-    assert "conversation_memory" in existing_names
-
-    # The document must be retrievable from the new collection.
-    result = mem._collection.get(ids=["facts:1"])
-    assert result["ids"] == ["facts:1"], "Migrated document not found in conversation_memory"
-    assert "migration_test_sentinel" in (result["documents"] or [""])[0]
