@@ -36,7 +36,15 @@ from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 
-from intents import CHAT_MODEL, CLOUD_MODEL, CODER_MODEL, VISION_MODEL, RouteDecision, classify_intent, _is_code_intent
+from intents import (
+    CHAT_MODEL,
+    CLOUD_MODEL,
+    CODER_MODEL,
+    VISION_MODEL,
+    RouteDecision,
+    classify_intent,
+    is_write_like_code_request,
+)
 from embedding_router import (
     EmbeddingRouterSnapshotMismatchError,
     ollama_embed_text,
@@ -60,6 +68,7 @@ class AssistantState(TypedDict, total=False):
     system: str
     source: str
     project_id: str
+    project_folder: str
     history: list[dict[str, Any]]
     session_summary: str
     selected_history: list[dict[str, Any]]
@@ -91,8 +100,8 @@ class AssistantState(TypedDict, total=False):
     # Responder modality split
     modality: str                     # "voice" or "chat"; set by /chat endpoint from request source
     # Coding agent tool
-    pending_code_task: str            # code-write task description awaiting agent confirmation
-    awaiting_agent_confirmation: bool # True when a code-write task needs user approval before dispatch
+    pending_code_task: str            # coding task description awaiting agent confirmation
+    awaiting_agent_confirmation: bool # True when a coding task needs user approval before dispatch
     # Vision input
     image_base64: str | None          # raw base64 image (ephemeral, not persisted)
     image_mime: str | None            # "image/png" | "image/jpeg" | "image/webp"
@@ -289,9 +298,8 @@ def _decision_from_embedding(
         )
 
     if tool_label == "code":
-        code_intent = "code-write" if heuristic.intent == "code-write" else "code-question"
         return RouteDecision(
-            intent=code_intent,
+            intent="code-question",
             confidence=round(_similarity_to_confidence(tool_score), 3),
             use_cloud=False,
             model=coder_model,
@@ -349,7 +357,7 @@ def _pick_model_for_decision(
 ) -> str:
     if use_cloud:
         return cloud_model
-    if _is_code_intent(intent):
+    if intent == "code-question":
         return coder_model
     if intent == "vision":
         return vision_model
@@ -431,12 +439,39 @@ def build_assistant_graph(
 
     async def intent_classifier(state: AssistantState) -> dict[str, Any]:
         writer = get_stream_writer()
+        project_id = str(state.get("project_id", "") or "").strip()
 
         def _last_assistant_message() -> str:
             for item in reversed(list(state.get("history", []))):
                 if item.get("role") == "assistant":
                     return str(item.get("content", ""))
             return ""
+
+        # Project sessions are deterministic coding sessions.
+        if project_id:
+            writer({
+                "meta": {
+                    "model": deps.coder_model or deps.chat_model,
+                    "intent": "code-write",
+                    "confidence": 1.0,
+                    "route_type": "coding_agent",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "deterministic",
+                    "reasoning_summary": "",
+                }
+            })
+            return {
+                "intent": "code-write",
+                "confidence": 1.0,
+                "use_cloud": False,
+                "model": deps.coder_model or deps.chat_model,
+                "tool": None,
+                "planner_status": "deterministic",
+                "reasoning_summary": "",
+                "needs_memory": False,
+                "route_type": "coding_agent",
+            }
 
         # Dedicated /code endpoint can force code routing deterministically.
         if state.get("force_code"):
@@ -637,9 +672,19 @@ def build_assistant_graph(
         else:
             decision = _heuristic_router_decision()
 
+        if is_write_like_code_request(state["message"]) and decision.intent != "code-question":
+            decision.intent = "code-question"
+            decision.use_cloud = False
+            decision.tool = None
+            decision.model = deps.coder_model or deps.chat_model
+            decision.planner_status = "write_downgraded_to_code_question"
+
         route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
-        if _is_code_intent(decision.intent):
+        if decision.intent == "code-question":
             route_type = "code"
+
+        if is_write_like_code_request(state["message"]):
+            writer({"notice": "To edit files, open a project first."})
 
         writer({
             "meta": {
@@ -718,13 +763,7 @@ def build_assistant_graph(
             summary_text=session_summary,
         )
         if project_id:
-            memory_hits_all = await asyncio.to_thread(
-                deps.memory_store.retrieve,
-                state["user_id"],
-                state["message"],
-                None,
-                project_id,
-            )
+            memory_hits_all = []
         else:
             memory_hits_all = await asyncio.to_thread(
                 deps.memory_store.retrieve,
@@ -741,7 +780,24 @@ def build_assistant_graph(
         # - Code intents: code_context_retrieval() queries 'code_context' only.
         # The two collections are strictly separate.
         code_context = ""
-        if _is_code_intent(state.get("intent", "")):
+        if project_id:
+            log.info(
+                "graph.memory_retrieval | collection=code_context_%s | session=%s",
+                project_id,
+                state.get("session_id", ""),
+            )
+            code_context = code_context_retrieval(
+                state["message"],
+                deps.chroma_path,
+                max_snippets=5,
+                project_id=project_id,
+            )
+            if code_context:
+                log.info(
+                    "graph.memory_retrieval | code_context_injected=true | session=%s",
+                    state.get("session_id", ""),
+                )
+        elif state.get("intent", "") == "code-question":
             log.info(
                 "graph.memory_retrieval | collection=code_context | session=%s",
                 state.get("session_id", ""),
@@ -750,7 +806,6 @@ def build_assistant_graph(
                 state["message"],
                 deps.chroma_path,
                 max_snippets=5,
-                project_id=project_id,
             )
             if code_context:
                 log.info(
@@ -1248,13 +1303,23 @@ def build_assistant_graph(
         }
 
     async def coding_agent_tool(state: AssistantState) -> dict[str, Any]:
-        """Confirmation gate for code-write tasks dispatched to the external coding agent.
+        """Confirmation gate for coding tasks dispatched to the external coding agent.
 
         Presents the planned task to the user and waits for explicit confirmation
         before dispatching to AgentAPI. Sets awaiting_agent_confirmation=True and
         stores the task in pending_code_task state.
         """
         writer = get_stream_writer()
+        if not str(state.get("project_id", "") or "").strip():
+            msg = "Coding edits are project-only. Open a project first."
+            writer({"text": msg})
+            return {
+                "response_text": msg,
+                "response_model": deps.chat_model,
+                "pending_code_task": "",
+                "awaiting_agent_confirmation": False,
+            }
+
         task = str(state.get("message", "")).strip()
         modality = state.get("modality", "chat")
 
@@ -1286,7 +1351,7 @@ def build_assistant_graph(
         }
 
     async def coding_agent_executor(state: AssistantState) -> dict[str, Any]:
-        """Execute a confirmed code-write task via the external AgentAPI adapter.
+        """Execute a confirmed coding task via the external AgentAPI adapter.
 
         Reads pending_code_task and code_context from state, calls coding_agent.run(),
         shapes the result based on modality, and clears the confirmation flags.
@@ -1665,7 +1730,7 @@ def build_assistant_graph(
         return "memory_retrieval"
 
     def _after_tool_router(state: AssistantState) -> str:
-        if state.get("intent") == "code-write":
+        if str(state.get("project_id", "") or "").strip():
             return "coding_agent_tool"
         if state.get("intent") == "code-question":
             return "code_tool"

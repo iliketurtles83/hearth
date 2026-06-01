@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -55,7 +55,8 @@ from app_schemas import (
     SessionSelectRequest,
 )
 import tts
-from projects import ProjectStore
+from projects import ProjectStore, ProjectError
+from tools.workspace import WorkspacePathError, resolve_workspace_path
 
 _BACKEND_DIR = os.path.dirname(__file__)
 if _BACKEND_DIR not in sys.path:
@@ -605,6 +606,25 @@ def _voice_tts_metadata(chat_source: str) -> dict | None:
     }
 
 
+def _resolve_project_context(user_id: str, raw_project_id: str | None) -> tuple[str, str]:
+    project_id = (raw_project_id or "").strip()
+    if not project_id:
+        return "", ""
+    try:
+        project = project_store.get_project(project_id, user_id)
+    except ProjectError as exc:
+        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+    if project is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    folder_name = str(project.get("folder_name", "")).strip()
+    try:
+        project_folder = resolve_workspace_path(project_store.code_workspace_root, folder_name)
+    except WorkspacePathError as exc:
+        raise HTTPException(status_code=400, detail="Path traversal is not allowed") from exc
+    return project_id, project_folder
+
+
 def _set_session_cookie(response: Response, session_id: str) -> None:
     """Apply consistent session-cookie attributes across all endpoints."""
     response.set_cookie(
@@ -766,7 +786,7 @@ async def chat(request: ChatRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id = cookie_session_id or str(uuid4())
     session_created = cookie_session_id is None
-    project_id = (request.project_id or "").strip() or None
+    project_id, project_folder = _resolve_project_context(user_id, request.project_id)
     chat_source = _normalize_chat_source(request.source)
     effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
 
@@ -802,7 +822,7 @@ async def chat(request: ChatRequest, http_request: Request):
                         user_id,
                         "user",
                         request.message,
-                        project_id,
+                        project_id or None,
                     )
                     await asyncio.to_thread(
                         memory_store.log_turn,
@@ -810,7 +830,7 @@ async def chat(request: ChatRequest, http_request: Request):
                         user_id,
                         "assistant",
                         response_text,
-                        project_id,
+                        project_id or None,
                     )
                 except Exception as exc:
                     log.warning("chat.music_fast.log_turn | session_id=%s error=%s", session_id, exc)
@@ -834,7 +854,8 @@ async def chat(request: ChatRequest, http_request: Request):
         "message": request.message,
         "system": effective_system,
         "source": chat_source,
-        "project_id": project_id or "",
+        "project_id": project_id,
+        "project_folder": project_folder,
         "modality": "voice" if chat_source == "voice" else "chat",
         # Pass image through state (ephemeral, not persisted to memory)
         "image_base64": request.image_base64,
@@ -1142,7 +1163,7 @@ async def code(request: CodeRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id = cookie_session_id or str(uuid4())
     session_created = cookie_session_id is None
-    project_id = (request.project_id or "").strip() or None
+    project_id, project_folder = _resolve_project_context(user_id, request.project_id)
     code_source = _normalize_chat_source(request.source)
     effective_system = request.system or CODE_DEFAULT_SYSTEM_PROMPT
 
@@ -1152,7 +1173,8 @@ async def code(request: CodeRequest, http_request: Request):
         "message": request.message,
         "system": effective_system,
         "source": code_source,
-        "project_id": project_id or "",
+        "project_id": project_id,
+        "project_folder": project_folder,
         "force_code": True,
     }
 

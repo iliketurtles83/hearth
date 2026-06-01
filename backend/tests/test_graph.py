@@ -47,25 +47,43 @@ TEST_CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
 
 
 class _FakeMemoryStore:
-    def retrieve(self, _user_id: str, _query: str):
+    def retrieve(self, _user_id: str, _query: str, _limit: int | None = None, _project_id: str | None = None):
         return []
 
-    def get_session_turns(self, _session_id: str, _user_id: str, _limit: int = 500):
+    def get_session_turns(
+        self,
+        _session_id: str,
+        _user_id: str,
+        _limit: int = 500,
+        _project_id: str | None = None,
+    ):
         return []
 
-    def get_latest_session_summary(self, _session_id: str, _user_id: str) -> str:
+    def get_latest_session_summary(
+        self,
+        _session_id: str,
+        _user_id: str,
+        _project_id: str | None = None,
+    ) -> str:
         return ""
 
-    def log_turn(self, _session_id: str, _user_id: str, _role: str, _content: str) -> None:
+    def log_turn(
+        self,
+        _session_id: str,
+        _user_id: str,
+        _role: str,
+        _content: str,
+        _project_id: str | None = None,
+    ) -> None:
         return None
 
     def ingest_user_message(self, _user_id: str, _message: str, _source: str = "text"):
         return {"status": "none", "saved": [], "blocked": [], "needs_confirmation": []}
 
-    def count_unconsolidated(self, _user_id: str) -> int:
+    def count_unconsolidated(self, _user_id: str, _project_id: str | None = None) -> int:
         return 0
 
-    def consolidate_pending(self, _user_id=None, _limit: int = 50):
+    def consolidate_pending(self, _user_id=None, _limit: int = 50, _project_id: str | None = None):
         return {}
 
 
@@ -236,7 +254,7 @@ async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
     # history_loader populates state["history"] from the memory store, so the
     # confirm-write prompt must be returned by get_session_turns.
     class _HistoryMemoryStore(_FakeMemoryStore):
-        def get_session_turns(self, _session_id, _user_id, _limit=500):
+        def get_session_turns(self, _session_id, _user_id, _limit=500, _project_id=None):
             return [
                 {
                     "role": "assistant",
@@ -311,13 +329,13 @@ def _heuristic_returning(intent: str):
 
 
 @pytest.mark.asyncio
-async def test_code_write_routes_to_coding_agent_tool(monkeypatch):
-    """code-write intent should trigger the confirmation gate, not the executor."""
-    monkeypatch.setattr(assistant_graph, "classify_intent", _heuristic_returning("code-write"))
-
+async def test_project_session_routes_to_coding_agent_tool():
+    """Project sessions should route directly to the coding-agent confirmation gate."""
     graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
     state = _base_state()
     state["message"] = "Write a Python function that sorts a list of integers."
+    state["project_id"] = "proj-123"
+    state["project_folder"] = "/tmp/proj-123"
 
     result = await graph.ainvoke(state)
 
@@ -329,15 +347,15 @@ async def test_code_write_routes_to_coding_agent_tool(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_code_write_voice_prompt_is_short(monkeypatch):
+async def test_project_voice_prompt_is_short():
     """Voice confirmation prompt should be ≤ 12-word preview, not full task."""
-    monkeypatch.setattr(assistant_graph, "classify_intent", _heuristic_returning("code-write"))
-
     graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
     long_task = "Write " + " ".join([f"word{i}" for i in range(30)])
     state = _base_state()
     state["message"] = long_task
     state["modality"] = "voice"
+    state["project_id"] = "proj-123"
+    state["project_folder"] = "/tmp/proj-123"
 
     result = await graph.ainvoke(state)
 

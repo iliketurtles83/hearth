@@ -74,21 +74,21 @@ DEFAULT_TOOL_EXEMPLARS: dict[str, tuple[str, ...]] = {
         "Queue the album Kind of Blue",
     ),
     "code": (
-        "Write a Python function to parse CSV",
-        "Implement a binary search in JavaScript",
-        "Fix this bug in my auth module",
-        "Refactor this class for readability",
-        "Add unit tests for this function",
         "Explain how this code works",
         "Review this pull request diff",
-        "Create a FastAPI endpoint",
-        "Debug this stack trace",
-        "How do I implement rate limiting",
-        "Generate SQL migration script",
-        "Rename this variable across files",
         "Why does this algorithm fail",
-        "Optimize this query",
-        "Create test cases for edge conditions",
+        "Walk me through this function",
+        "What does this class do",
+        "Explain this stack trace",
+        "Help me understand this SQL query",
+        "Describe this module's architecture",
+        "What is wrong with this code path",
+        "Compare these two implementations",
+        "How does this endpoint handle errors",
+        "Summarize this diff",
+        "What edge cases are missing in this test",
+        "Explain this regex",
+        "Where is this function called from",
     ),
     "vision": (
         "Describe this image",
@@ -409,4 +409,3 @@ async def build_embedding_router(
         dialogue_rows=int(dialogue_index.matrix.shape[0]),
     )
     return router, snapshot
-

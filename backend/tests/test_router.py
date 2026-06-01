@@ -6,7 +6,7 @@ Covers:
 - Tool inference for weather and music requests.
 - Code intent stays local and uses the coder model.
 - code-question intent (explain/how-does) routes to code_tool.
-- code-write intent (write/fix/implement) routes to external coding agent.
+- write-like requests in main chat are downgraded to code-question.
 - Async route() remains a thin wrapper over classify_intent().
 """
 
@@ -60,9 +60,9 @@ class TestHeuristicClassifier:
         d = r.classify_intent("What is my name? You mentioned it earlier.")
         assert d.intent == "memory-needed"
 
-    def test_code_write_intent(self):
+    def test_write_request_is_downgraded_to_code_question(self):
         d = r.classify_intent("Write a Python function that parses a JSON file.")
-        assert d.intent == "code-write"
+        assert d.intent == "code-question"
         assert not d.use_cloud
         assert d.model == r.CODER_MODEL
 
@@ -72,9 +72,9 @@ class TestHeuristicClassifier:
         assert not d.use_cloud
         assert d.model == r.CODER_MODEL
 
-    def test_fix_bug_is_code_write(self):
+    def test_fix_bug_is_code_question(self):
         d = r.classify_intent("Fix the bug in the authentication module.")
-        assert d.intent == "code-write"
+        assert d.intent == "code-question"
         assert not d.use_cloud
         assert d.model == r.CODER_MODEL
 
@@ -94,13 +94,14 @@ class TestHeuristicClassifier:
 
     def test_how_do_i_implement_is_code_question(self):
         d = r.classify_intent("How do I implement a rate limiter in python?")
-        assert d.intent in {"code-question", "code-write"}
+        assert d.intent == "code-question"
         assert d.model == r.CODER_MODEL
 
 
 class TestModelSelection:
-    def test_code_write_returns_coder(self):
-        assert r._pick_local_model("code-write") == r.CODER_MODEL
+    def test_only_code_question_is_code_intent(self):
+        assert r._is_code_intent("code-question")
+        assert not r._is_code_intent("quick-local")
 
     def test_code_question_returns_coder(self):
         assert r._pick_local_model("code-question") == r.CODER_MODEL
@@ -112,7 +113,6 @@ class TestModelSelection:
     def test_coder_differs_when_overridden(self):
         original = r.CODER_MODEL
         r.CODER_MODEL = "qwen2.5-coder:7b"
-        assert r._pick_local_model("code-write") == "qwen2.5-coder:7b"
         assert r._pick_local_model("code-question") == "qwen2.5-coder:7b"
         assert r._pick_local_model("quick-local") != "qwen2.5-coder:7b"
         r.CODER_MODEL = original
@@ -127,7 +127,7 @@ class TestAsyncRouteWrapper:
         assert routed.planner_status == "heuristic"
 
     @pytest.mark.asyncio
-    async def test_route_handles_code_write_intent(self):
+    async def test_route_downgrades_write_to_code_question(self):
         routed = await r.route("Write a Python function to read a CSV file.")
-        assert routed.intent == "code-write"
+        assert routed.intent == "code-question"
         assert routed.model == r.CODER_MODEL

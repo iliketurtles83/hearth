@@ -5,7 +5,6 @@ Intent categories:
     quick-local          — factual, short, conversational
     reasoning-heavy      — multi-step planning, analysis, architecture
     code-question        — explanation, understanding, code review
-    code-write           — code generation, file edits, debugging
     external-data-needed — weather/news/live-data/music commands
     memory-needed        — references to prior facts or user preferences
     vision               — image-related requests
@@ -55,7 +54,7 @@ class RouteDecision:
 
 
 def _is_code_intent(intent: str) -> bool:
-    return intent in ("code-question", "code-write")
+    return intent == "code-question"
 
 
 def _pick_local_model(intent: str) -> str:
@@ -190,7 +189,7 @@ _MEMORY_KEYWORDS = [
     "my name", "my preference", "my favorite", "my favourite", "my city",
 ]
 
-_CODE_WRITE_PATTERNS = [
+_CODE_ACTION_PATTERNS = [
     r"\bwrite\s+me\s+code\b",
     r"\b(write|generate|create|implement)\b.{0,80}\b(in|using)\s+(python|javascript|typescript|sql|bash|shell|css|html)\b",
     r"\b(quicksort|quick\s*sort|merge\s*sort|binary\s*search)\b",
@@ -206,7 +205,7 @@ _CODE_WRITE_PATTERNS = [
     r"\b(add|remove|delete|rename|move|update|change)\b.{0,40}\b(function|class|method|file|module|endpoint|variable)\b",
 ]
 
-_CODE_WRITE_KEYWORDS = [
+_CODE_ACTION_KEYWORDS = [
     "write me code",
     "in python",
     "write a function", "write a class", "write a script", "write a test",
@@ -245,9 +244,15 @@ _CODE_QUESTION_KEYWORDS = [
 
 def _looks_like_code_request(text: str) -> bool:
     p = text.lower()
-    write_score = _score_patterns(p, _CODE_WRITE_PATTERNS) + _score_keywords(p, _CODE_WRITE_KEYWORDS)
+    write_score = _score_patterns(p, _CODE_ACTION_PATTERNS) + _score_keywords(p, _CODE_ACTION_KEYWORDS)
     question_score = _score_patterns(p, _CODE_QUESTION_PATTERNS) + _score_keywords(p, _CODE_QUESTION_KEYWORDS)
     return max(write_score, question_score) >= 0.25
+
+
+def is_write_like_code_request(text: str) -> bool:
+    p = text.lower()
+    score = _score_patterns(p, _CODE_ACTION_PATTERNS) + _score_keywords(p, _CODE_ACTION_KEYWORDS)
+    return score >= 0.25
 
 
 def _score_patterns(text: str, patterns: list[str]) -> float:
@@ -267,7 +272,6 @@ def classify_intent(prompt: str) -> RouteDecision:
         "quick-local": 0.0,
         "reasoning-heavy": 0.0,
         "code-question": 0.0,
-        "code-write": 0.0,
         "external-data-needed": 0.0,
         "memory-needed": 0.0,
         "vision": 0.0,
@@ -290,11 +294,10 @@ def classify_intent(prompt: str) -> RouteDecision:
     scores["memory-needed"] += _score_patterns(p, _MEMORY_PATTERNS)
     scores["memory-needed"] += _score_keywords(p, _MEMORY_KEYWORDS)
 
-    scores["code-write"] += _score_patterns(p, _CODE_WRITE_PATTERNS)
-    scores["code-write"] += _score_keywords(p, _CODE_WRITE_KEYWORDS)
-
     scores["code-question"] += _score_patterns(p, _CODE_QUESTION_PATTERNS)
     scores["code-question"] += _score_keywords(p, _CODE_QUESTION_KEYWORDS)
+    scores["code-question"] += _score_patterns(p, _CODE_ACTION_PATTERNS)
+    scores["code-question"] += _score_keywords(p, _CODE_ACTION_KEYWORDS)
 
     if len(prompt) < 60:
         scores["quick-local"] += 0.60
@@ -310,7 +313,7 @@ def classify_intent(prompt: str) -> RouteDecision:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
     if scores["memory-needed"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
-    if scores["code-write"] >= 0.25 or scores["code-question"] >= 0.25:
+    if scores["code-question"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
     if scores["vision"] >= 0.25:
         scores["quick-local"] = max(0.0, scores["quick-local"] - 0.35)
