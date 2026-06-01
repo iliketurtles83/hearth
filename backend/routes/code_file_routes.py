@@ -22,6 +22,22 @@ def create_code_file_router(
 ) -> APIRouter:
     router = APIRouter()
 
+    # Abandoned (never-confirmed) pending writes would otherwise accumulate in
+    # memory forever. Evict entries older than this TTL on each write access.
+    pending_write_ttl = float(os.getenv("PENDING_CODE_WRITE_TTL_SECONDS", "3600"))
+
+    def _purge_expired_pending(now: float) -> None:
+        """Drop stale pending writes. Caller must hold ``code_write_lock``."""
+        stale = [
+            rid
+            for rid, entry in pending_code_writes.items()
+            if now - float(entry.get("created_at", 0.0)) > pending_write_ttl
+        ]
+        for rid in stale:
+            del pending_code_writes[rid]
+        if stale:
+            log.info("code.pending_writes.purged | count=%d", len(stale))
+
     def _get_code_root() -> str:
         root = os.getenv("CODE_WORKSPACE_ROOT", "")
         if not root or not os.path.isdir(root):
@@ -82,12 +98,14 @@ def create_code_file_router(
             diff = _make_unified_diff(file_path, current, body.content)
             request_id = str(uuid4())
             with code_write_lock:
+                now = time.time()
+                _purge_expired_pending(now)
                 pending_code_writes[request_id] = {
                     "user_id": user_id,
                     "file_path": file_path,
                     "resolved": resolved,
                     "content": body.content,
-                    "created_at": time.time(),
+                    "created_at": now,
                 }
             summary = "No changes detected." if not diff else "Diff generated. Confirmation required before write."
             return JSONResponse(
@@ -104,6 +122,7 @@ def create_code_file_router(
             raise HTTPException(status_code=400, detail="request_id is required when confirm=true")
 
         with code_write_lock:
+            _purge_expired_pending(time.time())
             pending = pending_code_writes.get(body.request_id)
             if not pending:
                 raise HTTPException(status_code=404, detail="Pending write not found or expired")

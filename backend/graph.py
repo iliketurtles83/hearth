@@ -59,6 +59,7 @@ class AssistantState(TypedDict, total=False):
     message: str
     system: str
     source: str
+    project_id: str
     history: list[dict[str, Any]]
     session_summary: str
     selected_history: list[dict[str, Any]]
@@ -355,7 +356,12 @@ def _pick_model_for_decision(
     return chat_model
 
 
-def code_context_retrieval(query: str, chroma_path: str, max_snippets: int = 5) -> str:
+def code_context_retrieval(
+    query: str,
+    chroma_path: str,
+    max_snippets: int = 5,
+    project_id: str | None = None,
+) -> str:
     """Fetch and format code-context snippets for prompt injection."""
     if not chroma_path:
         return ""
@@ -364,7 +370,15 @@ def code_context_retrieval(query: str, chroma_path: str, max_snippets: int = 5) 
     except Exception:
         return ""
 
-    snippets = query_code_context(query, chroma_path, n=max_snippets)
+    collection_name = "code_context"
+    if project_id:
+        collection_name = f"code_context_{project_id}"
+    snippets = query_code_context(
+        query,
+        chroma_path,
+        n=max_snippets,
+        collection_name=collection_name,
+    )
     if not snippets:
         return ""
 
@@ -654,20 +668,36 @@ def build_assistant_graph(
     async def history_loader(state: AssistantState) -> dict[str, Any]:
         session_id = str(state.get("session_id", ""))
         user_id = str(state.get("user_id", ""))
+        project_id = str(state.get("project_id", "") or "").strip() or None
         if not session_id or not user_id:
             return {"history": [], "session_summary": ""}
 
-        turns = await asyncio.to_thread(
-            deps.memory_store.get_session_turns,
-            session_id,
-            user_id,
-            CHAT_MAX_TURNS * 2,
-        )
-        session_summary = await asyncio.to_thread(
-            deps.memory_store.get_latest_session_summary,
-            session_id,
-            user_id,
-        )
+        if project_id:
+            turns = await asyncio.to_thread(
+                deps.memory_store.get_session_turns,
+                session_id,
+                user_id,
+                CHAT_MAX_TURNS * 2,
+                project_id,
+            )
+            session_summary = await asyncio.to_thread(
+                deps.memory_store.get_latest_session_summary,
+                session_id,
+                user_id,
+                project_id,
+            )
+        else:
+            turns = await asyncio.to_thread(
+                deps.memory_store.get_session_turns,
+                session_id,
+                user_id,
+                CHAT_MAX_TURNS * 2,
+            )
+            session_summary = await asyncio.to_thread(
+                deps.memory_store.get_latest_session_summary,
+                session_id,
+                user_id,
+            )
         history = [
             {
                 "role": str(turn.get("role", "")),
@@ -678,6 +708,7 @@ def build_assistant_graph(
         return {"history": history, "session_summary": str(session_summary or "")}
 
     async def memory_retrieval(state: AssistantState) -> dict[str, Any]:
+        project_id = str(state.get("project_id", "") or "").strip() or None
         history = list(state.get("history", []))
         session_summary = str(state.get("session_summary", "") or "")
         selected_history, history_tokens, truncated, summary_tokens = _select_history_for_budget(
@@ -686,9 +717,20 @@ def build_assistant_graph(
             current_user_message=state["message"],
             summary_text=session_summary,
         )
-        memory_hits_all = await asyncio.to_thread(
-            deps.memory_store.retrieve, state["user_id"], state["message"]
-        )
+        if project_id:
+            memory_hits_all = await asyncio.to_thread(
+                deps.memory_store.retrieve,
+                state["user_id"],
+                state["message"],
+                None,
+                project_id,
+            )
+        else:
+            memory_hits_all = await asyncio.to_thread(
+                deps.memory_store.retrieve,
+                state["user_id"],
+                state["message"],
+            )
         inject_memory = _should_inject_memory(state["intent"], memory_hits_all, state["message"])
         memory_hits = memory_hits_all if inject_memory else []
         system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
@@ -704,7 +746,12 @@ def build_assistant_graph(
                 "graph.memory_retrieval | collection=code_context | session=%s",
                 state.get("session_id", ""),
             )
-            code_context = code_context_retrieval(state["message"], deps.chroma_path, max_snippets=5)
+            code_context = code_context_retrieval(
+                state["message"],
+                deps.chroma_path,
+                max_snippets=5,
+                project_id=project_id,
+            )
             if code_context:
                 log.info(
                     "graph.memory_retrieval | code_context_injected=true | session=%s",
@@ -1514,6 +1561,7 @@ def build_assistant_graph(
         writer = get_stream_writer()
         user_id = str(state.get("user_id", ""))
         session_id = str(state.get("session_id", ""))
+        project_id = str(state.get("project_id", "") or "").strip() or None
         message = str(state.get("message", "") or "")
         response_text = str(state.get("response_text", "") or "").strip()
 
@@ -1521,21 +1569,41 @@ def build_assistant_graph(
             return {"memory_result": {}}
 
         # 1) Persist the turn in conversation_log.
-        await asyncio.to_thread(
-            deps.memory_store.log_turn,
-            session_id,
-            user_id,
-            "user",
-            message,
-        )
-        if response_text:
+        if project_id:
             await asyncio.to_thread(
                 deps.memory_store.log_turn,
                 session_id,
                 user_id,
-                "assistant",
-                response_text,
+                "user",
+                message,
+                project_id,
             )
+        else:
+            await asyncio.to_thread(
+                deps.memory_store.log_turn,
+                session_id,
+                user_id,
+                "user",
+                message,
+            )
+        if response_text:
+            if project_id:
+                await asyncio.to_thread(
+                    deps.memory_store.log_turn,
+                    session_id,
+                    user_id,
+                    "assistant",
+                    response_text,
+                    project_id,
+                )
+            else:
+                await asyncio.to_thread(
+                    deps.memory_store.log_turn,
+                    session_id,
+                    user_id,
+                    "assistant",
+                    response_text,
+                )
 
         # 2) Extract explicit/inline memory from the user message.
         raw_memory_result = await asyncio.to_thread(
@@ -1562,10 +1630,17 @@ def build_assistant_graph(
             writer({"memory": memory_payload})
 
         # 3) Threshold-based consolidation trigger.
-        unconsolidated = await asyncio.to_thread(
-            deps.memory_store.count_unconsolidated,
-            user_id,
-        )
+        if project_id:
+            unconsolidated = await asyncio.to_thread(
+                deps.memory_store.count_unconsolidated,
+                user_id,
+                project_id,
+            )
+        else:
+            unconsolidated = await asyncio.to_thread(
+                deps.memory_store.count_unconsolidated,
+                user_id,
+            )
         consolidation_threshold = int(os.getenv("MEMORY_CONSOLIDATION_THRESHOLD", "3"))
         if unconsolidated >= consolidation_threshold:
             consolidation_batch = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))

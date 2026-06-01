@@ -50,6 +50,24 @@ class _FakeMemoryStore:
     def retrieve(self, _user_id: str, _query: str):
         return []
 
+    def get_session_turns(self, _session_id: str, _user_id: str, _limit: int = 500):
+        return []
+
+    def get_latest_session_summary(self, _session_id: str, _user_id: str) -> str:
+        return ""
+
+    def log_turn(self, _session_id: str, _user_id: str, _role: str, _content: str) -> None:
+        return None
+
+    def ingest_user_message(self, _user_id: str, _message: str, _source: str = "text"):
+        return {"status": "none", "saved": [], "blocked": [], "needs_confirmation": []}
+
+    def count_unconsolidated(self, _user_id: str) -> int:
+        return 0
+
+    def consolidate_pending(self, _user_id=None, _limit: int = 50):
+        return {}
+
 
 def _base_state() -> assistant_graph.AssistantState:
     return {
@@ -63,7 +81,9 @@ def _base_state() -> assistant_graph.AssistantState:
     }
 
 
-def _deps_for_local_stream(chunks: list[str]) -> assistant_graph.AssistantGraphDependencies:
+def _deps_for_local_stream(
+    chunks: list[str], *, embedding_router=None
+) -> assistant_graph.AssistantGraphDependencies:
     async def _fake_router(_message: str):
         return SimpleNamespace(
             intent="quick-local",
@@ -89,6 +109,7 @@ def _deps_for_local_stream(chunks: list[str]) -> assistant_graph.AssistantGraphD
 
     return assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=embedding_router,
         router_route=_fake_router,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -164,6 +185,7 @@ async def test_graph_checkpoint_resume_reloads_state_without_reexecution():
 
     deps = assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=None,
         router_route=_fake_router,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -211,8 +233,20 @@ async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
     async def _fake_tool_dispatch(_tool_name: str, _params: dict):
         raise AssertionError("tool dispatch should not run in confirm-write orphan test")
 
+    # history_loader populates state["history"] from the memory store, so the
+    # confirm-write prompt must be returned by get_session_turns.
+    class _HistoryMemoryStore(_FakeMemoryStore):
+        def get_session_turns(self, _session_id, _user_id, _limit=500):
+            return [
+                {
+                    "role": "assistant",
+                    "content": "Type **yes** to confirm the write, or describe any changes you want first.",
+                }
+            ]
+
     deps = assistant_graph.AssistantGraphDependencies(
-        memory_store=_FakeMemoryStore(),
+        memory_store=_HistoryMemoryStore(),
+        embedding_router=None,
         router_route=_fake_router,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -224,12 +258,6 @@ async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
     graph = assistant_graph.build_assistant_graph(deps)
     state = _base_state()
     state["message"] = "yes"
-    state["history"] = [
-        {
-            "role": "assistant",
-            "content": "Type **yes** to confirm the write, or describe any changes you want first.",
-        }
-    ]
     state["pending_write"] = {}
     state["awaiting_confirmation"] = False
 
@@ -240,7 +268,7 @@ async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
 
 # ── Phase 13 — coding agent integration ───────────────────────────────────────
 
-def _deps_for_code_write() -> assistant_graph.AssistantGraphDependencies:
+def _deps_for_code_write(*, embedding_router=None) -> assistant_graph.AssistantGraphDependencies:
     """Return minimal deps for coding-agent tests (stream_local not needed)."""
 
     async def _fake_stream_local(_request, model_name=None):
@@ -254,6 +282,7 @@ def _deps_for_code_write() -> assistant_graph.AssistantGraphDependencies:
 
     return assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=embedding_router,
         router_route=lambda _m: None,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -362,6 +391,7 @@ async def test_orphan_yes_without_agent_pending_does_not_trigger_executor():
 
     deps = assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=None,
         router_route=lambda _m: None,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -384,7 +414,7 @@ async def test_orphan_yes_without_agent_pending_does_not_trigger_executor():
 
 # ── Slice 1 — Heuristic gate tests ───────────────────────────────────────────
 
-def _deps_for_weather_stream() -> assistant_graph.AssistantGraphDependencies:
+def _deps_for_weather_stream(*, embedding_router=None) -> assistant_graph.AssistantGraphDependencies:
     """Deps suitable for weather-routing tests: tool_dispatch returns a valid weather result."""
     from tools.base import ToolResult
 
@@ -411,6 +441,7 @@ def _deps_for_weather_stream() -> assistant_graph.AssistantGraphDependencies:
 
     return assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=embedding_router,
         router_route=lambda _m: None,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -437,7 +468,6 @@ async def test_heuristic_routing_for_weather_without_planner():
 @pytest.mark.asyncio
 async def test_embedding_router_absence_uses_heuristic_fallback(monkeypatch):
     """Without an embedding router, routing falls back to heuristic immediately."""
-    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: None)
 
     async def _fake_stream_local(_request, model_name=None):
         yield "fallback response"
@@ -450,6 +480,7 @@ async def test_embedding_router_absence_uses_heuristic_fallback(monkeypatch):
 
     deps = assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=None,
         router_route=lambda _m: None,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -496,10 +527,11 @@ async def test_embedding_unambiguous_weather_skips_planner(monkeypatch):
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([1.0, 0.0], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
     monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
 
-    graph = assistant_graph.build_assistant_graph(_deps_for_weather_stream())
+    graph = assistant_graph.build_assistant_graph(
+        _deps_for_weather_stream(embedding_router=_FakeEmbedRouter())
+    )
     state = _base_state()
     state["message"] = "weather in london"
 
@@ -538,10 +570,11 @@ async def test_embedding_ambiguous_uses_heuristic_fallback(monkeypatch):
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([0.1, 0.9], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
     monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
 
-    graph = assistant_graph.build_assistant_graph(_deps_for_local_stream(["ok"]))
+    graph = assistant_graph.build_assistant_graph(
+        _deps_for_local_stream(["ok"], embedding_router=_FakeEmbedRouter())
+    )
     state = _base_state()
     state["message"] = "hello"
 
@@ -579,10 +612,11 @@ async def test_embedding_ambiguous_does_not_call_planner_function(monkeypatch):
         return np.asarray([0.2, 0.8], dtype=np.float32)
 
     assert not hasattr(assistant_graph, "_call_planner")
-    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
     monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
 
-    graph = assistant_graph.build_assistant_graph(_deps_for_local_stream(["ok"]))
+    graph = assistant_graph.build_assistant_graph(
+        _deps_for_local_stream(["ok"], embedding_router=_FakeEmbedRouter())
+    )
     state = _base_state()
     state["message"] = "hello"
 
@@ -601,10 +635,11 @@ async def test_embedding_snapshot_mismatch_falls_back_to_legacy_router(monkeypat
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([0.1, 0.9], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "get_embedding_router", lambda: _FakeEmbedRouter())
     monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
 
-    graph = assistant_graph.build_assistant_graph(_deps_for_local_stream(["ok"]))
+    graph = assistant_graph.build_assistant_graph(
+        _deps_for_local_stream(["ok"], embedding_router=_FakeEmbedRouter())
+    )
     state = _base_state()
     state["message"] = "hello"
 

@@ -507,6 +507,7 @@ def test_code_mode_yes_without_pending_write_is_blocked(monkeypatch):
             coder_model="qwen2.5-coder:14b",
             cloud_model=None,
             memory_store=memory_mod.MemoryStore(db_path=mem_db, chroma_path=chroma_dir),
+            embedding_router=None,
             router_route=_router_route,
             stream_local=_stream_noop,
             stream_cloud=_stream_noop,

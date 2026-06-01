@@ -67,6 +67,24 @@ class _FakeMemoryStore:
     def retrieve(self, _user_id: str, _query: str):
         return []
 
+    def get_session_turns(self, _session_id: str, _user_id: str, _limit: int = 500):
+        return []
+
+    def get_latest_session_summary(self, _session_id: str, _user_id: str) -> str:
+        return ""
+
+    def log_turn(self, _session_id: str, _user_id: str, _role: str, _content: str) -> None:
+        return None
+
+    def ingest_user_message(self, _user_id: str, _message: str, _source: str = "text"):
+        return {"status": "none", "saved": [], "blocked": [], "needs_confirmation": []}
+
+    def count_unconsolidated(self, _user_id: str) -> int:
+        return 0
+
+    def consolidate_pending(self, _user_id=None, _limit: int = 50):
+        return {}
+
 
 def _make_deps(
     *,
@@ -109,6 +127,7 @@ def _make_deps(
 
     return assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=None,
         router_route=_fake_router,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,
@@ -148,11 +167,30 @@ def _chat_state(**overrides) -> assistant_graph.AssistantState:
     return base
 
 
+def _force_local_intent(monkeypatch) -> None:
+    """Force heuristic routing to quick-local so responder-modality behaviour is exercised."""
+
+    def _classify(_prompt: str):
+        return assistant_graph.RouteDecision(
+            intent="quick-local",
+            confidence=0.99,
+            use_cloud=False,
+            model=TEST_CHAT_MODEL,
+            tool=None,
+            planner_status="heuristic",
+            reasoning_summary="",
+            needs_memory=False,
+        )
+
+    monkeypatch.setattr(assistant_graph, "classify_intent", _classify)
+
+
 # ── Chat modality: full response must pass through unchanged ─────────────────
 
 @pytest.mark.asyncio
-async def test_chat_modality_response_passes_through_full_text():
+async def test_chat_modality_response_passes_through_full_text(monkeypatch):
     """For modality='chat', the response_text must be the exact model output."""
+    _force_local_intent(monkeypatch)
     original_chunks = ["The weather in Paris is 18", "°C and sunny."]
     deps = _make_deps(
         original_chunks=original_chunks,
@@ -169,8 +207,9 @@ async def test_chat_modality_response_passes_through_full_text():
 # ── Voice modality: compression pass must run ────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_voice_modality_uses_compressed_response():
+async def test_voice_modality_uses_compressed_response(monkeypatch):
     """For modality='voice', response_text must be the compressed version, not the original."""
+    _force_local_intent(monkeypatch)
     compressed = "It's 7 degrees Celsius in Helsinki with 72 percent humidity."
     deps = _make_deps(
         original_chunks=[_DETAILED_RESPONSE],
@@ -185,8 +224,9 @@ async def test_voice_modality_uses_compressed_response():
 
 
 @pytest.mark.asyncio
-async def test_voice_modality_compression_is_shorter_than_original():
+async def test_voice_modality_compression_is_shorter_than_original(monkeypatch):
     """Voice response should be shorter than the original (compression worked)."""
+    _force_local_intent(monkeypatch)
     compressed = "It's 7°C in Helsinki with 72% humidity and a high of 9°C."
     deps = _make_deps(
         original_chunks=[_DETAILED_RESPONSE],
@@ -207,7 +247,7 @@ async def test_voice_modality_compression_is_shorter_than_original():
 # ── Fact-drift test: critical factual values must survive compression ─────────
 
 @pytest.mark.asyncio
-async def test_voice_compression_preserves_key_facts_no_drift():
+async def test_voice_compression_preserves_key_facts_no_drift(monkeypatch):
     """Voice compression must not drop critical factual values (the primary safety test).
 
     The fake 'compressed' response is crafted to contain all required facts,
@@ -219,6 +259,7 @@ async def test_voice_compression_preserves_key_facts_no_drift():
     the test will catch it by enforcing that response_text contains all facts.
     In production, the compression prompt instructs the model to preserve facts.
     """
+    _force_local_intent(monkeypatch)
     # A compressed response that preserves all the key facts.
     compressed_preserving_facts = (
         "In Helsinki it's 7 degrees Celsius, partly cloudy. "
@@ -245,9 +286,10 @@ async def test_voice_compression_preserves_key_facts_no_drift():
 # ── Short response: already-short responses bypass compression call ───────────
 
 @pytest.mark.asyncio
-async def test_voice_short_response_no_compression_model_call():
+async def test_voice_short_response_no_compression_model_call(monkeypatch):
     """Responses under 30 words are stripped of markdown and returned directly
     without a second model call (compression is not needed)."""
+    _force_local_intent(monkeypatch)
     short_response = "**Paused.** The music has been paused."
     call_count = {"n": 0}
 
@@ -275,6 +317,7 @@ async def test_voice_short_response_no_compression_model_call():
 
     deps = assistant_graph.AssistantGraphDependencies(
         memory_store=_FakeMemoryStore(),
+        embedding_router=None,
         router_route=_fake_router,
         stream_local=_fake_stream_local,
         stream_cloud=_fake_stream_cloud,

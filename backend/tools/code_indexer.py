@@ -7,14 +7,18 @@ queried for code intents, never for general chat retrieval.
 
 Public API
 ----------
-index_workspace(workspace_root, chroma_path, index_paths=None) -> int
+index_workspace(workspace_root, chroma_path, index_paths=None, collection_name="code_context") -> int
     Walk the workspace, extract summaries, upsert into ChromaDB.
 
-query_code_context(query, chroma_path, n=5) -> list[str]
+query_code_context(query, chroma_path, n=5, collection_name="code_context") -> list[str]
     Return the top-n relevant code snippets for a query string.
 
-start_background_index(workspace_root, chroma_path, index_paths=None) -> None
+start_background_index(workspace_root, chroma_path, index_paths=None, collection_name="code_context") -> None
     Launch index_workspace in a daemon thread (non-blocking).
+
+delete_collection(chroma_path, collection_name) -> bool
+    Delete a Chroma collection if it exists. Returns True when a collection
+    was removed, False otherwise.
 """
 
 from __future__ import annotations
@@ -60,12 +64,29 @@ class _HashEmbeddingFunction(EmbeddingFunction):
 _embedder = _HashEmbeddingFunction()
 
 
-def _get_collection(chroma_path: str) -> Any:
+def _get_collection(chroma_path: str, collection_name: str = "code_context") -> Any:
     client = chromadb.PersistentClient(path=chroma_path)
     return client.get_or_create_collection(
-        name="code_context",
+        name=collection_name,
         embedding_function=_embedder,
     )
+
+
+def delete_collection(chroma_path: str, collection_name: str) -> bool:
+    """Delete ``collection_name`` from Chroma if it exists.
+
+    Returns True when the collection was deleted and False when it did not
+    exist (or could not be listed).
+    """
+    client = chromadb.PersistentClient(path=chroma_path)
+    try:
+        existing = {c.name for c in client.list_collections()}
+    except Exception:
+        existing = set()
+    if collection_name not in existing:
+        return False
+    client.delete_collection(collection_name)
+    return True
 
 
 # ── tree-sitter parser bootstrap ──────────────────────────────────────────────
@@ -267,6 +288,7 @@ def index_workspace(
     workspace_root: str,
     chroma_path: str,
     index_paths: list[str] | None = None,
+    collection_name: str = "code_context",
 ) -> int:
     """Walk the workspace and upsert code summaries into the code_context collection.
 
@@ -289,7 +311,7 @@ def index_workspace(
     extra: list[Path] = [root / p for p in index_paths] if index_paths else []
     files = _collect_files(root, extra)
 
-    collection = _get_collection(chroma_path)
+    collection = _get_collection(chroma_path, collection_name=collection_name)
 
     docs: list[str] = []
     ids: list[str] = []
@@ -313,17 +335,27 @@ def index_workspace(
     for i in range(0, len(docs), batch_size):
         collection.upsert(documents=docs[i : i + batch_size], ids=ids[i : i + batch_size])
 
-    log.info("code_indexer: indexed %d files into code_context (root=%s)", len(docs), workspace_root)
+    log.info(
+        "code_indexer: indexed %d files into %s (root=%s)",
+        len(docs),
+        collection_name,
+        workspace_root,
+    )
     return len(docs)
 
 
-def query_code_context(query: str, chroma_path: str, n: int = 5) -> list[str]:
+def query_code_context(
+    query: str,
+    chroma_path: str,
+    n: int = 5,
+    collection_name: str = "code_context",
+) -> list[str]:
     """Return the top-n relevant code context snippets for a query.
 
     Returns an empty list if the collection is empty or a query error occurs.
     """
     try:
-        collection = _get_collection(chroma_path)
+        collection = _get_collection(chroma_path, collection_name=collection_name)
         count = collection.count()
         if count == 0:
             return []
@@ -338,12 +370,18 @@ def start_background_index(
     workspace_root: str,
     chroma_path: str,
     index_paths: list[str] | None = None,
+    collection_name: str = "code_context",
 ) -> None:
     """Launch index_workspace in a daemon thread so startup is non-blocking."""
 
     def _run() -> None:
         try:
-            count = index_workspace(workspace_root, chroma_path, index_paths)
+            count = index_workspace(
+                workspace_root,
+                chroma_path,
+                index_paths,
+                collection_name=collection_name,
+            )
             log.info("code_indexer: background index complete (%d files)", count)
         except Exception as exc:
             log.error("code_indexer: background index failed: %s", exc, exc_info=True)

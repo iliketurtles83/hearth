@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -47,6 +47,7 @@ from music_fastpath import parse_music_command, format_music_response
 from routes.auth_routes import create_auth_router
 from routes.code_file_routes import create_code_file_router
 from routes.memory_tool_routes import create_memory_tool_router
+from routes.project_routes import create_project_router
 from app_schemas import (
     ChatRequest as BaseChatRequest,
     TTSRequest,
@@ -54,6 +55,7 @@ from app_schemas import (
     SessionSelectRequest,
 )
 import tts
+from projects import ProjectStore
 
 _BACKEND_DIR = os.path.dirname(__file__)
 if _BACKEND_DIR not in sys.path:
@@ -150,6 +152,7 @@ class CodeRequest(BaseCodeRequest):
 WAKEWORD_MODEL_FILE = os.getenv("WAKEWORD_MODEL_FILE", "computer_v2.onnx")
 OWW_MELSPEC_MODEL_FILE = os.getenv("OWW_MELSPEC_MODEL_FILE", "melspectrogram.onnx")
 OWW_EMBEDDING_MODEL_FILE = os.getenv("OWW_EMBEDDING_MODEL_FILE", "embedding_model.onnx")
+WAKEWORD_THRESHOLD = float(os.getenv("WAKEWORD_THRESHOLD", "0.5"))
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "").strip().lower()
@@ -183,11 +186,21 @@ AUTH_COOKIE_NAME: str = os.getenv("AUTH_COOKIE_NAME", "auth_token")
 
 
 _code_write_lock = Lock()
+# NOTE: single-worker assumption. _pending_code_writes (and the lazily-loaded
+# model singletons / fallback graph below) are per-process in-memory state. Do
+# NOT run the backend with `uvicorn --workers N` (N > 1): a write confirmation
+# could land on a different worker than the one that created the pending entry,
+# producing spurious "Pending write not found" 404s. Move this state to the
+# SQLite store before scaling to multiple workers.
 _pending_code_writes: dict[str, dict] = {}
 
 # ── Auth service (shared singleton) ───────────────────────────────────────────
 _auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
 auth_service = AuthService(os.getenv("AUTH_DB_PATH", _auth_db_default))
+project_store = ProjectStore(
+    db_path=os.getenv("AUTH_DB_PATH", _auth_db_default),
+    code_workspace_root=os.getenv("CODE_WORKSPACE_ROOT", ""),
+)
 
 # ── Startup validation ─────────────────────────────────────────────────────────
 def _required_wake_models() -> list[str]:
@@ -325,6 +338,7 @@ _API_PATH_PREFIXES = (
     "/music",
     "/weather",
     "/tts",
+    "/projects",
     "/auth/me",
     "/auth/logout",
 )
@@ -431,6 +445,12 @@ _assistant_graph = None  # type: ignore[assignment]
 @asynccontextmanager
 async def _graph_lifespan(_app: FastAPI):
     global _assistant_graph
+    try:
+        purged = auth_service.purge_expired_tokens()
+        if purged:
+            log.info("auth.tokens.purged | count=%d", purged)
+    except Exception as exc:
+        log.warning("auth.tokens.purge_failed | error=%s", exc)
     embed_router = None
     try:
         embed_router, embed_snapshot = await build_embedding_router()
@@ -557,6 +577,13 @@ app.include_router(
         code_write_lock=_code_write_lock,
         pending_code_writes=_pending_code_writes,
         log=log,
+    )
+)
+
+app.include_router(
+    create_project_router(
+        project_store=project_store,
+        chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
     )
 )
 
@@ -712,8 +739,25 @@ def _make_graph_deps(*, embedding_router=None) -> AssistantGraphDependencies:
     )
 
 
-_assistant_graph = build_assistant_graph(_make_graph_deps())
-log.info("graph.ready | checkpointer=none (no-checkpoint mode; Slice 5 adds AsyncSqliteSaver)")
+def _resolve_graph_runner():
+    """Return the active checkpointed graph, building a no-checkpoint fallback lazily.
+
+    The checkpointed graph is installed on ``app.state.assistant_graph`` by the
+    lifespan handler. If it is missing (lifespan failed or hasn't run yet), build
+    a no-checkpoint graph on first use and log a clear warning — running on it
+    means conversation persistence is silently disabled.
+    """
+    runner = getattr(app.state, "assistant_graph", None)
+    if runner is not None:
+        return runner
+    global _assistant_graph
+    if _assistant_graph is None:
+        log.warning(
+            "graph.fallback | checkpointed graph unavailable — building no-checkpoint "
+            "fallback graph; conversation persistence is DISABLED"
+        )
+        _assistant_graph = build_assistant_graph(_make_graph_deps())
+    return _assistant_graph
 
 
 @app.post("/chat")
@@ -722,6 +766,7 @@ async def chat(request: ChatRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id = cookie_session_id or str(uuid4())
     session_created = cookie_session_id is None
+    project_id = (request.project_id or "").strip() or None
     chat_source = _normalize_chat_source(request.source)
     effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
 
@@ -752,10 +797,20 @@ async def chat(request: ChatRequest, http_request: Request):
             if user_id:
                 try:
                     await asyncio.to_thread(
-                        memory_store.log_turn, session_id, user_id, "user", request.message
+                        memory_store.log_turn,
+                        session_id,
+                        user_id,
+                        "user",
+                        request.message,
+                        project_id,
                     )
                     await asyncio.to_thread(
-                        memory_store.log_turn, session_id, user_id, "assistant", response_text
+                        memory_store.log_turn,
+                        session_id,
+                        user_id,
+                        "assistant",
+                        response_text,
+                        project_id,
                     )
                 except Exception as exc:
                     log.warning("chat.music_fast.log_turn | session_id=%s error=%s", session_id, exc)
@@ -779,12 +834,13 @@ async def chat(request: ChatRequest, http_request: Request):
         "message": request.message,
         "system": effective_system,
         "source": chat_source,
+        "project_id": project_id or "",
         "modality": "voice" if chat_source == "voice" else "chat",
         # Pass image through state (ephemeral, not persisted to memory)
         "image_base64": request.image_base64,
         "image_mime": request.image_mime,
     }
-    graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
+    graph_runner = _resolve_graph_runner()
 
     async def generate():
         assistant_accumulated = ""
@@ -905,10 +961,10 @@ async def _clear_checkpoint_thread(session_id: str) -> None:
 
 
 @app.get("/chat/sessions")
-async def list_chat_sessions(http_request: Request):
+async def list_chat_sessions(http_request: Request, project_id: str | None = Query(default=None)):
     user_id: str = http_request.state.user_id
     current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    sessions = memory_store.list_sessions(user_id)
+    sessions = memory_store.list_sessions(user_id, project_id)
     return JSONResponse(
         {
             "sessions": sessions,
@@ -918,10 +974,10 @@ async def list_chat_sessions(http_request: Request):
 
 
 @app.get("/chat/session/messages")
-async def get_chat_session_messages(http_request: Request):
+async def get_chat_session_messages(http_request: Request, project_id: str | None = Query(default=None)):
     user_id: str = http_request.state.user_id
     session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
-    turns = memory_store.get_session_turns(session_id, user_id, limit=500)
+    turns = memory_store.get_session_turns(session_id, user_id, limit=500, project_id=project_id)
     response = JSONResponse({"session_id": session_id, "messages": turns})
     _set_session_cookie(response, session_id)
     return response
@@ -937,9 +993,13 @@ async def create_chat_session(http_request: Request):
 
 
 @app.post("/chat/session/select")
-async def select_chat_session(payload: SessionSelectRequest, http_request: Request):
+async def select_chat_session(
+    payload: SessionSelectRequest,
+    http_request: Request,
+    project_id: str | None = Query(default=None),
+):
     user_id: str = http_request.state.user_id
-    sessions = memory_store.list_sessions(user_id)
+    sessions = memory_store.list_sessions(user_id, project_id)
     if not any(s.get("session_id") == payload.session_id for s in sessions):
         return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
 
@@ -949,16 +1009,20 @@ async def select_chat_session(payload: SessionSelectRequest, http_request: Reque
 
 
 @app.delete("/chat/sessions/{session_id}")
-async def delete_chat_session(session_id: str, http_request: Request):
+async def delete_chat_session(
+    session_id: str,
+    http_request: Request,
+    project_id: str | None = Query(default=None),
+):
     user_id: str = http_request.state.user_id
     current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
 
-    memory_store.delete_session(session_id, user_id)
+    memory_store.delete_session(session_id, user_id, project_id=project_id)
     await _clear_checkpoint_thread(session_id)
 
     next_session_id: str | None = None
     if current_session_id == session_id:
-        sessions = memory_store.list_sessions(user_id)
+        sessions = memory_store.list_sessions(user_id, project_id)
         next_session_id = sessions[0]["session_id"] if sessions else str(uuid4())
 
     payload: dict[str, object] = {"ok": True, "session_id": session_id}
@@ -972,10 +1036,10 @@ async def delete_chat_session(session_id: str, http_request: Request):
 
 
 @app.delete("/chat/session")
-async def reset_chat_session(http_request: Request):
+async def reset_chat_session(http_request: Request, project_id: str | None = Query(default=None)):
     user_id: str = http_request.state.user_id
     session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
-    memory_store.reset_session(session_id, user_id)
+    memory_store.reset_session(session_id, user_id, project_id=project_id)
     await _clear_checkpoint_thread(session_id)
     response = JSONResponse({"ok": True, "session_id": session_id})
     _set_session_cookie(response, session_id)
@@ -1037,8 +1101,8 @@ async def wake_websocket(ws: WebSocket):
             if not isinstance(prediction, dict):
                 prediction = {}
             score = float(prediction.get("computer_v2", 0.0) or 0.0)
-            log.debug("Wake score: %.3f (threshold: 0.5)", score)
-            if score > 0.5:
+            log.debug("Wake score: %.3f (threshold: %.3f)", score, WAKEWORD_THRESHOLD)
+            if score > WAKEWORD_THRESHOLD:
                 log.info("Wake word detected — score: %.3f", score)
                 await ws.send_json({"event": "wake", "score": round(float(score), 3)})
                 model.reset()
@@ -1078,6 +1142,7 @@ async def code(request: CodeRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id = cookie_session_id or str(uuid4())
     session_created = cookie_session_id is None
+    project_id = (request.project_id or "").strip() or None
     code_source = _normalize_chat_source(request.source)
     effective_system = request.system or CODE_DEFAULT_SYSTEM_PROMPT
 
@@ -1087,10 +1152,11 @@ async def code(request: CodeRequest, http_request: Request):
         "message": request.message,
         "system": effective_system,
         "source": code_source,
+        "project_id": project_id or "",
         "force_code": True,
     }
 
-    graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
+    graph_runner = _resolve_graph_runner()
 
     async def generate():
         assistant_accumulated = ""
