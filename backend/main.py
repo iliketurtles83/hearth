@@ -585,6 +585,7 @@ app.include_router(
     create_project_router(
         project_store=project_store,
         chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
+        coder_model=CODER_MODEL,
     )
 )
 

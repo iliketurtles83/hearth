@@ -252,3 +252,13 @@ def test_projects_require_auth(project_env):
 
     resp = client.get("/projects")
     assert resp.status_code == 401
+
+
+def test_projects_config_returns_coder_model(authed_client):
+    client, _main_mod = authed_client
+    headers = {"Authorization": "Bearer ok"}
+
+    resp = client.get("/projects/config", headers=headers)
+    assert resp.status_code == 200
+    payload = resp.json()
+    assert isinstance(payload.get("coder_model"), str)

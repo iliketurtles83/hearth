@@ -29,6 +29,7 @@ def create_project_router(
     *,
     project_store,
     chroma_path: str,
+    coder_model: str,
 ) -> APIRouter:
     router = APIRouter()
     def _project_collection_name(project_id: str) -> str:
@@ -190,6 +191,10 @@ def create_project_router(
         except ProjectError as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
         return JSONResponse({"projects": projects})
+
+    @router.get("/projects/config")
+    async def projects_config(_http_request: Request):
+        return JSONResponse({"coder_model": coder_model})
 
     @router.get("/projects/{project_id}")
     async def get_project(project_id: str, http_request: Request):
