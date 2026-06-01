@@ -13,13 +13,13 @@ When this section conflicts with historical roadmap notes below, follow this sec
 - Phase 8 includes the deterministic music pre-router (`_parse_music_command`) that bypasses the LLM for clear music commands, compound title+artist search, and year/decade range playback.
 - Phase 9 TTS is complete (Piper + Kokoro engines, `/tts` endpoint, barge-in, voice SSE metadata).
 - Phase 10a LangGraph migration is complete (graph skeleton, checkpointing, all nodes wired, `/graph/state` endpoint, checkpoint resume test passing).
-- Phase 10b code tool node is complete (ReAct loop, tree-sitter indexer, ChromaDB code_context collection, confirmation-gated writes, workspace-root enforcement, /code endpoints). The code tool is now scoped to voice-driven code *questions* only — file writes are frozen pending an external coding agent integration (see Phase 13b).
+- Phase 10b code tool node is complete (ReAct loop, tree-sitter indexer, ChromaDB code_context collection, confirmation-gated writes, workspace-root enforcement, /code endpoints). Main-chat code remains scoped to voice-driven code *questions*; project-scoped coding work is handled by the Projects roadmap (`roadmap.4.md`).
 - Phase 10c responder/modality split is complete (voice compression, fact-drift test, tone field wired as nullable).
 - Phase 10d ChromaDB cleanup is complete (conversation_memory collection, auto-migration from assistant_memories, consolidated column on summaries table, 6 isolation tests passing).
 - Phase 11 is complete (shipped as a single Hearth character prompt in `backend/hearth_prompt.txt`; tone_probe, persona_renderer, /persona endpoints, and persona UI panel were removed).
 - Phase 12 is complete (three-tier memory: working/episodic/semantic; consolidation worker; tiered retrieval; `GET /memory/episodic`, `POST /memory/consolidate`; tier badges in memory panel). The consolidation worker currently uses regex-based candidate extraction — this is the known gap addressed in Phase 12b.
 - Phase 12b is complete
-- Phase 13 is complete (AgentAPI adapter `backend/tools/coding_agent.py` fully implemented; `code-write` intent split from `code-question` in router; confirmation gate nodes `coding_agent_tool` + `coding_agent_executor` wired in graph; code context injection from ChromaDB working; modality-aware responder for voice/chat; test coverage complete with 143 tests passing). **Aider integration testing still pending.**
+- Phase 13 (external coding-agent integration) is retired. Its reusable pieces were kept and repurposed for the internal project-scoped coding-agent path in `roadmap.4.md` (confirmation gate flow, project write routing, code-context injection, and result shaping).
 - Active models: `gemma:e4b` (chat) and `qwen2.5-coder:14b` (code) are both pulled and verified on this machine.
 - Wake-word voice is stable on desktop/Linux. Treat Android/mobile voice as requiring an HTTPS-capable LAN edge before calling it complete.
 
@@ -514,21 +514,21 @@ Acceptance:
 ---
 
 ### Phase 10b — Code tool node
-**Status: complete (scoped to code questions only — file writes frozen)**
+**Status: complete (main-chat code questions only)**
 **Estimate: 1 week**
 **Depends on: Phase 10a**
 
 Goal: Add a dedicated code assistant node to the graph with a ReAct loop, tree-sitter
-summaries, ChromaDB code context injection. File-write capability was built and is
-frozen pending external agent integration decision.
+summaries, and ChromaDB code context injection. Main-chat writes are intentionally
+not expanded here; project-scoped coding flow lives in `roadmap.4.md`.
 
 Design notes:
 - The `code_tool` node answers voice-driven code questions using project context
   retrieved from tree-sitter summaries stored in ChromaDB `code_context` collection.
-- File writes are NOT expanded further. The confirmation-gated write flow built in
-  this phase is frozen in place — do not invest in improving or extending it.
+- File writes are NOT expanded further for main chat. The confirmation-gated flow
+  built in this phase is reused by project-scoped coding work.
 - The ReAct loop, tree-sitter indexer, and code_context ChromaDB collection remain
-  as the context-retrieval foundation for the future external agent adapter (Phase 13b).
+  foundational for project-scoped coding in `roadmap.4.md`.
 
 Tasks — all complete:
 - ✅ Add `active_files: list[str]` and `code_context: str` to `AssistantState`.
@@ -837,107 +837,30 @@ Implementation notes:
 
 ---
 
-### Phase 13 — Voice-activated external coding agent integration
-**Status: complete (AgentAPI adapter wired; Aider integration pending)**
+### Phase 13 — External coding-agent integration (retired)
+**Status: retired / superseded by project-scoped coding (`roadmap.4.md`)**
 **Estimate: 3–5 days**
 **Depends on: Phase 12b**
 
-Goal: Connect Hearth to an external coding agent (Aider, Continue.dev, or similar)
-via a thin HTTP adapter. Hearth handles voice activation, intent routing, and
-response formatting. The external agent handles all code generation, file editing,
-and agentic reasoning. Hearth does not implement any of that logic itself.
+This phase is no longer an active direction. External-agent integration was
+dropped in favor of an internal coding agent centered on Projects workspace.
 
-Design rationale:
-Hearth's `code_tool` node handles code *questions* well using tree-sitter context.
-Actual code generation and file editing is a specialized problem that mature tools
-(Aider, Continue.dev) have solved better than a hand-rolled ReAct loop can. The
-correct architecture is Hearth as a voice-activated orchestrator that delegates to
-the best available tool, not Hearth as a coding agent itself.
+Salvaged/reused work:
+- ✅ `coding_agent_tool` confirmation-gate UX and pending-task state flow.
+- ✅ `coding_agent_executor` result-shaping path (voice summary vs chat detail).
+- ✅ `code_context` injection pattern from `memory_retrieval`.
+- ✅ `code-question` vs coding-task split that keeps main chat lighter.
 
-Architecture:
-```
-Voice → Hearth intent_classifier (code-write intent detected)
-  → tool_router → coding_agent_tool
-      → POST http://localhost:{CODING_AGENT_PORT}/task
-          { "task": str, "context": str, "session_id": str }
-      ← { "result": str, "files_changed": list[str], "status": str }
-  → responder (voice: summarize changes; chat: full diff/result)
-  → TTS (for voice flows)
-```
-
-The external coding agent runs as a separate service on the local machine. Hearth
-does not manage its lifecycle — it is started independently by the user.
-
-Implementation notes:
-- ✅ New tool module: `backend/tools/coding_agent.py` following the standard
-  `async def run(params: dict) -> dict` interface. Implements full AgentAPI protocol:
-  POST /message to send task, GET /status to poll for completion, SSE /events to
-  stream output. Handles connection errors, timeouts, JSON parsing, event deduplication.
-- ✅ `CODING_AGENT_URL` env var (default: `http://localhost:3284`). Never hardcode.
-- ✅ If the coding agent is unreachable: return a clear user-visible error with startup
-  command, suggest running `agentapi server -- aider --model ollama/qwen2.5-coder:7b`.
-  Never silent failure. Returns `retryable=True` so user can retry after starting agent.
-- ✅ Voice confirmation flow: `coding_agent_tool` node presents task to user and waits
-  for verbal confirmation (voice: "Got it. [task preview]. Say yes to confirm, or tell
-  me what to change." chat: "Type **yes** to confirm, or describe what you want changed.")
-  before dispatching to AgentAPI. Mirrors pattern from Phase 10b.
-- ✅ The `code_context` ChromaDB collection built in Phase 10b is retrieved in
-  `memory_retrieval` node for all code intents, stored in state, and injected into
-  the task payload by `coding_agent_executor`. Agent receives full project context
-  without needing to re-index the codebase.
-- ✅ Keep the existing `code_tool` node for code *questions*. The `coding_agent_tool`
-  is a separate node for code *write* intents. Intent classifier distinguishes between them.
-
-Intent routing:
-```
-"explain how this function works"  → code_tool (existing, question)
-"write a function that does X"     → coding_agent_tool (new, write)
-"fix the bug in music.py"          → coding_agent_tool (new, write)
-```
-
-The inner monologue routing decision distinguishes between `code-question`
-and `code-write` intents in `router.py`.
-
-Tasks — all complete:
-- ✅ Add `CODING_AGENT_URL` env var to `.env.example` and document.
-- ✅ Implement `backend/tools/coding_agent.py` with `async def run(params: dict) -> dict`.
-  Params: `{ "task": str, "context": str, "session_id": str }`.
-  Returns: `{ "result": str, "files_changed": list[str], "status": str }`.
-- ✅ Inject relevant `code_context` from ChromaDB into the task payload.
-  Memory_retrieval node retrieves code_context for code intents; coding_agent_executor passes to agent.
-- ✅ Add `coding_agent_tool` node to the graph (confirmation gate), wired from `tool_router` on `code-write` intent.
-- ✅ Add `coding_agent_executor` node to the graph (executes confirmed task), wired from intent_classifier on `confirm_agent_task`.
-- ✅ Intent classifier distinguishes `code-question` from `code-write` in router.py.
-- ✅ Implement voice confirmation gate: `coding_agent_tool` summarizes task and waits for "yes / confirm / go ahead".
-- ✅ Handle unreachable agent: structured error log + user-visible message with startup command.
-- ✅ Responder modality-aware handling: for voice flows, compress agent result to brief summary of files changed;
-  for chat flows, return full result with file list.
-
-**Status by Subfeature:**
-- ✅ AgentAPI HTTP adapter (`coding_agent.py`) — fully implemented with all protocol steps, error handling, timeouts
-- ✅ Confirmation gates (`coding_agent_tool` + `coding_agent_executor` nodes) — wired in graph with proper state transitions
-- ✅ Intent routing (`code-question` vs `code-write`) — implemented in router.py, heuristic + planner support
-- ✅ Code context injection — ChromaDB retrieval in memory_retrieval node, passed to agent in executor
-- ✅ Error messages and fallbacks — unreachable agent returns clear message, retryable flag set
-- ✅ Modality-aware responder — voice compression for brief summaries, chat returns full results
-- ✅ Tests — comprehensive coverage in test_coding_agent.py (7 test cases covering empty task, connect error, HTTP error, success, timeout, context injection, file deduplication)
-- ⏳ Aider integration (PENDING) — adapter is complete and ready for AgentAPI; Aider server connection not yet tested
-
-Acceptance:
-- ✅ "Computer, write a function that does X" routes to the external coding agent (code-write intent).
-- ✅ "Computer, explain how this function works" still routes to `code_tool` (code-question intent, no regression).
-- ✅ Voice confirmation is required before any code-write task is dispatched to AgentAPI.
-- ✅ If the coding agent service is not running, Hearth returns a clear error message with startup command.
-- ✅ The `code_context` ChromaDB slices are injected into the agent task payload.
-- ✅ Agent results are summarized for voice (brief, files changed) and returned in full for chat.
-- ⏳ Live Aider/AgentAPI server integration tested end-to-end (PENDING).
+Follow-up:
+- Continue implementation in `docs/roadmap.4.md` only.
+- Do not add new external coding-agent dependencies or setup requirements.
 
 ---
 
 ### Phase 14 — Vision input
 **Status: complete**
 **Estimate: 2–3 days**
-**Depends on: Phase 13**
+**Depends on: Phase 12b**
 
 Goal: Enable users to attach images to chat and ask questions about them.
 Hearth processes images end-to-end with a unified multimodal model, producing

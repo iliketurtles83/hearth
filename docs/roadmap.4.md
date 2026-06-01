@@ -502,7 +502,7 @@ from main chat entirely. That is out of scope for this roadmap.
       a `code-question` response with an "open a project" notice — no write
       is attempted.
 - [ ] `coding_agent_tool` with an empty `project_id` returns an error state
-      without contacting the external agent.
+      without dispatching any coding task.
 
 ### Phase 4
 - [ ] Project facts extracted after coding turns appear in `project_memory`.

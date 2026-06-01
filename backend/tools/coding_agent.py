@@ -1,28 +1,24 @@
 """
-Coding agent tool — AgentAPI HTTP adapter.
+Coding agent tool — HTTP runtime adapter.
 
-Sends tasks to an AgentAPI server (e.g. wrapping Aider) and returns structured results.
-Hearth handles voice activation, intent routing, context injection, and confirmation.
-The external agent handles all code generation, file editing, and agentic reasoning.
+Sends project coding tasks to a configured coding runtime endpoint and returns
+structured results for Hearth's project-scoped coding flow.
 
-AgentAPI protocol:
-  POST /message  {"message": str}               — send the task
-  GET  /status   → {"status": "stable"|"running"} — poll for completion
-  GET  /events   → SSE stream of agent output events
-
-Starting the agent (local Ollama, no cloud cost):
-  agentapi server -- aider --model ollama/qwen2.5-coder:7b
+Runtime protocol:
+  POST /message  {"message": str}                   — send the task
+  GET  /status   → {"status": "stable"|"running"}   — poll for completion
+  GET  /events   → SSE stream of runtime output events
 
 Normalised ToolResult.data schema:
 {
-    "result":        str,        # accumulated agent output text
-    "files_changed": list[str],  # paths of files the agent modified
+    "result":        str,        # accumulated runtime output text
+    "files_changed": list[str],  # paths of files modified by the task
     "status":        str,        # "success"
 }
 
 Environment variables:
-  CODING_AGENT_URL              Base URL of AgentAPI server (default: http://localhost:3284)
-  CODING_AGENT_TIMEOUT_SECONDS  Max seconds to wait for agent to finish (default: 120)
+  CODING_AGENT_URL              Base URL of coding runtime (default: http://localhost:3284)
+  CODING_AGENT_TIMEOUT_SECONDS  Max seconds to wait for completion (default: 120)
 """
 from __future__ import annotations
 
@@ -48,8 +44,8 @@ _STATUS_POLL_TIMEOUT: float = 5.0
 _POST_TIMEOUT: float = 10.0
 
 _UNREACHABLE_MSG = (
-    "The coding agent service is not running. "
-    "Start it with: agentapi server -- aider --model ollama/qwen2.5-coder:7b"
+    "The coding runtime is not available at CODING_AGENT_URL. "
+    "Start the configured runtime and try again."
 )
 
 
@@ -127,7 +123,7 @@ async def _poll_until_stable(
 
 
 async def run(params: dict) -> ToolResult:
-    """Send a coding task to the AgentAPI server and return the structured result.
+    """Send a coding task to the configured runtime and return the structured result.
 
     Params:
         task (str):       The coding task description.

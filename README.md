@@ -236,8 +236,7 @@ MEMORY_MIN_RELEVANCE_SCORE=0.28
 # TTS_KOKORO_LANG=en-us
 # TTS_KOKORO_SPEED=1.0
 
-# External coding agent — AgentAPI (Phase 13)
-# Start the agent separately: agentapi server -- aider --model ollama/qwen2.5-coder:7b
+# Project coding runtime adapter (used by project-scoped coding flow)
 # CODING_AGENT_URL=http://localhost:3284
 # CODING_AGENT_TIMEOUT_SECONDS=120
 
@@ -340,53 +339,18 @@ If you prefer a different Kokoro model variant, set `TTS_KOKORO_MODEL` in `.env`
 to the matching file path. The compose defaults point at the int8 model to keep
 download size and memory usage lower.
 
-## External Coding Agent — AgentAPI (Phase 13)
+## Project Coding Agent (Roadmap v4 direction)
 
-Voice-activated code-write tasks are dispatched to an external coding agent via
-[AgentAPI](https://github.com/coder/agentapi). Hearth acts as the orchestrator:
-intent routing, context injection, confirmation gate, and result formatting.
-The agent handles all code generation, file editing, and agentic reasoning.
+External coding-agent integration is retired. Coding work now moves toward the
+project-scoped internal path documented in `docs/roadmap.4.md`.
 
-### Setup
+Current behavior to preserve:
+1. Main chat keeps `code-question` for explain/how-does flows.
+2. Project sessions use `coding_agent_tool` + `coding_agent_executor` for coding tasks.
+3. Confirmation gating, code-context injection, and result formatting are reused from prior work.
 
-Install AgentAPI and Aider (or any AgentAPI-compatible agent):
-
-```bash
-# Install AgentAPI
-go install github.com/coder/agentapi@latest
-# or download a binary from the releases page
-
-# Install Aider
-pip install aider-chat
-```
-
-Start the agent (uses local Ollama, no cloud cost):
-
-```bash
-agentapi server -- aider --model ollama/qwen2.5-coder:7b
-```
-
-The default port is `3284`. Set `CODING_AGENT_URL` in `.env` if you use a
-different host or port. `CODING_AGENT_TIMEOUT_SECONDS` controls how long Hearth
-waits for the agent to finish (default: 120 s).
-
-### Usage
-
-Say or type a code-write request:
-
-> "Write a function that validates email addresses and add tests for it."
-
-Hearth will:
-1. Classify the intent as `code-write`.
-2. Present a confirmation summary ("Got it. [task]. Say yes to confirm").
-3. On confirmation, inject relevant ChromaDB code context and dispatch to AgentAPI.
-4. Stream back a summary of changed files (voice: brief spoken summary; chat: full list).
-
-Code *questions* (explain, walk through, how does) still route to the local
-`code_tool` — no regression, no agent required for those.
-
-If the agent service is not running when a code-write is confirmed, Hearth
-returns a clear error message with the startup command rather than failing silently.
+`CODING_AGENT_URL` remains as a runtime adapter setting while project coding is
+being completed. If unavailable, Hearth returns a clear user-visible error.
 
 - The backend includes a local music tool that uses [Beets](https://beets.io/) as
   the music library and MPD for playback.
@@ -540,5 +504,4 @@ Safety behavior:
 - [sqlite3](https://www.sqlite.org/index.html) and [ChromaDB](https://www.trychroma.com/) for a powerful hybrid memory solution.
 - [openmeteo](https://open-meteo.com/) for free weather data with a simple API.
 - [beets](https://beets.io/) for local music library management (tag-based, offline-first).
-
 

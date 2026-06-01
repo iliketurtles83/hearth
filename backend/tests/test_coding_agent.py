@@ -1,4 +1,4 @@
-"""Tests for backend/tools/coding_agent.py — AgentAPI HTTP adapter.
+"""Tests for backend/tools/coding_agent.py — coding runtime HTTP adapter.
 
 Coverage:
   1. Empty task → immediate failure (no HTTP calls made)
@@ -86,7 +86,7 @@ async def test_connect_error_returns_retryable_failure():
 
     assert not result.ok
     assert result.retryable
-    assert "not running" in result.error.lower() or "agentapi" in result.error.lower()
+    assert "not available" in result.error.lower() or "coding runtime" in result.error.lower()
 
 
 # ── 3. HTTP error on POST → non-retryable ─────────────────────────────────────

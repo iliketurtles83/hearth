@@ -1303,10 +1303,11 @@ def build_assistant_graph(
         }
 
     async def coding_agent_tool(state: AssistantState) -> dict[str, Any]:
-        """Confirmation gate for coding tasks dispatched to the external coding agent.
+        """Confirmation gate for project-scoped coding tasks.
 
         Presents the planned task to the user and waits for explicit confirmation
-        before dispatching to AgentAPI. Sets awaiting_agent_confirmation=True and
+        before dispatching to the coding runtime adapter. Sets
+        awaiting_agent_confirmation=True and
         stores the task in pending_code_task state.
         """
         writer = get_stream_writer()
@@ -1332,7 +1333,7 @@ def build_assistant_graph(
             )
         else:
             confirm_text = (
-                "I'll send this task to the external coding agent:\n\n"
+                "I'll run this coding task in the current project:\n\n"
                 f"> {task}\n\n"
                 "Type **yes** to confirm, or describe what you want changed."
             )
@@ -1351,7 +1352,7 @@ def build_assistant_graph(
         }
 
     async def coding_agent_executor(state: AssistantState) -> dict[str, Any]:
-        """Execute a confirmed coding task via the external AgentAPI adapter.
+        """Execute a confirmed coding task via the coding-agent runtime adapter.
 
         Reads pending_code_task and code_context from state, calls coding_agent.run(),
         shapes the result based on modality, and clears the confirmation flags.

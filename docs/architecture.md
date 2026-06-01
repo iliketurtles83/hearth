@@ -59,10 +59,10 @@ runtime code.
 
 ## Locked architecture decisions
 
-- **Hearth does not implement its own coding agent.** The `code_tool` node handles voice-driven code *questions* (explain, describe, answer) but does not write files. File generation is deferred to an external coding agent service (Aider, Continue.dev, or similar) that Hearth will call as a thin tool adapter in a future phase.
-- The `code_tool` node stays in the graph for code question routing. Do not remove it. Do not expand it with new file-write capability. The ReAct loop and tree-sitter indexer built in Phase 10b remain in place — they are the context-retrieval foundation for code questions and for the future external agent adapter.
-- The tree-sitter indexer in `code_context` ChromaDB collection is frozen at current capability. Do not invest in improving it until the external agent integration path is decided.
-- The coding assistant is NOT a VS Code extension. Future voice-activated coding connects to an external service via HTTP, not through IDE plugin APIs.
+- **Hearth implements its own project-scoped coding agent path.** Main-chat code stays `code-question` only; coding writes run through project-scoped `coding_agent_tool`/`coding_agent_executor` flows.
+- The `code_tool` node stays in the graph for code-question routing in main chat. Keep that boundary clear: main chat answers code questions; project sessions handle coding work.
+- The ReAct loop and tree-sitter indexer in `code_context` are core context infrastructure for both code questions and project coding sessions; continue evolving them as needed.
+- The coding assistant is NOT a VS Code extension. Coding remains local-first within Hearth's own backend/runtime paths, not IDE plugin APIs.
 - Sub-agent architecture (previously Phase 14) is shelved indefinitely. Do not implement task decomposer, critic, or synthesizer subgraphs. A single well-prompted agent with tool access is sufficient for Hearth's use cases.
 - The deterministic music pre-router (`_parse_music_command()` in the HTTP handler) stays in place, by design. It guards the graph invocation for high-confidence music commands and is never moved into the graph.
 - All frontend API calls use relative paths. No hardcoded hosts or ports in runtime code.
@@ -98,5 +98,4 @@ class AssistantState(TypedDict):
 ```
 
 ---
-
 
