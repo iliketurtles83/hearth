@@ -211,14 +211,39 @@ header. This is a static string fetched from `GET /health` or a new
 ### 2.5 Back to chat
 
 A "← Back to Chat" button in the project header restores the normal chat
-view and disconnects the project context from subsequent messages.
-Or should the projects chats part remain throughout?
+view and disconnects the project context from subsequent messages. Project
+chats remain inside the project panel — they are not surfaced in the main
+chat history and do not contaminate the global session list.
 
-### 2.6 Session continuity
+### 2.6 Per-project chat sessions
 
-Each project gets its own session namespace. When re-entering a project, the
-previous session resumes (same `project_id` in `conversation_log`). Session
-list endpoint already supports filtering; add `?project_id=` query param.
+Each project maintains its own list of chat sessions. When re-entering a
+project the last active session resumes automatically (session ID persisted
+in `localStorage` per project). Users can start a new session or switch
+between past sessions without leaving the project view.
+
+**Session list UI** (left sidebar, below the file tree):
+
+```
+[ + New Chat ]
+──────────────────────────────
+▸ Add error handling to router   today
+  Plan index isolation strategy  yesterday
+  Initial project setup          3d ago
+```
+
+Each row shows an auto-generated name (first ~50 chars of the opening
+message) and a relative timestamp. Clicking a row loads that session's
+history.
+
+**Backend additions:**
+- `GET /sessions?project_id={id}` — returns sessions scoped to the project,
+  ordered by most recent activity. Each record includes `session_id`,
+  `name` (first message excerpt), and `last_active`.
+- `PATCH /sessions/{session_id}` with `{"name": "..."}` — allows renaming
+  a session.
+- `DELETE /sessions/{session_id}` — removes all `conversation_log` rows for
+  that session (scoped to `user_id`). Does not affect `project_memory`.
 
 ---
 
@@ -233,10 +258,14 @@ routes directly to the coder model.
 ```python
 project_id:      str   # "" for main chat
 project_folder:  str   # resolved absolute path, "" for main chat
+project_mode:    str   # "plan" | "code"; "" for main chat
 ```
 
-Both set by the HTTP chat handler when the request carries a `project_id`
-field (new optional field in `ChatRequest`).
+All three set by the HTTP chat handler when the request carries a
+`project_id` field (new optional field in `ChatRequest`). `project_mode`
+defaults to `"code"` when `project_id` is non-empty and the field is
+absent from the request (safe default — plan/code toggle is a Phase 3.5
+addition and older clients omit it).
 
 ### 3.2 `memory_retrieval` node
 
@@ -247,12 +276,19 @@ If `state["project_id"]` is non-empty:
 
 ### 3.3 `intent_classifier` shortcut
 
-If `project_id` is set, skip intent classification entirely. Return:
+If `project_id` is set, skip intent classification entirely. For now,
+unconditionally return `code-write` so the full coding pipeline is active:
+
 ```python
 {"intent": "code-write", "confidence": 1.0, "route_type": "coding_agent"}
 ```
-The project UI is already a coding context — do not spend tokens re-classifying.
-This is the key simplification for the main chat classifier.
+
+The project UI is already a coding context — do not spend tokens
+re-classifying. This is the key simplification for the main chat classifier.
+
+**Note:** Phase 3.5 replaces this with a mode-aware branch that returns
+`code-question` routing when `project_mode == "plan"`. The shortcut
+structure stays identical; only the returned intent changes.
 
 ### 3.4 `tool_router` shortcut
 
@@ -300,6 +336,107 @@ from the main chat path:
   agent. Belt-and-suspenders against future topology mistakes.
 - `code_tool` (questions only) remains a normal `tool_router` edge for
   `code-question` in main chat. It is not touched by this phase.
+
+---
+
+## Phase 3.5 — Per-project sessions and plan/code modes
+
+**Scope:** Activate multi-session UX within each project and introduce two
+explicit interaction modes. Both build directly on Phase 3 infrastructure
+(`project_id` in state, classifier shortcut, coding-agent isolation) with no
+new graph nodes required.
+
+### 3.5.1 Per-project chat sessions
+
+The `conversation_log.project_id` column (Phase 1) already scopes messages
+correctly. This section activates the multi-session UX within a project.
+
+**Backend:**
+- Confirm `GET /sessions?project_id={id}` returns per-project sessions
+  ordered by most recent activity, with `session_id`, auto-generated `name`
+  (first 50 chars of opening message), and `last_active` timestamp.
+- Add `PATCH /sessions/{session_id}` — accepts `{"name": "..."}` to let
+  users rename sessions. Scoped to `user_id`.
+- Add `DELETE /sessions/{session_id}` — removes all `conversation_log` rows
+  for that session (scoped to `user_id`). Does not touch `project_memory`.
+  Requires confirmation from the UI before calling.
+
+**Frontend:**
+- Project panel left sidebar gains a collapsible **Chats** section below
+  the file tree:
+  ```
+  [ + New Chat ]
+  ──────────────────────────────
+  ▸ Add error handling to router   today
+    Plan index isolation strategy  yesterday
+    Initial project setup          3d ago
+  ```
+- Active session highlighted; clicking a past row loads its history via
+  `GET /chat/history?session_id={id}`.
+- "New Chat" generates a fresh `session_id` (UUID) and clears the chat panel.
+- Session name is editable inline (double-click); calls `PATCH /sessions/{id}`.
+- Active `session_id` persisted in `localStorage` per project so re-opening
+  a project resumes the last active session.
+
+### 3.5.2 Plan / Code mode
+
+Two explicit modes per project, toggled in the project header. Mode is a
+project-level preference (not per-session) and is persisted in `localStorage`.
+
+| | Plan | Code |
+|---|---|---|
+| Purpose | Discuss, review, architect, question | Write, create, edit files |
+| Graph path | `code_tool` (questions) | `coding_agent_tool` → `coding_agent_executor` |
+| File writes | Never | With confirmation gate |
+| Header badge | **Plan** | **Code** |
+| Input placeholder | "Ask about this project, review code, plan changes…" | "Describe the change to make…" |
+
+**Backend — `ChatRequest`:**
+
+Add optional field `project_mode: str` (`"plan"` | `"code"`, default `"code"`
+when absent). The HTTP handler passes it into `AssistantState` (already added
+in 3.1).
+
+**Backend — `intent_classifier` shortcut (replaces Phase 3.3 placeholder):**
+
+```python
+if state["project_id"]:
+    if state.get("project_mode") == "plan":
+        return {"intent": "code-question", "confidence": 1.0, "route_type": "code_tool"}
+    else:  # "code" or default
+        return {"intent": "code-write", "confidence": 1.0, "route_type": "coding_agent"}
+```
+
+Plan mode reuses the existing `code_tool` node (already in the graph for
+`code-question`). No new node needed.
+
+**Backend — `coding_agent_tool` guard (extends Phase 3.7):**
+
+Extend the existing empty-`project_id` guard to also reject calls where
+`project_mode == "plan"`:
+
+```python
+if not state.get("project_id"):
+    return error_state("coding_agent_tool requires a project context")
+if state.get("project_mode") == "plan":
+    return error_state(
+        "File writes are disabled in Plan mode. Switch to Code mode to make changes."
+    )
+```
+
+Belt-and-suspenders: the classifier shortcut already prevents this path in
+Plan mode; the guard catches any future topology mistake.
+
+**Frontend:**
+
+- Two-segment toggle `[ Plan | Code ]` in the project header, right of the
+  model indicator.
+- Default is **Code** mode on first project open.
+- Mode stored in `localStorage` keyed by `project_id`.
+- Mode sent with every chat request as `"project_mode"` in the JSON body.
+- In Plan mode: "Confirm write" button is hidden from any pending
+  `coding_agent` tool outputs (defensively, since the backend guard should
+  prevent reaching that state).
 
 ---
 
@@ -503,6 +640,24 @@ from main chat entirely. That is out of scope for this roadmap.
       is attempted.
 - [ ] `coding_agent_tool` with an empty `project_id` returns an error state
       without dispatching any coding task.
+
+### Phase 3.5
+- [ ] `GET /sessions?project_id={id}` returns only sessions for that project,
+      ordered by most recent activity.
+- [ ] "New Chat" button in the project panel creates a fresh session; chat
+      panel clears and the new session appears at the top of the list.
+- [ ] Switching to a past session loads its history without leaving the project view.
+- [ ] Session rename (`PATCH /sessions/{id}`) updates the sidebar label.
+- [ ] `DELETE /sessions/{id}` removes all conversation rows; other sessions
+      in the same project are unaffected.
+- [ ] Mode toggle switches between Plan and Code; selection persists across
+      project re-opens (via `localStorage`).
+- [ ] In Plan mode, a message requesting a file write receives a `code_tool`
+      response (no write attempted); backend logs confirm `code_tool` node was used.
+- [ ] In Code mode, the full `coding_agent_tool` → `coding_agent_executor`
+      pipeline is reachable and confirmation gate appears as normal.
+- [ ] `coding_agent_tool` called with `project_mode == "plan"` returns the
+      "disabled in Plan mode" error without dispatching any coding task.
 
 ### Phase 4
 - [ ] Project facts extracted after coding turns appear in `project_memory`.

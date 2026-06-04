@@ -716,6 +716,29 @@
     }
   }
 
+  async function ensureProjectIndexStartedOnOpen() {
+    if (!currentProject?.id) return;
+    try {
+      const statusResp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(currentProject.id)}/index/status`, {
+        credentials: 'same-origin',
+      });
+      if (!statusResp.ok) return;
+      const status = await statusResp.json();
+      if (status.status !== 'idle') return;
+
+      const startResp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(currentProject.id)}/index`, {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      if (!startResp.ok) {
+        throw new Error(`HTTP ${startResp.status}`);
+      }
+      _setProjectIndexStatus('Indexing…');
+    } catch (err) {
+      _setProjectIndexStatus(`Unable to start index: ${err.message}`, 'error');
+    }
+  }
+
   async function openProject(projectId) {
     closeSidebar();
     try {
@@ -738,6 +761,7 @@
         renderProjectFiles(payload.files || []);
       }
       await Promise.all([refreshSessions(), loadCurrentSessionMessages(), refreshProjects()]);
+      await ensureProjectIndexStartedOnOpen();
       startProjectIndexPolling();
     } catch (err) {
       appendMessage('assistant', `⚠ Unable to open project: ${err.message}`);
