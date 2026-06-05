@@ -6,18 +6,7 @@
   const stopBtn = document.getElementById('stop-btn');
   const sessionListEl = document.getElementById('session-list');
   const sessionNewBtn = document.getElementById('session-new-btn');
-  const sessionsPanel = document.getElementById('sessions-panel');
-  const projectsPanel = document.getElementById('projects-panel');
   const sidebarSectionChatsBtn = document.getElementById('sidebar-section-chats');
-  const sidebarSectionProjectsBtn = document.getElementById('sidebar-section-projects');
-  const projectListEl = document.getElementById('project-list');
-  const projectNewBtn = document.getElementById('project-new-btn');
-  const projectCreateForm = document.getElementById('project-create-form');
-  const projectNameInput = document.getElementById('project-name-input');
-  const projectFolderInput = document.getElementById('project-folder-input');
-  const projectDescriptionInput = document.getElementById('project-description-input');
-  const projectGitInitInput = document.getElementById('project-git-init-input');
-  const projectCreateCancelBtn = document.getElementById('project-create-cancel-btn');
   const memoryListEl = document.getElementById('memory-list');
   const memoryClearBtn = document.getElementById('memory-clear-btn');
   const memoryPanel = document.getElementById('memory-panel');
@@ -29,24 +18,9 @@
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
   const ttsEnableBtn = document.getElementById('tts-enable-btn');
   const ttsStopBtn = document.getElementById('tts-stop-btn');
-  const projectHeader = document.getElementById('project-header');
-  const projectBackBtn = document.getElementById('project-back-btn');
-  const projectTitleEl = document.getElementById('project-title');
-  const projectModelIndicatorEl = document.getElementById('project-model-indicator');
-  const projectReindexBtn = document.getElementById('project-reindex-btn');
-  const projectFilesPane = document.getElementById('project-files-pane');
-  const projectFilesListEl = document.getElementById('project-files-list');
-  const projectIndexStatusEl = document.getElementById('project-index-status');
-  const projectFileViewerEl = document.getElementById('project-file-viewer');
-  const projectFileViewerPathEl = document.getElementById('project-file-viewer-path');
-  const projectFileViewerContentEl = document.getElementById('project-file-viewer-content');
 
   window.appUi = { messagesEl, messagesInner, input, sendBtn };
   let currentSessionId = null;
-  let currentSidebarSection = 'chats';
-  let currentProject = null;
-  let projectIndexPollTimer = null;
-  let coderModelName = '';
   let creatingNewSession = false;
   let ttsAudio = null;
   let pendingVoicePlayback = null;
@@ -258,78 +232,10 @@
     if (!isMobileLayout()) closeSidebar();
   });
 
-  function _slugifyProjectName(text) {
-    return String(text || '')
-      .toLowerCase()
-      .trim()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .slice(0, 64);
-  }
-
-  function _encodePath(path) {
-    return String(path || '')
-      .split('/')
-      .filter(Boolean)
-      .map(encodeURIComponent)
-      .join('/');
-  }
-
-  function _withProjectParam(path, projectId = currentProject?.id || '') {
-    const pid = String(projectId || '').trim();
-    if (!pid) return path;
-    const joiner = path.includes('?') ? '&' : '?';
-    return `${path}${joiner}project_id=${encodeURIComponent(pid)}`;
-  }
-
-  function _formatOpenedAt(ts) {
-    if (!ts) return 'never opened';
-    const deltaSec = Math.max(0, Math.floor(Date.now() / 1000 - Number(ts)));
-    if (deltaSec < 60) return 'opened now';
-    const minutes = Math.floor(deltaSec / 60);
-    if (minutes < 60) return `${minutes}m ago`;
-    const hours = Math.floor(minutes / 60);
-    if (hours < 24) return `${hours}h ago`;
-    const days = Math.floor(hours / 24);
-    if (days < 7) return `${days}d ago`;
-    const weeks = Math.floor(days / 7);
-    return `${weeks}w ago`;
-  }
-
   function _setSidebarSection(section) {
-    const target = section === 'projects' ? 'projects' : 'chats';
-    currentSidebarSection = target;
-    const inProjects = target === 'projects';
-    sidebarSectionChatsBtn?.classList.toggle('active', !inProjects);
-    sidebarSectionChatsBtn?.setAttribute('aria-pressed', String(!inProjects));
-    sidebarSectionProjectsBtn?.classList.toggle('active', inProjects);
-    sidebarSectionProjectsBtn?.setAttribute('aria-pressed', String(inProjects));
-    if (projectsPanel) projectsPanel.style.display = inProjects ? '' : 'none';
-    if (sessionsPanel) sessionsPanel.style.display = inProjects ? 'none' : '';
-    if (musicPanel) musicPanel.style.display = inProjects ? 'none' : '';
-    if (memoryPanel) memoryPanel.style.display = inProjects ? 'none' : '';
-  }
-
-  function _setProjectWorkspaceActive(active) {
-    if (projectHeader) projectHeader.style.display = active ? 'flex' : 'none';
-    if (projectFilesPane) projectFilesPane.style.display = active ? 'flex' : 'none';
-    if (!active && projectIndexStatusEl) projectIndexStatusEl.style.display = 'none';
-    if (!active && projectFileViewerEl) projectFileViewerEl.style.display = 'none';
-    if (!active) {
-      if (projectIndexPollTimer) {
-        clearInterval(projectIndexPollTimer);
-        projectIndexPollTimer = null;
-      }
-      currentProject = null;
-      resetMessagesView();
-    }
-  }
-
-  function _setProjectIndexStatus(text, level = 'info') {
-    if (!projectIndexStatusEl) return;
-    projectIndexStatusEl.textContent = text;
-    projectIndexStatusEl.style.display = text ? 'block' : 'none';
-    projectIndexStatusEl.style.color = level === 'error' ? '#ff8787' : 'var(--text-muted)';
+    const inChats = section === 'chats';
+    sidebarSectionChatsBtn?.classList.toggle('active', inChats);
+    sidebarSectionChatsBtn?.setAttribute('aria-pressed', String(inChats));
   }
 
   input.addEventListener('input', () => {
@@ -348,56 +254,7 @@
   sessionNewBtn?.addEventListener('click', startNewChat);
   memoryClearBtn?.addEventListener('click', clearAllMemory);
   sidebarSectionChatsBtn?.addEventListener('click', () => {
-    if (currentProject?.id) {
-      backToChat();
-      return;
-    }
     _setSidebarSection('chats');
-  });
-  sidebarSectionProjectsBtn?.addEventListener('click', () => {
-    _setSidebarSection('projects');
-    refreshProjects();
-  });
-  projectBackBtn?.addEventListener('click', backToChat);
-  projectReindexBtn?.addEventListener('click', triggerProjectReindex);
-  projectNewBtn?.addEventListener('click', () => toggleProjectCreateForm(projectCreateForm?.style.display === 'none'));
-  projectCreateCancelBtn?.addEventListener('click', () => toggleProjectCreateForm(false));
-  projectNameInput?.addEventListener('input', () => {
-    if (!projectFolderInput || projectFolderInput.dataset.manual === 'true') return;
-    projectFolderInput.value = _slugifyProjectName(projectNameInput.value);
-  });
-  projectFolderInput?.addEventListener('input', () => {
-    if (!projectFolderInput) return;
-    projectFolderInput.dataset.manual = projectFolderInput.value.trim() ? 'true' : '';
-  });
-  projectCreateForm?.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const name = projectNameInput?.value?.trim() || '';
-    const folderName = (projectFolderInput?.value?.trim() || _slugifyProjectName(name)).slice(0, 120);
-    if (!name || !folderName) return;
-    try {
-      const resp = await (window.apiFetch || fetch)('/projects', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'same-origin',
-        body: JSON.stringify({
-          name,
-          folder_name: folderName,
-          description: projectDescriptionInput?.value?.trim() || '',
-          git_init: Boolean(projectGitInitInput?.checked),
-        }),
-      });
-      if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}));
-        throw new Error(body.detail || `HTTP ${resp.status}`);
-      }
-      const project = await resp.json();
-      toggleProjectCreateForm(false);
-      await refreshProjects();
-      await openProject(project.id);
-    } catch (err) {
-      appendMessage('assistant', `⚠ Unable to create project: ${err.message}`);
-    }
   });
 
   function setLocked(locked) {
@@ -405,8 +262,6 @@
     input.disabled = locked;
     if (sessionNewBtn) sessionNewBtn.disabled = locked;
     if (memoryClearBtn) memoryClearBtn.disabled = locked;
-    if (projectNewBtn) projectNewBtn.disabled = locked;
-    if (projectReindexBtn) projectReindexBtn.disabled = locked;
     if (stopBtn) stopBtn.style.display = locked ? 'flex' : 'none';
     sendBtn.style.display = locked ? 'none' : 'flex';
   }
@@ -582,208 +437,6 @@
     }
   }
 
-  function renderProjects(projects) {
-    if (!projectListEl) return;
-    projectListEl.innerHTML = '';
-    if (!projects.length) {
-      const div = document.createElement('div');
-      div.className = 'list-item';
-      div.innerHTML = '<div class="list-item-title">No projects yet</div>';
-      projectListEl.appendChild(div);
-      return;
-    }
-
-    for (const project of projects) {
-      const item = document.createElement('div');
-      const active = currentProject?.id === project.id;
-      item.className = 'list-item' + (active ? ' active' : '');
-      const gitBadge = project.git ? '<span class="project-git-badge">git</span>' : '';
-      item.innerHTML = `
-        <div class="project-file-item">
-          <div class="list-item-title session-title">${_esc(project.name || 'Untitled')}</div>
-          ${gitBadge}
-        </div>
-        <div class="list-item-meta">${_esc(_formatOpenedAt(project.opened_at))}</div>
-      `;
-      item.addEventListener('click', () => openProject(project.id));
-      projectListEl.appendChild(item);
-    }
-  }
-
-  async function refreshProjects() {
-    try {
-      const resp = await (window.apiFetch || fetch)('/projects', { credentials: 'same-origin' });
-      if (!resp.ok) return;
-      const data = await resp.json();
-      renderProjects(data.projects || []);
-    } catch {
-      // non-fatal
-    }
-  }
-
-  async function refreshProjectConfig() {
-    try {
-      const resp = await (window.apiFetch || fetch)('/projects/config', { credentials: 'same-origin' });
-      if (!resp.ok) return;
-      const data = await resp.json();
-      coderModelName = String(data.coder_model || '').trim();
-    } catch {
-      // non-fatal
-    }
-  }
-
-  function renderProjectFiles(files = []) {
-    if (!projectFilesListEl) return;
-    projectFilesListEl.innerHTML = '';
-    if (!files.length) {
-      const row = document.createElement('div');
-      row.className = 'list-item';
-      row.innerHTML = '<div class="list-item-title">No files found</div>';
-      projectFilesListEl.appendChild(row);
-      return;
-    }
-    for (const relPath of files) {
-      const row = document.createElement('div');
-      row.className = 'list-item';
-      row.innerHTML = `<div class="list-item-title">${_esc(relPath)}</div>`;
-      row.addEventListener('click', () => openProjectFile(relPath));
-      projectFilesListEl.appendChild(row);
-    }
-  }
-
-  async function openProjectFile(projectRelativePath) {
-    if (!currentProject?.folder_name) return;
-    const fullPath = `${String(currentProject.folder_name).replace(/\/+$/, '')}/${String(projectRelativePath).replace(/^\/+/, '')}`;
-    try {
-      const resp = await (window.apiFetch || fetch)(`/code/files/${_encodePath(fullPath)}`, { credentials: 'same-origin' });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const data = await resp.json();
-      if (projectFileViewerPathEl) projectFileViewerPathEl.textContent = data.path || fullPath;
-      if (projectFileViewerContentEl) projectFileViewerContentEl.textContent = data.content || '';
-      if (projectFileViewerEl) projectFileViewerEl.style.display = 'flex';
-    } catch (err) {
-      appendMessage('assistant', `⚠ Unable to open file: ${err.message}`);
-    }
-  }
-
-  async function refreshProjectIndexStatus() {
-    if (!currentProject?.id) return;
-    try {
-      const resp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(currentProject.id)}/index/status`, { credentials: 'same-origin' });
-      if (!resp.ok) return;
-      const data = await resp.json();
-      if (data.status === 'running') {
-        _setProjectIndexStatus('Indexing…');
-      } else if (data.status === 'done') {
-        const details = `Indexed ${data.files_indexed || 0} files · ${data.chunks || 0} chunks`;
-        _setProjectIndexStatus(`Index ready · ${details}`);
-        if (projectIndexPollTimer) {
-          clearInterval(projectIndexPollTimer);
-          projectIndexPollTimer = null;
-        }
-      } else if (data.status === 'error') {
-        _setProjectIndexStatus(`Index error: ${data.error || 'unknown error'}`, 'error');
-        if (projectIndexPollTimer) {
-          clearInterval(projectIndexPollTimer);
-          projectIndexPollTimer = null;
-        }
-      } else {
-        _setProjectIndexStatus('Index idle');
-      }
-    } catch {
-      // non-fatal
-    }
-  }
-
-  function startProjectIndexPolling() {
-    if (projectIndexPollTimer) clearInterval(projectIndexPollTimer);
-    projectIndexPollTimer = setInterval(() => { void refreshProjectIndexStatus(); }, 1500);
-    void refreshProjectIndexStatus();
-  }
-
-  async function triggerProjectReindex() {
-    if (!currentProject?.id) return;
-    try {
-      const resp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(currentProject.id)}/index`, {
-        method: 'POST',
-        credentials: 'same-origin',
-      });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      _setProjectIndexStatus('Indexing…');
-      startProjectIndexPolling();
-    } catch (err) {
-      _setProjectIndexStatus(`Unable to re-index: ${err.message}`, 'error');
-    }
-  }
-
-  async function ensureProjectIndexStartedOnOpen() {
-    if (!currentProject?.id) return;
-    try {
-      const statusResp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(currentProject.id)}/index/status`, {
-        credentials: 'same-origin',
-      });
-      if (!statusResp.ok) return;
-      const status = await statusResp.json();
-      if (status.status !== 'idle') return;
-
-      const startResp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(currentProject.id)}/index`, {
-        method: 'POST',
-        credentials: 'same-origin',
-      });
-      if (!startResp.ok) {
-        throw new Error(`HTTP ${startResp.status}`);
-      }
-      _setProjectIndexStatus('Indexing…');
-    } catch (err) {
-      _setProjectIndexStatus(`Unable to start index: ${err.message}`, 'error');
-    }
-  }
-
-  async function openProject(projectId) {
-    closeSidebar();
-    try {
-      const resp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(projectId)}/open`, {
-        method: 'POST',
-        credentials: 'same-origin',
-      });
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const payload = await resp.json();
-      currentProject = payload.project || null;
-      _setSidebarSection('projects');
-      _setProjectWorkspaceActive(true);
-      projectTitleEl.textContent = currentProject?.name || 'Project';
-      projectModelIndicatorEl.textContent = coderModelName ? `Coder model: ${coderModelName}` : 'Coder model: unavailable';
-      const filesResp = await (window.apiFetch || fetch)(`/projects/${encodeURIComponent(projectId)}/files`, { credentials: 'same-origin' });
-      if (filesResp.ok) {
-        const filesPayload = await filesResp.json();
-        renderProjectFiles(filesPayload.files || []);
-      } else {
-        renderProjectFiles(payload.files || []);
-      }
-      await Promise.all([refreshSessions(), loadCurrentSessionMessages(), refreshProjects()]);
-      await ensureProjectIndexStartedOnOpen();
-      startProjectIndexPolling();
-    } catch (err) {
-      appendMessage('assistant', `⚠ Unable to open project: ${err.message}`);
-    }
-  }
-
-  function backToChat() {
-    _setProjectWorkspaceActive(false);
-    _setSidebarSection('chats');
-    void Promise.all([refreshSessions(), loadCurrentSessionMessages()]);
-  }
-
-  function toggleProjectCreateForm(show) {
-    if (!projectCreateForm) return;
-    projectCreateForm.style.display = show ? 'flex' : 'none';
-    if (!show) {
-      projectCreateForm.reset();
-      return;
-    }
-    projectNameInput?.focus();
-  }
-
   function renderMemory(items) {
     if (!memoryListEl) return;
     memoryListEl.innerHTML = '';
@@ -822,7 +475,7 @@
 
   async function refreshSessions() {
     try {
-      const resp = await (window.apiFetch || fetch)(_withProjectParam('/chat/sessions'), { credentials: 'same-origin' });
+      const resp = await (window.apiFetch || fetch)('/chat/sessions', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       currentSessionId = data.current_session_id || currentSessionId;
@@ -954,7 +607,7 @@
   async function loadCurrentSessionMessages() {
     resetMessagesView();
     try {
-      const resp = await (window.apiFetch || fetch)(_withProjectParam('/chat/session/messages'), { credentials: 'same-origin' });
+      const resp = await (window.apiFetch || fetch)('/chat/session/messages', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       currentSessionId = data.session_id || currentSessionId;
@@ -972,7 +625,7 @@
     setLocked(true);
     closeSidebar();
     try {
-      const resp = await (window.apiFetch || fetch)(_withProjectParam('/chat/session/select'), {
+      const resp = await (window.apiFetch || fetch)('/chat/session/select', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
@@ -1006,7 +659,7 @@
   async function deleteSession(sessionId) {
     try {
       closeSidebar();
-      const resp = await (window.apiFetch || fetch)(_withProjectParam(`/chat/sessions/${encodeURIComponent(sessionId)}`), {
+      const resp = await (window.apiFetch || fetch)(`/chat/sessions/${encodeURIComponent(sessionId)}`, {
         method: 'DELETE',
         credentials: 'same-origin',
       });
@@ -1071,7 +724,6 @@
         body: JSON.stringify({
           message: text,
           source,
-          ...(currentProject?.id && { project_id: currentProject.id }),
           ...(imageSnapshot && {
             image_base64: imageSnapshot.base64,
             image_mime: imageSnapshot.mime,
@@ -1206,7 +858,7 @@
   async function bootstrap() {
     _bindCollapsiblePanels();
     _setSidebarSection('chats');
-    await Promise.all([refreshSessions(), refreshMemory(), refreshProjects(), refreshProjectConfig()]);
+    await Promise.all([refreshSessions(), refreshMemory()]);
     await loadCurrentSessionMessages();
     refreshNowPlaying();
     refreshQueue();

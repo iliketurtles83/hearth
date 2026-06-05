@@ -73,32 +73,10 @@
       <div id="sidebar-top">
         <div id="sidebar-sections" aria-label="Sidebar sections">
           <button id="sidebar-section-chats" class="sidebar-section-btn active" type="button" aria-pressed="true">Chats</button>
-          <button id="sidebar-section-projects" class="sidebar-section-btn" type="button" aria-pressed="false">Projects</button>
         </div>
       </div>
 
       <div id="sidebar-main">
-        <section class="panel" id="projects-panel" style="display:none">
-          <div class="panel-header">
-            <h2>Projects</h2>
-            <button id="project-new-btn" class="panel-btn" title="Create a new project">+ New Project</button>
-          </div>
-          <form id="project-create-form" class="project-form" style="display:none">
-            <input id="project-name-input" type="text" placeholder="Project name" required />
-            <input id="project-folder-input" type="text" placeholder="Folder name (optional)" />
-            <input id="project-description-input" type="text" placeholder="Description (optional)" />
-            <label class="checkbox-row">
-              <input id="project-git-init-input" type="checkbox" />
-              Initialize git repository
-            </label>
-            <div class="project-form-actions">
-              <button id="project-create-submit-btn" class="panel-btn" type="submit">Create</button>
-              <button id="project-create-cancel-btn" class="panel-btn" type="button">Cancel</button>
-            </div>
-          </form>
-          <div id="project-list" class="list"></div>
-        </section>
-
         <section class="panel" id="sessions-panel">
           <div class="panel-header">
             <h2>Sessions</h2>
@@ -160,81 +138,57 @@
     </aside>
 
     <div id="chat-column">
-      <div id="project-header" style="display:none">
-        <button id="project-back-btn" class="panel-btn" type="button">← Back to Chat</button>
-        <div id="project-header-meta">
-          <div id="project-title">Project</div>
-          <div id="project-model-indicator"></div>
+      <div id="messages">
+        <div id="messages-inner">
+          <div id="empty-state">
+            <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="1.4"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+            </svg>
+            <span>Start a conversation</span>
+          </div>
         </div>
-        <button id="project-reindex-btn" class="panel-btn" type="button">Re-index</button>
       </div>
 
-      <div id="project-layout">
-        <aside id="project-files-pane" style="display:none">
-          <div id="project-files-header">Files</div>
-          <div id="project-files-list" class="list"></div>
-        </aside>
-
-        <div id="project-main-pane">
-          <div id="project-index-status" style="display:none"></div>
-          <div id="project-file-viewer" style="display:none">
-            <div id="project-file-viewer-path"></div>
-            <pre><code id="project-file-viewer-content"></code></pre>
+      <div id="input-area">
+        <div id="image-preview-strip" style="display:none">
+          <div id="image-preview-inner">
+            <img id="image-preview-thumb" alt="Attached image" />
+            <button id="image-clear-btn" title="Remove image" type="button">&times;</button>
           </div>
-
-          <div id="messages">
-            <div id="messages-inner">
-              <div id="empty-state">
-                <svg xmlns="http://www.w3.org/2000/svg" width="44" height="44" viewBox="0 0 24 24"
-                     fill="none" stroke="currentColor" stroke-width="1.4"
-                     stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-                </svg>
-                <span>Start a conversation</span>
-              </div>
-            </div>
-          </div>
-
-          <div id="input-area">
-            <div id="image-preview-strip" style="display:none">
-              <div id="image-preview-inner">
-                <img id="image-preview-thumb" alt="Attached image" />
-                <button id="image-clear-btn" title="Remove image" type="button">&times;</button>
-              </div>
-            </div>
-            <div id="input-inner">
-              <!-- Phase 14: hidden file picker + attach button -->
-              <input id="image-upload" type="file" accept="image/png,image/jpeg,image/webp" style="display:none" />
-              <button id="image-attach-btn" type="button" title="Attach image">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-                     fill="none" stroke="currentColor" stroke-width="2"
-                     stroke-linecap="round" stroke-linejoin="round">
-                  <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19
-                           a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
-                </svg>
-              </button>
-              <textarea
-                id="message-input"
-                placeholder="Message..."
-                rows="1"
-                autofocus
-              ></textarea>
-              <button id="send-btn" title="Send (Enter)">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-                     fill="none" stroke="currentColor" stroke-width="2.2"
-                     stroke-linecap="round" stroke-linejoin="round">
-                  <line x1="22" y1="2" x2="11" y2="13"/>
-                  <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-                </svg>
-              </button>
-              <button id="stop-btn" title="Stop generating" style="display:none">
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
-                     fill="currentColor" stroke="none">
-                  <rect x="5" y="5" width="14" height="14" rx="2"/>
-                </svg>
-              </button>
-            </div>
-          </div>
+        </div>
+        <div id="input-inner">
+          <!-- Phase 14: hidden file picker + attach button -->
+          <input id="image-upload" type="file" accept="image/png,image/jpeg,image/webp" style="display:none" />
+          <button id="image-attach-btn" type="button" title="Attach image">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19
+                       a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+            </svg>
+          </button>
+          <textarea
+            id="message-input"
+            placeholder="Message..."
+            rows="1"
+            autofocus
+          ></textarea>
+          <button id="send-btn" title="Send (Enter)">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="none" stroke="currentColor" stroke-width="2.2"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+            </svg>
+          </button>
+          <button id="stop-btn" title="Stop generating" style="display:none">
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"
+                 fill="currentColor" stroke="none">
+              <rect x="5" y="5" width="14" height="14" rx="2"/>
+            </svg>
+          </button>
         </div>
       </div>
     </div>
