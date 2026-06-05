@@ -24,12 +24,6 @@ CHAT_MODEL: str = (
     or os.getenv("MODEL_LOCAL")
     or "llama3.2"
 )
-CODER_MODEL: str = (
-    os.getenv("OLLAMA_CODER_MODEL")
-    or os.getenv("OLLAMA_CHAT_MODEL")
-    or os.getenv("MODEL_LOCAL")
-    or "llama3.2"
-)
 VISION_MODEL: str = (
     os.getenv("OLLAMA_VISION_MODEL")
     or CHAT_MODEL
@@ -58,8 +52,6 @@ def _is_code_intent(intent: str) -> bool:
 
 
 def _pick_local_model(intent: str) -> str:
-    if _is_code_intent(intent):
-        return CODER_MODEL
     if intent == "vision":
         return VISION_MODEL
     return CHAT_MODEL

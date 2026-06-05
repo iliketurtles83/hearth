@@ -88,7 +88,6 @@ services:
       - BEETS_DB_PATH=${BEETS_DB_PATH:-/beets/library.db}
       - MUSIC_ROOT=/music
       - BEETSDIR=/beets
-      - CODE_WORKSPACE_ROOT=/code-workspace
       - MPD_HOST=mpd
       - TTS_ENGINE=${TTS_ENGINE:-kokoro}
       - TTS_KOKORO_MODEL=${TTS_KOKORO_MODEL:-/app/models/tts/kokoro-v1.0.int8.onnx}
@@ -102,9 +101,6 @@ services:
     volumes:
       - ./backend:/app
       - ./frontend:/frontend
-      # Code tool workspace — writable volume for the code_tool node (Phase 10b).
-      # CODE_WORKSPACE_ROOT inside the container is /code-workspace.
-      - ${CODE_WORKSPACE_ROOT}:/code-workspace
       # Music library — writable so beets import can create temp files during remux.
       - ${MUSIC_PATH}:/music
       # Beets library DB directory — mounted read-only so backend can query items.

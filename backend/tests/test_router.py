@@ -4,7 +4,7 @@ Routing tests for the heuristic classifier and compatibility wrapper.
 Covers:
 - Heuristic fallback intent / confidence / routing rules.
 - Tool inference for weather and music requests.
-- Code intent stays local and uses the coder model.
+- Code intent stays local and uses the chat model.
 - code-question intent (explain/how-does) routes to code_tool.
 - write-like requests in main chat are downgraded to code-question.
 - Async route() remains a thin wrapper over classify_intent().
@@ -64,24 +64,24 @@ class TestHeuristicClassifier:
         d = r.classify_intent("Write a Python function that parses a JSON file.")
         assert d.intent == "code-question"
         assert not d.use_cloud
-        assert d.model == r.CODER_MODEL
+        assert d.model == r.CHAT_MODEL
 
     def test_code_question_intent(self):
         d = r.classify_intent("Can you explain how this function works?")
         assert d.intent == "code-question"
         assert not d.use_cloud
-        assert d.model == r.CODER_MODEL
+        assert d.model == r.CHAT_MODEL
 
     def test_fix_bug_is_code_question(self):
         d = r.classify_intent("Fix the bug in the authentication module.")
         assert d.intent == "code-question"
         assert not d.use_cloud
-        assert d.model == r.CODER_MODEL
+        assert d.model == r.CHAT_MODEL
 
     def test_explain_is_code_question(self):
         d = r.classify_intent("Walk me through how the memory retrieval node works.")
         assert d.intent == "code-question"
-        assert d.model == r.CODER_MODEL
+        assert d.model == r.CHAT_MODEL
 
     def test_confidence_clamped(self):
         d = r.classify_intent("x" * 700 + " analyze this deeply")
@@ -90,12 +90,12 @@ class TestHeuristicClassifier:
     def test_coding_solution_is_code_question(self):
         d = r.classify_intent("What is a coding solution for creating an api call parser in python?")
         assert d.intent == "code-question"
-        assert d.model == r.CODER_MODEL
+        assert d.model == r.CHAT_MODEL
 
     def test_how_do_i_implement_is_code_question(self):
         d = r.classify_intent("How do I implement a rate limiter in python?")
         assert d.intent == "code-question"
-        assert d.model == r.CODER_MODEL
+        assert d.model == r.CHAT_MODEL
 
 
 class TestModelSelection:
@@ -103,20 +103,12 @@ class TestModelSelection:
         assert r._is_code_intent("code-question")
         assert not r._is_code_intent("quick-local")
 
-    def test_code_question_returns_coder(self):
-        assert r._pick_local_model("code-question") == r.CODER_MODEL
+    def test_code_question_returns_chat(self):
+        assert r._pick_local_model("code-question") == r.CHAT_MODEL
 
     def test_non_code_returns_chat(self):
         for intent in ["quick-local", "reasoning-heavy", "external-data-needed", "memory-needed"]:
             assert r._pick_local_model(intent) == r.CHAT_MODEL
-
-    def test_coder_differs_when_overridden(self):
-        original = r.CODER_MODEL
-        r.CODER_MODEL = "qwen2.5-coder:7b"
-        assert r._pick_local_model("code-question") == "qwen2.5-coder:7b"
-        assert r._pick_local_model("quick-local") != "qwen2.5-coder:7b"
-        r.CODER_MODEL = original
-
 
 class TestAsyncRouteWrapper:
     @pytest.mark.asyncio
@@ -130,4 +122,4 @@ class TestAsyncRouteWrapper:
     async def test_route_downgrades_write_to_code_question(self):
         routed = await r.route("Write a Python function to read a CSV file.")
         assert routed.intent == "code-question"
-        assert routed.model == r.CODER_MODEL
+        assert routed.model == r.CHAT_MODEL

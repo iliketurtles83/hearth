@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request, Query, HTTPException
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,7 +21,6 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from threading import Lock
 from uuid import uuid4
 import numpy as np
 from dotenv import load_dotenv
@@ -31,7 +30,7 @@ from dotenv import load_dotenv
 # populated first or those module-level constants capture stale defaults.
 load_dotenv()
 
-from intents import CLOUD_MODEL, CHAT_MODEL, CODER_MODEL
+from intents import CLOUD_MODEL, CHAT_MODEL
 from embedding_router import build_embedding_router
 from memory import MemoryStore
 from routing_config import ROUTING_CONFIG
@@ -45,9 +44,7 @@ from graph import (
 from auth import AuthService
 from music_fastpath import parse_music_command, format_music_response
 from routes.auth_routes import create_auth_router
-from routes.code_file_routes import create_code_file_router
 from routes.memory_tool_routes import create_memory_tool_router
-from routes.project_routes import create_project_router
 from app_schemas import (
     ChatRequest as BaseChatRequest,
     TTSRequest,
@@ -55,8 +52,6 @@ from app_schemas import (
     SessionSelectRequest,
 )
 import tts
-from projects import ProjectStore, ProjectError
-from tools.workspace import WorkspacePathError, resolve_workspace_path
 
 _BACKEND_DIR = os.path.dirname(__file__)
 if _BACKEND_DIR not in sys.path:
@@ -186,22 +181,9 @@ SESSION_COOKIE_SECURE: bool = os.getenv("SESSION_COOKIE_SECURE", "false").lower(
 AUTH_COOKIE_NAME: str = os.getenv("AUTH_COOKIE_NAME", "auth_token")
 
 
-_code_write_lock = Lock()
-# NOTE: single-worker assumption. _pending_code_writes (and the lazily-loaded
-# model singletons / fallback graph below) are per-process in-memory state. Do
-# NOT run the backend with `uvicorn --workers N` (N > 1): a write confirmation
-# could land on a different worker than the one that created the pending entry,
-# producing spurious "Pending write not found" 404s. Move this state to the
-# SQLite store before scaling to multiple workers.
-_pending_code_writes: dict[str, dict] = {}
-
 # ── Auth service (shared singleton) ───────────────────────────────────────────
 _auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
 auth_service = AuthService(os.getenv("AUTH_DB_PATH", _auth_db_default))
-project_store = ProjectStore(
-    db_path=os.getenv("AUTH_DB_PATH", _auth_db_default),
-    code_workspace_root=os.getenv("CODE_WORKSPACE_ROOT", ""),
-)
 
 # ── Startup validation ─────────────────────────────────────────────────────────
 def _required_wake_models() -> list[str]:
@@ -293,31 +275,11 @@ def _validate_startup() -> None:
     if not os.getenv("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
 
-    # Code workspace
-    _code_root = os.getenv("CODE_WORKSPACE_ROOT", "")
-    if not _code_root:
-        log.warning(
-            "CODE_WORKSPACE_ROOT not set — code_tool node will refuse all file operations. "
-            "Set it in .env and restart."
-        )
-    elif not os.path.isdir(_code_root):
-        log.warning(
-            "CODE_WORKSPACE_ROOT=%s does not exist or is not a directory — "
-            "create it and mount it into the container before using the code tool.",
-            _code_root,
-        )
-    else:
-        # Start background workspace indexer
-        _index_paths_raw = os.getenv("CODE_INDEX_PATHS", "")
-        _index_paths = [p.strip() for p in _index_paths_raw.split() if p.strip()] or None
-        from tools.code_indexer import start_background_index
-        start_background_index(_code_root, os.getenv("CHROMA_PATH", _chroma_default), _index_paths)
-
     _bootstrap_beets_library_if_empty()
 
     log.info(
-        "Startup OK | chat_model=%s | coder_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",
-        CHAT_MODEL, CODER_MODEL, OLLAMA_URL, _CORS_ORIGINS, SESSION_COOKIE_SECURE,
+        "Startup OK | chat_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",
+        CHAT_MODEL, OLLAMA_URL, _CORS_ORIGINS, SESSION_COOKIE_SECURE,
     )
 
 _validate_startup()
@@ -339,7 +301,6 @@ _API_PATH_PREFIXES = (
     "/music",
     "/weather",
     "/tts",
-    "/projects",
     "/auth/me",
     "/auth/logout",
 )
@@ -573,22 +534,6 @@ app.include_router(
     )
 )
 
-app.include_router(
-    create_code_file_router(
-        code_write_lock=_code_write_lock,
-        pending_code_writes=_pending_code_writes,
-        log=log,
-    )
-)
-
-app.include_router(
-    create_project_router(
-        project_store=project_store,
-        chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
-        coder_model=CODER_MODEL,
-    )
-)
-
 
 def _normalize_chat_source(source: str | None) -> str:
     s = (source or "text").strip().lower()
@@ -605,25 +550,6 @@ def _voice_tts_metadata(chat_source: str) -> dict | None:
             "tts_ready": True,
         }
     }
-
-
-def _resolve_project_context(user_id: str, raw_project_id: str | None) -> tuple[str, str]:
-    project_id = (raw_project_id or "").strip()
-    if not project_id:
-        return "", ""
-    try:
-        project = project_store.get_project(project_id, user_id)
-    except ProjectError as exc:
-        raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-    if project is None:
-        raise HTTPException(status_code=404, detail="Project not found")
-
-    folder_name = str(project.get("folder_name", "")).strip()
-    try:
-        project_folder = resolve_workspace_path(project_store.code_workspace_root, folder_name)
-    except WorkspacePathError as exc:
-        raise HTTPException(status_code=400, detail="Path traversal is not allowed") from exc
-    return project_id, project_folder
 
 
 def _set_session_cookie(response: Response, session_id: str) -> None:
@@ -754,9 +680,8 @@ def _make_graph_deps(*, embedding_router=None) -> AssistantGraphDependencies:
         tool_dispatch=_late_tool_dispatch,
         chat_model=CHAT_MODEL,
         cloud_model=CLOUD_MODEL,
-        coder_model=CODER_MODEL,
+        coder_model=CHAT_MODEL,
         vision_model=OLLAMA_VISION_MODEL,
-        chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
     )
 
 
@@ -787,7 +712,6 @@ async def chat(request: ChatRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id = cookie_session_id or str(uuid4())
     session_created = cookie_session_id is None
-    project_id, project_folder = _resolve_project_context(user_id, request.project_id)
     chat_source = _normalize_chat_source(request.source)
     effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
 
@@ -823,7 +747,6 @@ async def chat(request: ChatRequest, http_request: Request):
                         user_id,
                         "user",
                         request.message,
-                        project_id or None,
                     )
                     await asyncio.to_thread(
                         memory_store.log_turn,
@@ -831,7 +754,6 @@ async def chat(request: ChatRequest, http_request: Request):
                         user_id,
                         "assistant",
                         response_text,
-                        project_id or None,
                     )
                 except Exception as exc:
                     log.warning("chat.music_fast.log_turn | session_id=%s error=%s", session_id, exc)
@@ -855,8 +777,6 @@ async def chat(request: ChatRequest, http_request: Request):
         "message": request.message,
         "system": effective_system,
         "source": chat_source,
-        "project_id": project_id,
-        "project_folder": project_folder,
         "modality": "voice" if chat_source == "voice" else "chat",
         # Pass image through state (ephemeral, not persisted to memory)
         "image_base64": request.image_base64,
@@ -983,10 +903,10 @@ async def _clear_checkpoint_thread(session_id: str) -> None:
 
 
 @app.get("/chat/sessions")
-async def list_chat_sessions(http_request: Request, project_id: str | None = Query(default=None)):
+async def list_chat_sessions(http_request: Request):
     user_id: str = http_request.state.user_id
     current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    sessions = memory_store.list_sessions(user_id, project_id)
+    sessions = memory_store.list_sessions(user_id)
     return JSONResponse(
         {
             "sessions": sessions,
@@ -996,10 +916,10 @@ async def list_chat_sessions(http_request: Request, project_id: str | None = Que
 
 
 @app.get("/chat/session/messages")
-async def get_chat_session_messages(http_request: Request, project_id: str | None = Query(default=None)):
+async def get_chat_session_messages(http_request: Request):
     user_id: str = http_request.state.user_id
     session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
-    turns = memory_store.get_session_turns(session_id, user_id, limit=500, project_id=project_id)
+    turns = memory_store.get_session_turns(session_id, user_id, limit=500)
     response = JSONResponse({"session_id": session_id, "messages": turns})
     _set_session_cookie(response, session_id)
     return response
@@ -1018,10 +938,9 @@ async def create_chat_session(http_request: Request):
 async def select_chat_session(
     payload: SessionSelectRequest,
     http_request: Request,
-    project_id: str | None = Query(default=None),
 ):
     user_id: str = http_request.state.user_id
-    sessions = memory_store.list_sessions(user_id, project_id)
+    sessions = memory_store.list_sessions(user_id)
     if not any(s.get("session_id") == payload.session_id for s in sessions):
         return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
 
@@ -1034,17 +953,16 @@ async def select_chat_session(
 async def delete_chat_session(
     session_id: str,
     http_request: Request,
-    project_id: str | None = Query(default=None),
 ):
     user_id: str = http_request.state.user_id
     current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
 
-    memory_store.delete_session(session_id, user_id, project_id=project_id)
+    memory_store.delete_session(session_id, user_id)
     await _clear_checkpoint_thread(session_id)
 
     next_session_id: str | None = None
     if current_session_id == session_id:
-        sessions = memory_store.list_sessions(user_id, project_id)
+        sessions = memory_store.list_sessions(user_id)
         next_session_id = sessions[0]["session_id"] if sessions else str(uuid4())
 
     payload: dict[str, object] = {"ok": True, "session_id": session_id}
@@ -1058,10 +976,10 @@ async def delete_chat_session(
 
 
 @app.delete("/chat/session")
-async def reset_chat_session(http_request: Request, project_id: str | None = Query(default=None)):
+async def reset_chat_session(http_request: Request):
     user_id: str = http_request.state.user_id
     session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
-    memory_store.reset_session(session_id, user_id, project_id=project_id)
+    memory_store.reset_session(session_id, user_id)
     await _clear_checkpoint_thread(session_id)
     response = JSONResponse({"ok": True, "session_id": session_id})
     _set_session_cookie(response, session_id)
@@ -1164,7 +1082,6 @@ async def code(request: CodeRequest, http_request: Request):
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     session_id = cookie_session_id or str(uuid4())
     session_created = cookie_session_id is None
-    project_id, project_folder = _resolve_project_context(user_id, request.project_id)
     code_source = _normalize_chat_source(request.source)
     effective_system = request.system or CODE_DEFAULT_SYSTEM_PROMPT
 
@@ -1174,8 +1091,6 @@ async def code(request: CodeRequest, http_request: Request):
         "message": request.message,
         "system": effective_system,
         "source": code_source,
-        "project_id": project_id,
-        "project_folder": project_folder,
         "force_code": True,
     }
 
@@ -1183,7 +1098,7 @@ async def code(request: CodeRequest, http_request: Request):
 
     async def generate():
         assistant_accumulated = ""
-        active_model = CODER_MODEL
+        active_model = CHAT_MODEL
 
         try:
             async for event in graph_runner.astream(
@@ -1193,7 +1108,7 @@ async def code(request: CodeRequest, http_request: Request):
             ):
                 if "meta" in event:
                     meta = event["meta"]
-                    active_model = meta.get("model", CODER_MODEL)
+                    active_model = meta.get("model", CHAT_MODEL)
                     yield f"data: {json.dumps({'model': active_model, 'intent': meta.get('intent', 'code'), 'confidence': meta.get('confidence', 1.0)})}\n\n"
                 elif "text" in event:
                     chunk = event["text"]

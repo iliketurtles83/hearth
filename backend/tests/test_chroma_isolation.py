@@ -11,7 +11,6 @@ from __future__ import annotations
 import pathlib
 import sqlite3
 import sys
-import textwrap
 
 import pytest
 
@@ -44,31 +43,28 @@ def test_conversation_memory_collection_name(store):
 
 
 def test_code_context_not_in_chat_retrieval(tmp_path):
-    """Content indexed into 'code_context' must not appear in store.retrieve()."""
+    """Content in a separate 'code_context' collection must not appear in store.retrieve()."""
     pytest.importorskip("chromadb", reason="chromadb not installed")
 
     chroma_dir = tmp_path / "chroma"
     chroma_dir.mkdir()
 
-    # Index a distinctive code snippet into the code_context collection.
-    from tools.code_indexer import index_workspace
-
-    src = tmp_path / "src"
-    src.mkdir()
-    (src / "secret_function.py").write_text(
-        textwrap.dedent("""\
-            def xyzzy_unique_sentinel_function(arg: int) -> int:
-                \"\"\"This name should never appear in chat retrieval.\"\"\"
-                return arg * 42
-        """)
-    )
-    indexed = index_workspace(str(tmp_path), str(chroma_dir))
-    assert indexed >= 1, "Expected at least one document indexed"
-
-    # Now create a MemoryStore backed by the same chroma path.
+    # Create a MemoryStore backed by this chroma path.
     mem = MemoryStore(
         db_path=str(tmp_path / "memory.db"),
         chroma_path=str(chroma_dir),
+    )
+
+    # Write a distinctive symbol into a separate collection. This simulates code
+    # indexing without depending on removed code-indexer modules.
+    code_context = mem._chroma.get_or_create_collection(
+        name="code_context",
+        embedding_function=mem._embedder,
+    )
+    code_context.upsert(
+        ids=["code:1"],
+        documents=["def xyzzy_unique_sentinel_function(arg: int) -> int: return arg * 42"],
+        metadatas=[{"path": "src/secret_function.py"}],
     )
 
     # Retrieve using the exact code symbol name — must not surface code content.
@@ -83,7 +79,7 @@ def test_code_context_not_in_chat_retrieval(tmp_path):
 
 
 def test_chat_memory_not_in_code_context(tmp_path):
-    """Facts stored in 'conversation_memory' must not appear in query_code_context()."""
+    """Facts stored in 'conversation_memory' must not appear when querying 'code_context'."""
     pytest.importorskip("chromadb", reason="chromadb not installed")
 
     chroma_dir = tmp_path / "chroma"
@@ -97,11 +93,18 @@ def test_chat_memory_not_in_code_context(tmp_path):
     # Plant a distinctive fact in conversation_memory.
     mem.ingest_user_message("alice", "My favourite_unique_sentinel_fact is blue cheese.")
 
-    # Query the code_context collection — the chat fact must not appear.
-    from tools.code_indexer import query_code_context
+    code_context = mem._chroma.get_or_create_collection(
+        name="code_context",
+        embedding_function=mem._embedder,
+    )
+    code_context.upsert(
+        ids=["code:2"],
+        documents=["def unrelated_helper(x): return x + 1"],
+        metadatas=[{"path": "src/unrelated.py"}],
+    )
 
-    results = query_code_context("favourite_unique_sentinel_fact", str(chroma_dir), n=5)
-    combined = "\n".join(results)
+    results = code_context.query(query_texts=["favourite_unique_sentinel_fact"], n_results=5)
+    combined = "\n".join((results.get("documents") or [[]])[0])
     assert "favourite_unique_sentinel_fact" not in combined, (
         f"Chat fact leaked into code context results: {combined!r}"
     )

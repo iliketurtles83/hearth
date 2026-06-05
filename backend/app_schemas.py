@@ -5,7 +5,6 @@ class ChatRequest(BaseModel):
     message: str
     system: str | None = None
     source: str = "text"
-    project_id: str | None = None
     # Phase 14 — vision input
     image_base64: str | None = None  # raw base64, no data-URI prefix
     image_mime: str | None = None    # "image/png" | "image/jpeg" | "image/webp"
@@ -19,7 +18,6 @@ class CodeRequest(BaseModel):
     message: str
     system: str | None = None
     source: str = "text"
-    project_id: str | None = None
 
 
 class SessionSelectRequest(BaseModel):
