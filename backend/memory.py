@@ -155,7 +155,6 @@ class MemoryStore:
                     id           INTEGER PRIMARY KEY AUTOINCREMENT,
                     user_id      TEXT NOT NULL,
                     session_id   TEXT NOT NULL,
-                    project_id   TEXT,
                     summary      TEXT NOT NULL,
                     created_at   REAL NOT NULL,
                     consolidated INTEGER NOT NULL DEFAULT 0
@@ -165,7 +164,6 @@ class MemoryStore:
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
                     session_id  TEXT NOT NULL,
                     user_id     TEXT NOT NULL,
-                    project_id  TEXT,
                     role        TEXT NOT NULL,
                     content     TEXT NOT NULL,
                     ts          REAL NOT NULL
@@ -195,91 +193,33 @@ class MemoryStore:
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
-            # Live-instance migration: add project_id columns if missing.
-            try:
-                self._conn.execute("ALTER TABLE summaries ADD COLUMN project_id TEXT")
-                self._conn.commit()
-            except sqlite3.OperationalError:
-                pass  # column already exists
-            try:
-                self._conn.execute("ALTER TABLE conversation_log ADD COLUMN project_id TEXT")
-                self._conn.commit()
-            except sqlite3.OperationalError:
-                pass  # column already exists
-
-            # Project-aware indexes must be created after project_id migrations,
-            # otherwise legacy DBs fail index creation before columns exist.
-            self._conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_convlog_project_session_user_ts
-                ON conversation_log(project_id, session_id, user_id, ts)
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS idx_summaries_project_session_user
-                ON summaries(project_id, session_id, user_id, created_at DESC)
-                """
-            )
             self._conn.commit()
 
-    @staticmethod
-    def _normalize_project_id(project_id: str | None) -> str | None:
-        pid = (project_id or "").strip()
-        return pid or None
-
-    def log_turn(
-        self,
-        session_id: str,
-        user_id: str,
-        role: str,
-        content: str,
-        project_id: str | None = None,
-    ) -> None:
-        project_id = self._normalize_project_id(project_id)
+    def log_turn(self, session_id: str, user_id: str, role: str, content: str) -> None:
         now = time.time()
         with self._lock:
             self._conn.execute(
                 """
-                INSERT INTO conversation_log (session_id, user_id, project_id, role, content, ts)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO conversation_log (session_id, user_id, role, content, ts)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (session_id, user_id, project_id, role, content, now),
+                (session_id, user_id, role, content, now),
             )
             self._conn.commit()
 
-    def get_session_turns(
-        self,
-        session_id: str,
-        user_id: str,
-        limit: int = 500,
-        project_id: str | None = None,
-    ) -> list[dict[str, Any]]:
-        project_id = self._normalize_project_id(project_id)
+    def get_session_turns(self, session_id: str, user_id: str, limit: int = 500) -> list[dict[str, Any]]:
         safe_limit = max(1, int(limit))
         with self._lock:
-            if project_id is None:
-                rows = self._conn.execute(
-                    """
-                    SELECT role, content, ts
-                    FROM conversation_log
-                    WHERE session_id = ? AND user_id = ? AND project_id IS NULL
-                    ORDER BY ts ASC
-                    LIMIT ?
-                    """,
-                    (session_id, user_id, safe_limit),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    """
-                    SELECT role, content, ts
-                    FROM conversation_log
-                    WHERE session_id = ? AND user_id = ? AND project_id = ?
-                    ORDER BY ts ASC
-                    LIMIT ?
-                    """,
-                    (session_id, user_id, project_id, safe_limit),
-                ).fetchall()
+            rows = self._conn.execute(
+                """
+                SELECT role, content, ts
+                FROM conversation_log
+                WHERE session_id = ? AND user_id = ?
+                ORDER BY ts ASC
+                LIMIT ?
+                """,
+                (session_id, user_id, safe_limit),
+            ).fetchall()
         return [
             {
                 "role": str(r["role"]),
@@ -289,59 +229,31 @@ class MemoryStore:
             for r in rows
         ]
 
-    def list_sessions(self, user_id: str, project_id: str | None = None) -> list[dict[str, Any]]:
-        project_id = self._normalize_project_id(project_id)
+    def list_sessions(self, user_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            if project_id is None:
-                rows = self._conn.execute(
-                    """
-                    SELECT
-                        c1.session_id AS session_id,
-                        MIN(c1.ts) AS created_at,
-                        MAX(c1.ts) AS updated_at,
-                        COUNT(*) AS message_count,
-                        (
-                            SELECT c2.content
-                            FROM conversation_log c2
-                            WHERE c2.session_id = c1.session_id
-                              AND c2.user_id = ?
-                              AND c2.project_id IS NULL
-                              AND c2.role = 'user'
-                            ORDER BY c2.ts ASC
-                            LIMIT 1
-                        ) AS preview
-                    FROM conversation_log c1
-                    WHERE c1.user_id = ? AND c1.project_id IS NULL
-                    GROUP BY c1.session_id
-                    ORDER BY updated_at DESC
-                    """,
-                    (user_id, user_id),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    """
-                    SELECT
-                        c1.session_id AS session_id,
-                        MIN(c1.ts) AS created_at,
-                        MAX(c1.ts) AS updated_at,
-                        COUNT(*) AS message_count,
-                        (
-                            SELECT c2.content
-                            FROM conversation_log c2
-                            WHERE c2.session_id = c1.session_id
-                              AND c2.user_id = ?
-                              AND c2.project_id = ?
-                              AND c2.role = 'user'
-                            ORDER BY c2.ts ASC
-                            LIMIT 1
-                        ) AS preview
-                    FROM conversation_log c1
-                    WHERE c1.user_id = ? AND c1.project_id = ?
-                    GROUP BY c1.session_id
-                    ORDER BY updated_at DESC
-                    """,
-                    (user_id, project_id, user_id, project_id),
-                ).fetchall()
+            rows = self._conn.execute(
+                """
+                SELECT
+                    c1.session_id AS session_id,
+                    MIN(c1.ts) AS created_at,
+                    MAX(c1.ts) AS updated_at,
+                    COUNT(*) AS message_count,
+                    (
+                        SELECT c2.content
+                        FROM conversation_log c2
+                        WHERE c2.session_id = c1.session_id
+                          AND c2.user_id = ?
+                          AND c2.role = 'user'
+                        ORDER BY c2.ts ASC
+                        LIMIT 1
+                    ) AS preview
+                FROM conversation_log c1
+                WHERE c1.user_id = ?
+                GROUP BY c1.session_id
+                ORDER BY updated_at DESC
+                """,
+                (user_id, user_id),
+            ).fetchall()
         return [
             {
                 "session_id": str(r["session_id"]),
@@ -353,108 +265,61 @@ class MemoryStore:
             for r in rows
         ]
 
-    def delete_session(self, session_id: str, user_id: str, project_id: str | None = None) -> None:
-        project_id = self._normalize_project_id(project_id)
+    def delete_session(self, session_id: str, user_id: str) -> None:
         with self._lock:
-            if project_id is None:
-                self._conn.execute(
-                    "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ? AND project_id IS NULL",
-                    (session_id, user_id),
-                )
-                self._conn.execute(
-                    "DELETE FROM summaries WHERE session_id = ? AND user_id = ? AND project_id IS NULL",
-                    (session_id, user_id),
-                )
-            else:
-                self._conn.execute(
-                    "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ? AND project_id = ?",
-                    (session_id, user_id, project_id),
-                )
-                self._conn.execute(
-                    "DELETE FROM summaries WHERE session_id = ? AND user_id = ? AND project_id = ?",
-                    (session_id, user_id, project_id),
-                )
+            self._conn.execute(
+                "DELETE FROM conversation_log WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            self._conn.execute(
+                "DELETE FROM summaries WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
             self._conn.commit()
 
-    def reset_session(self, session_id: str, user_id: str, project_id: str | None = None) -> None:
-        self.delete_session(session_id, user_id, project_id=project_id)
+    def reset_session(self, session_id: str, user_id: str) -> None:
+        self.delete_session(session_id, user_id)
 
     def get_latest_session_summary(
         self,
         session_id: str,
         user_id: str,
-        project_id: str | None = None,
     ) -> str:
-        project_id = self._normalize_project_id(project_id)
         with self._lock:
-            if project_id is None:
-                row = self._conn.execute(
-                    """
-                    SELECT summary
-                    FROM summaries
-                    WHERE session_id = ? AND user_id = ? AND project_id IS NULL
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (session_id, user_id),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    """
-                    SELECT summary
-                    FROM summaries
-                    WHERE session_id = ? AND user_id = ? AND project_id = ?
-                    ORDER BY created_at DESC
-                    LIMIT 1
-                    """,
-                    (session_id, user_id, project_id),
-                ).fetchone()
+            row = self._conn.execute(
+                """
+                SELECT summary
+                FROM summaries
+                WHERE session_id = ? AND user_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id, user_id),
+            ).fetchone()
         return str(row["summary"]) if row and row["summary"] is not None else ""
 
-    def count_unconsolidated(self, user_id: str, project_id: str | None = None) -> int:
-        project_id = self._normalize_project_id(project_id)
+    def count_unconsolidated(self, user_id: str) -> int:
         with self._lock:
-            if project_id is None:
-                row = self._conn.execute(
-                    """
-                    SELECT COUNT(*) AS c
-                    FROM summaries
-                    WHERE user_id = ? AND project_id IS NULL AND consolidated = 0
-                    """,
-                    (user_id,),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    """
-                    SELECT COUNT(*) AS c
-                    FROM summaries
-                    WHERE user_id = ? AND project_id = ? AND consolidated = 0
-                    """,
-                    (user_id, project_id),
-                ).fetchone()
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM summaries
+                WHERE user_id = ? AND consolidated = 0
+                """,
+                (user_id,),
+            ).fetchone()
         return int(row["c"] if row is not None else 0)
 
-    def count_session_turns(self, session_id: str, user_id: str, project_id: str | None = None) -> int:
-        project_id = self._normalize_project_id(project_id)
+    def count_session_turns(self, session_id: str, user_id: str) -> int:
         with self._lock:
-            if project_id is None:
-                row = self._conn.execute(
-                    """
-                    SELECT COUNT(*) AS c
-                    FROM conversation_log
-                    WHERE session_id = ? AND user_id = ? AND project_id IS NULL
-                    """,
-                    (session_id, user_id),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    """
-                    SELECT COUNT(*) AS c
-                    FROM conversation_log
-                    WHERE session_id = ? AND user_id = ? AND project_id = ?
-                    """,
-                    (session_id, user_id, project_id),
-                ).fetchone()
+            row = self._conn.execute(
+                """
+                SELECT COUNT(*) AS c
+                FROM conversation_log
+                WHERE session_id = ? AND user_id = ?
+                """,
+                (session_id, user_id),
+            ).fetchone()
         return int(row["c"] if row is not None else 0)
 
     def _is_sensitive(self, text: str) -> bool:
@@ -880,7 +745,6 @@ class MemoryStore:
         user_id: str,
         session_id: str,
         summary: str,
-        project_id: str | None = None,
     ) -> int:
         """Persist an episodic session summary.  Returns the new row id.
 
@@ -889,14 +753,13 @@ class MemoryStore:
         semantic memory (SQLite facts + ChromaDB conversation_memory).
         """
         now = time.time()
-        project_id = self._normalize_project_id(project_id)
         with self._lock:
             cur = self._conn.execute(
                 """
-                INSERT INTO summaries (user_id, session_id, project_id, summary, created_at, consolidated)
-                VALUES (?, ?, ?, ?, ?, 0)
+                INSERT INTO summaries (user_id, session_id, summary, created_at, consolidated)
+                VALUES (?, ?, ?, ?, 0)
                 """,
-                (user_id, session_id, project_id, summary, now),
+                (user_id, session_id, summary, now),
             )
             self._conn.commit()
             return int(cur.lastrowid)  # type: ignore[arg-type]
@@ -1222,51 +1085,12 @@ class MemoryStore:
         user_id: str,
         query: str,
         top_n: int | None = None,
-        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         raw_query = query.strip()
         if len(raw_query) < 2:
             return []
 
-        project_id = self._normalize_project_id(project_id)
         limit = top_n or self.top_n
-
-        if project_id is not None:
-            collection_name = f"code_context_{project_id}"
-            try:
-                collection = self._chroma.get_or_create_collection(
-                    name=collection_name,
-                    embedding_function=self._embedder,
-                )
-                count = collection.count()
-                if count <= 0:
-                    return []
-                result = collection.query(
-                    query_texts=[raw_query],
-                    n_results=min(limit, count),
-                )
-                docs = (result.get("documents") or [[]])[0]
-                distances = (result.get("distances") or [[]])[0]
-            except Exception:
-                return []
-
-            hits: list[dict[str, Any]] = []
-            for idx, (doc, dist) in enumerate(zip(docs, distances), start=1):
-                score = 1.0 / (1.0 + float(dist))
-                hits.append(
-                    {
-                        "id": f"code_context:{project_id}:{idx}",
-                        "table": "code_context",
-                        "tier": "semantic",
-                        "key": "code_context",
-                        "value": str(doc),
-                        "text": str(doc),
-                        "score": float(score),
-                        "source": "chroma-code-context",
-                    }
-                )
-            return hits
-
         query_terms = self._query_terms(raw_query)
         listed_all = self.list_items(user_id, limit=300, offset=0)["items"]
 
