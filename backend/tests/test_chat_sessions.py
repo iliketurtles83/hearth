@@ -123,7 +123,10 @@ async def test_select_chat_session_denies_other_users_session():
 async def test_delete_chat_session_denies_other_users_session():
     main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
 
-    await main.delete_chat_session("sess-alice", _request("bob"))
+    response = await main.delete_chat_session("sess-alice", _request("bob"))
+
+    assert response.status_code == 404
+    assert _json_body(response)["code"] == "SESSION_NOT_FOUND"
 
     turns = main.memory_store.get_session_turns("sess-alice", "alice", 500)
     assert len(turns) == 1

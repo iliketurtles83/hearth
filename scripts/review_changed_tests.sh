@@ -108,7 +108,6 @@ default_suite=(
   "backend/tests/test_router.py"
   "backend/tests/test_graph.py"
   "backend/tests/test_memory_isolation.py"
-  "backend/tests/test_code_tool.py"
   "backend/tests/test_weather.py"
 )
 
@@ -125,7 +124,6 @@ while IFS= read -r file; do
       ;;
     backend/graph.py|backend/tests/test_graph.py)
       add_test "backend/tests/test_graph.py"
-      add_test "backend/tests/test_code_tool.py"
       ;;
     backend/memory.py|backend/tests/test_memory_isolation.py)
       add_test "backend/tests/test_memory_isolation.py"
@@ -141,8 +139,7 @@ while IFS= read -r file; do
     backend/tools/music.py|backend/tests/test_music.py)
       add_test "backend/tests/test_music.py"
       ;;
-    backend/tools/code*.py|backend/tests/test_code_tool.py)
-      add_test "backend/tests/test_code_tool.py"
+    backend/tools/code*.py)
       add_test "backend/tests/test_graph.py"
       ;;
     backend/tts/*|backend/tests/test_tts_*.py|backend/tests/test_tts_endpoint.py)

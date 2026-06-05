@@ -33,8 +33,19 @@ run_step "Run focused backend regression suite" \
     -q
 
 if "$PYTHON_BIN" -m pip show pip-audit >/dev/null 2>&1; then
+  # Temporary local allowlist for vulnerabilities without an upstream fixed release.
+  # Override/extend via: PIP_AUDIT_IGNORE_IDS="CVE-2026-45829,..."
+  PIP_AUDIT_IGNORE_IDS="${PIP_AUDIT_IGNORE_IDS:-CVE-2026-45829}"
+  pip_audit_args=("-r" "backend/requirements.txt" "--progress-spinner" "off")
+  if [[ -n "$PIP_AUDIT_IGNORE_IDS" ]]; then
+    IFS=',' read -r -a _ignore_ids <<< "$PIP_AUDIT_IGNORE_IDS"
+    for _id in "${_ignore_ids[@]}"; do
+      _trimmed="${_id//[[:space:]]/}"
+      [[ -n "$_trimmed" ]] && pip_audit_args+=("--ignore-vuln" "$_trimmed")
+    done
+  fi
   run_step "Run dependency vulnerability audit" \
-    "$PYTHON_BIN" -m pip_audit -r backend/requirements.txt --progress-spinner off
+    "$PYTHON_BIN" -m pip_audit "${pip_audit_args[@]}"
 else
   echo
   echo "==> Run dependency vulnerability audit"

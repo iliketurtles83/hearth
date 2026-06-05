@@ -865,8 +865,7 @@ async def get_graph_state(session_id: str, http_request: Request):
     user_id: str = http_request.state.user_id
 
     # Verify session ownership before checking graph availability.
-    turns = memory_store.get_session_turns(session_id, user_id, limit=1)
-    if not turns and memory_store.session_exists(session_id):
+    if not memory_store.session_exists_for_user(session_id, user_id):
         return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
 
     graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
@@ -929,9 +928,11 @@ async def get_chat_session_messages(http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     if cookie_session_id:
-        # Check ownership: if turns exist for another user, this is a stale/foreign cookie.
-        turns = memory_store.get_session_turns(cookie_session_id, user_id, limit=500)
-        if not turns and memory_store.session_exists(cookie_session_id):
+        # Check ownership: if session exists for another user, this is a stale/foreign cookie.
+        if (
+            memory_store.session_exists(cookie_session_id)
+            and not memory_store.session_exists_for_user(cookie_session_id, user_id)
+        ):
             # Foreign session — generate a new one for this user.
             session_id = str(uuid4())
         else:
@@ -975,6 +976,9 @@ async def delete_chat_session(
 ):
     user_id: str = http_request.state.user_id
     current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+
+    if not memory_store.session_exists_for_user(session_id, user_id):
+        return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
 
     memory_store.delete_session(session_id, user_id)
     await _clear_checkpoint_thread(session_id)
