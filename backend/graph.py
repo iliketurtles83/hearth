@@ -7,7 +7,6 @@ import os
 import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, TypedDict
 
 log = logging.getLogger("assistant.graph")
@@ -39,7 +38,6 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from intents import (
     CHAT_MODEL,
     CLOUD_MODEL,
-    CODER_MODEL,
     VISION_MODEL,
     RouteDecision,
     classify_intent,
@@ -51,7 +49,6 @@ from embedding_router import (
 )
 from routing_config import ROUTING_CONFIG
 from tools.weather import format_weather_response, is_weather_reasoning
-from tools.workspace import make_unified_diff, resolve_workspace_path
 
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
@@ -89,12 +86,7 @@ class AssistantState(TypedDict, total=False):
     response_text: str
     response_model: str
     memory_result: dict[str, Any]
-    # Code tool
-    active_files: list[str]          # files the coder has read/touched this turn
-    code_context: str                 # tree-sitter snippets injected into coder prompt
-    pending_write: dict[str, Any]    # {path, content, relative_path} awaiting confirmation
-    awaiting_confirmation: bool       # True when a write diff is pending user approval
-    force_code: bool                  # True for /code endpoint to bypass classifier
+    force_code: bool                  # True for /code endpoint to bias toward code-question intent
     # Responder modality split
     modality: str                     # "voice" or "chat"; set by /chat endpoint from request source
     # Vision input
@@ -263,7 +255,6 @@ def _decision_from_embedding(
     *,
     chat_model: str,
     cloud_model: str,
-    coder_model: str,
     vision_model: str,
     reasoning_summary: str,
 ) -> RouteDecision:
@@ -296,7 +287,7 @@ def _decision_from_embedding(
             intent="code-question",
             confidence=round(_similarity_to_confidence(tool_score), 3),
             use_cloud=False,
-            model=coder_model,
+            model=chat_model,
             tool=None,
             planner_status="embedding",
             reasoning_summary=reasoning_summary,
@@ -346,13 +337,10 @@ def _pick_model_for_decision(
     use_cloud: bool,
     chat_model: str,
     cloud_model: str,
-    coder_model: str,
     vision_model: str,
 ) -> str:
     if use_cloud:
         return cloud_model
-    if intent == "code-question":
-        return coder_model
     if intent == "vision":
         return vision_model
     return chat_model
@@ -366,11 +354,6 @@ def build_assistant_graph(
     graph = StateGraph(AssistantState)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-
-    _CONFIRM_PATTERN = re.compile(
-        r"^\s*(yes|confirm|approve|go ahead|do it|write it|apply|proceed)\s*[.!]?\s*$",
-        re.IGNORECASE,
-    )
 
     # ── Nodes ─────────────────────────────────────────────────────────────────
 
@@ -387,10 +370,10 @@ def build_assistant_graph(
         if state.get("force_code"):
             writer({
                 "meta": {
-                    "model": deps.coder_model or deps.chat_model,
+                    "model": deps.chat_model,
                     "intent": "code-question",
                     "confidence": 1.0,
-                    "route_type": "code",
+                    "route_type": "local",
                     "needs_memory": True,
                     "tool": None,
                     "planner_status": "forced",
@@ -401,60 +384,13 @@ def build_assistant_graph(
                 "intent": "code-question",
                 "confidence": 1.0,
                 "use_cloud": False,
-                "model": deps.coder_model or deps.chat_model,
+                "model": deps.chat_model,
                 "tool": None,
                 "planner_status": "forced",
                 "reasoning_summary": "",
                 "needs_memory": True,
-                "route_type": "code",
+                "route_type": "local",
             }
-
-        # Short-circuit: if a write diff is pending and the user confirmed it,
-        # skip normal LLM routing and go straight to write_executor.
-        if state.get("awaiting_confirmation") and state.get("pending_write"):
-            msg = str(state.get("message", "")).strip()
-            if _CONFIRM_PATTERN.match(msg):
-                log.info(
-                    "graph.intent_classifier | confirm_write detected | session=%s",
-                    state.get("session_id", ""),
-                )
-                writer({"meta": {"intent": "confirm_write", "route_type": "write_executor"}})
-                return {
-                    "intent": "confirm_write",
-                    "route_type": "write_executor",
-                    "confidence": 1.0,
-                    "use_cloud": False,
-                    "planner_status": "deterministic",
-                    "reasoning_summary": "",
-                    "needs_memory": False,
-                }
-
-        # Safety: if user sends a bare confirmation after a write-prompt but
-        # pending_write was lost/cleared, route deterministically so the system
-        # reports "No pending write" instead of hallucinating a write success.
-        msg = str(state.get("message", "")).strip()
-        if _CONFIRM_PATTERN.match(msg):
-            last_assistant = _last_assistant_message().lower()
-            looks_like_write_prompt = (
-                "type **yes** to confirm the write" in last_assistant
-                or "type yes to confirm the write" in last_assistant
-                or "say yes to apply" in last_assistant
-            )
-            if looks_like_write_prompt and not state.get("pending_write"):
-                log.info(
-                    "graph.intent_classifier | confirm_without_pending | session=%s",
-                    state.get("session_id", ""),
-                )
-                writer({"meta": {"intent": "confirm_write", "route_type": "write_executor"}})
-                return {
-                    "intent": "confirm_write",
-                    "route_type": "write_executor",
-                    "confidence": 1.0,
-                    "use_cloud": False,
-                    "planner_status": "deterministic",
-                    "reasoning_summary": "",
-                    "needs_memory": False,
-                }
 
         # Image attachment is a structural signal; skip the classifier
         # entirely.  There is no ambiguous case: an attached image always means
@@ -497,7 +433,6 @@ def build_assistant_graph(
                 use_cloud=fallback.use_cloud,
                 chat_model=deps.chat_model,
                 cloud_model=deps.cloud_model,
-                coder_model=deps.coder_model or deps.chat_model,
                 vision_model=deps.vision_model or deps.chat_model,
             )
             fallback.planner_status = "heuristic"
@@ -555,7 +490,6 @@ def build_assistant_graph(
                             heuristic,
                             chat_model=deps.chat_model,
                             cloud_model=deps.cloud_model,
-                            coder_model=deps.coder_model or deps.chat_model,
                             vision_model=deps.vision_model or deps.chat_model,
                             reasoning_summary=reasoning_summary,
                         )
@@ -566,15 +500,10 @@ def build_assistant_graph(
             decision.intent = "code-question"
             decision.use_cloud = False
             decision.tool = None
-            decision.model = deps.coder_model or deps.chat_model
+            decision.model = deps.chat_model
             decision.planner_status = "write_downgraded_to_code_question"
 
         route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
-        if decision.intent == "code-question":
-            route_type = "code"
-
-        if is_write_like_code_request(state["message"]):
-            writer({"notice": "To edit files, open a project first."})
 
         writer({
             "meta": {
@@ -672,597 +601,6 @@ def build_assistant_graph(
             "local_prompt": local_prompt,
             "cloud_messages": cloud_messages,
         }
-
-    async def code_tool(state: AssistantState) -> dict[str, Any]:
-        """ReAct agent node for code generation and file operations.
-
-        Uses OLLAMA_CODER_MODEL (qwen2.5-coder) via ChatOllama.
-        File writes are intercepted: the diff is streamed to the user and
-        pending_write is set in state; the actual write waits for confirmation.
-        """
-        writer = get_stream_writer()
-
-        if not _workspace_root:
-            msg = (
-                "CODE_WORKSPACE_ROOT is not configured. "
-                "Set it in .env and restart the backend."
-            )
-            writer({"text": msg})
-            return {"response_text": msg, "response_model": deps.coder_model or deps.chat_model}
-
-        # Mutable capture for write requests from within tool calls
-        _pending: dict[str, Any] = {}
-        touched_files: set[str] = set(state.get("active_files", []))
-
-        # In code mode, a bare confirmation without a pending diff should not
-        # re-enter the coder loop and potentially trigger unrelated writes.
-        msg = str(state.get("message", "")).strip()
-        if _CONFIRM_PATTERN.match(msg) and not state.get("pending_write"):
-            no_pending_msg = (
-                "No pending write to confirm. Describe the code change you want "
-                "(for example: add pytest tests for bubble_sort in test_bubble_sort.py)."
-            )
-            writer({"text": no_pending_msg})
-            return {
-                "response_text": no_pending_msg,
-                "response_model": deps.coder_model or deps.chat_model,
-                "pending_write": {},
-                "awaiting_confirmation": False,
-                "active_files": sorted(touched_files),
-            }
-
-        # ── Custom tools ──────────────────────────────────────────────────────
-        try:
-            from langchain_core.tools import tool as lc_tool
-        except ImportError:
-            writer({"text": "langchain-core is not installed. Run: pip install langchain-core"})
-            return {"response_text": "langchain-core missing", "response_model": ""}
-
-        read_file_tool = None
-        try:
-            from langchain_community.tools import ReadFileTool, WriteFileTool  # type: ignore[import-untyped]
-            read_file_tool = ReadFileTool(root_dir=_workspace_root)
-            _ = WriteFileTool(root_dir=_workspace_root)
-        except Exception as exc:
-            log.warning("code_tool: ReadFileTool/WriteFileTool unavailable, using fallback (%s)", exc)
-
-        @lc_tool
-        def read_file(relative_path: str) -> str:
-            """Read a file from the code workspace. Input: path relative to workspace root."""
-            try:
-                resolved = _resolve_workspace_path(relative_path)
-            except ValueError as exc:
-                return f"Error: {exc}"
-            touched_files.add(relative_path)
-            if read_file_tool is not None:
-                try:
-                    return str(read_file_tool.invoke(relative_path))
-                except Exception as exc:
-                    return f"Error reading file: {exc}"
-            try:
-                return Path(resolved).read_text(encoding="utf-8", errors="replace")
-            except FileNotFoundError:
-                return f"File not found: {relative_path}"
-            except OSError as exc:
-                return f"Error reading file: {exc}"
-
-        @lc_tool
-        def list_files(sub_path: str = "") -> str:
-            """List files in the workspace (or a sub-directory). Input: optional sub-path."""
-            try:
-                base = _resolve_workspace_path(sub_path) if sub_path else _workspace_root
-            except ValueError as exc:
-                return f"Error: {exc}"
-            result: list[str] = []
-            for dirpath, dirnames, filenames in os.walk(base):
-                dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("__pycache__", "node_modules", ".venv")]
-                for fname in filenames:
-                    p = Path(dirpath) / fname
-                    try:
-                        result.append(str(p.relative_to(_workspace_root)))
-                    except ValueError:
-                        result.append(str(p))
-            return "\n".join(result) if result else "(empty)"
-
-        @lc_tool
-        def write_file(relative_path: str, content: str) -> str:
-            """Propose writing content to a file.  Shows a diff; user must type 'yes' to confirm.
-            Input: relative_path (str), content (str)."""
-            try:
-                resolved = _resolve_workspace_path(relative_path)
-            except ValueError as exc:
-                return f"Error: {exc}"
-            touched_files.add(relative_path)
-            try:
-                original = Path(resolved).read_text(encoding="utf-8", errors="replace")
-            except FileNotFoundError:
-                original = ""
-            diff = _make_unified_diff(relative_path, original, content)
-            _pending["path"] = resolved
-            _pending["content"] = content
-            _pending["relative_path"] = relative_path
-            if diff:
-                if str(state.get("source", "text")).lower() == "voice":
-                    return _write_summary_for_voice(relative_path, diff)
-                return (
-                    f"```diff\n{diff}\n```\n\n"
-                    "Type **yes** to confirm the write, or describe any changes you want first."
-                )
-            return "No changes detected — the file already has that content."
-
-        active_tools = [read_file, list_files, write_file]
-
-        enable_shell = os.getenv("CODE_ENABLE_SHELL", "false").lower() == "true"
-        if enable_shell:
-            try:
-                from langchain_community.tools import ShellTool  # type: ignore[import-untyped]
-                active_tools.append(ShellTool())
-                log.info("code_tool: ShellTool enabled (CODE_ENABLE_SHELL=true)")
-            except ImportError:
-                log.warning("code_tool: ShellTool requested but langchain-community not installed")
-
-        enable_repl = os.getenv("CODE_ENABLE_REPL", "true").lower() == "true"
-        if enable_repl:
-            try:
-                from langchain_community.tools import PythonREPLTool  # type: ignore[import-untyped]
-                active_tools.append(PythonREPLTool())
-            except ImportError:
-                log.warning("code_tool: PythonREPLTool requested but langchain-community not installed")
-
-        # ── Build the ReAct agent ─────────────────────────────────────────────
-        try:
-            from langchain_ollama import ChatOllama  # type: ignore[import-untyped]
-            from langgraph.prebuilt import create_react_agent
-        except ImportError as exc:
-            msg = f"Missing dependency for code_tool: {exc}. Run: pip install langchain-ollama"
-            writer({"text": msg})
-            return {"response_text": msg, "response_model": ""}
-
-        coder_model_name = deps.coder_model or deps.chat_model
-        llm = ChatOllama(
-            base_url=os.getenv("OLLAMA_URL", "http://ollama:11434"),
-            model=coder_model_name,
-            temperature=0,
-        )
-
-        # Build system prompt with code_context injection
-        base_system = state.get("augmented_system", state.get("system", ""))
-        code_context = state.get("code_context", "")
-        workspace_note = f"\nYour workspace root is: {_workspace_root}\nAll file paths are relative to this root."
-        if code_context:
-            system_prompt = (
-                f"{base_system}{workspace_note}\n\n"
-                f"Relevant codebase context (tree-sitter summaries):\n{code_context}"
-            )
-        else:
-            system_prompt = f"{base_system}{workspace_note}"
-
-        agent = create_react_agent(llm, active_tools, prompt=system_prompt)
-
-        response_text = ""
-        handled_json_tool_call = False
-
-        log.info(
-            "graph.code_tool | model=%s | session=%s | tools=%s",
-            coder_model_name,
-            state.get("session_id", ""),
-            [t.name for t in active_tools],
-        )
-
-        async def _run_agent_once(user_message: str) -> str:
-            collected = ""
-            try:
-                async for event in agent.astream_events(
-                    {"messages": [{"role": "user", "content": user_message}]},
-                    version="v2",
-                ):
-                    event_type = event.get("event", "")
-                    if event_type == "on_chat_model_stream":
-                        chunk = event["data"].get("chunk")
-                        if chunk and hasattr(chunk, "content") and chunk.content:
-                            collected += chunk.content
-                    elif event_type == "on_tool_start":
-                        tool_name = event.get("name", "unknown")
-                        log.info(
-                            "graph.code_tool | tool_start | tool=%s | session=%s",
-                            tool_name,
-                            state.get("session_id", ""),
-                        )
-                    elif event_type == "on_tool_end":
-                        tool_name = event.get("name", "unknown")
-                        tool_output = event.get("data", {}).get("output", "")
-                        log.info(
-                            "graph.code_tool | tool_end | tool=%s | output_len=%d | session=%s",
-                            tool_name,
-                            len(str(tool_output)),
-                            state.get("session_id", ""),
-                        )
-            except Exception as exc:
-                log.error(
-                    "graph.code_tool | stream error: %s | session=%s",
-                    exc,
-                    state.get("session_id", ""),
-                    exc_info=True,
-                )
-                err_msg = f"Code tool error: {exc}"
-                writer({"text": err_msg})
-                return err_msg
-            return collected
-
-        def _extract_json_tool_payload(text: str) -> dict[str, Any] | None:
-            candidate = text.strip()
-            if not candidate:
-                return None
-            if not (candidate.startswith("{") and candidate.endswith("}")):
-                first = candidate.find("{")
-                last = candidate.rfind("}")
-                if first != -1 and last != -1 and last > first:
-                    candidate = candidate[first:last + 1]
-            try:
-                payload = json.loads(candidate)
-            except Exception:
-                return None
-            if isinstance(payload, dict) and payload.get("name"):
-                return payload
-            return None
-
-        def _execute_readonly_fallback_tool(payload: dict[str, Any]) -> str | None:
-            tool_name = str(payload.get("name", ""))
-            args = payload.get("arguments", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except Exception:
-                    args = {}
-
-            if tool_name == "list_files":
-                sub_path = args.get("sub_path", "") if isinstance(args, dict) else ""
-                try:
-                    base = _resolve_workspace_path(sub_path) if sub_path else _workspace_root
-                except ValueError:
-                    base = _workspace_root
-                result_files: list[str] = []
-                for dirpath, dirnames, filenames in os.walk(base):
-                    dirnames[:] = [
-                        d for d in dirnames
-                        if not d.startswith(".") and d not in ("__pycache__", "node_modules", ".venv")
-                    ]
-                    for fname in filenames:
-                        p = Path(dirpath) / fname
-                        try:
-                            rel = str(p.relative_to(_workspace_root))
-                        except ValueError:
-                            rel = str(p)
-                        result_files.append(rel)
-                        touched_files.add(rel)
-                log.info(
-                    "graph.code_tool | fallback_executed_list_files | count=%d | session=%s",
-                    len(result_files),
-                    state.get("session_id", ""),
-                )
-                return "\n".join(result_files) if result_files else "(empty)"
-
-            if tool_name == "read_file":
-                relative_path = args.get("relative_path", "") if isinstance(args, dict) else ""
-                if not relative_path and isinstance(args, dict):
-                    relative_path = args.get("file_path", "")
-                if not relative_path:
-                    return "Error: missing relative_path"
-                try:
-                    resolved = _resolve_workspace_path(relative_path)
-                    touched_files.add(relative_path)
-                    return Path(resolved).read_text(encoding="utf-8", errors="replace")
-                except (FileNotFoundError, ValueError, OSError) as exc:
-                    return f"Error: {exc}"
-
-            return None
-
-        response_text = await _run_agent_once(str(state.get("message", "")))
-
-        # Fallback for models that emit JSON tool calls as plain text instead of
-        # structured tool-call messages (observed with some Ollama coder models).
-        # If we see a read-only tool call, execute it and run one follow-up turn
-        # automatically so the model can proceed to a write_file call in the same turn.
-        max_fallback_turns = 3
-        fallback_turn = 0
-        while not _pending and response_text.strip() and fallback_turn < max_fallback_turns:
-            payload = _extract_json_tool_payload(response_text)
-            if not payload:
-                break
-
-            tool_name = str(payload.get("name", ""))
-            if tool_name == "write_file":
-                args = payload.get("arguments", {})
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except Exception:
-                        args = {}
-                if isinstance(args, dict):
-                    relative_path = str(args.get("relative_path", "") or "").strip()
-                    content = args.get("content", "")
-                    if relative_path and isinstance(content, str):
-                        try:
-                            resolved = _resolve_workspace_path(relative_path)
-                            try:
-                                original = Path(resolved).read_text(encoding="utf-8", errors="replace")
-                            except FileNotFoundError:
-                                original = ""
-
-                            diff = _make_unified_diff(relative_path, original, content)
-                            _pending["path"] = resolved
-                            _pending["content"] = content
-                            _pending["relative_path"] = relative_path
-                            touched_files.add(relative_path)
-
-                            if diff:
-                                if str(state.get("source", "text")).lower() == "voice":
-                                    confirm_msg = _write_summary_for_voice(relative_path, diff)
-                                else:
-                                    confirm_msg = (
-                                        f"```diff\n{diff}\n```\n\n"
-                                        "Type **yes** to confirm the write, or describe any changes you want first."
-                                    )
-                            else:
-                                confirm_msg = "No changes detected — the file already has that content."
-
-                            writer({"text": confirm_msg})
-                            response_text = confirm_msg
-                            handled_json_tool_call = True
-                            log.info(
-                                "graph.code_tool | fallback_tool_parse=write_file | path=%s | session=%s",
-                                relative_path,
-                                state.get("session_id", ""),
-                            )
-                        except ValueError as exc:
-                            msg = f"Write blocked: {exc}"
-                            writer({"text": msg})
-                            response_text = msg
-                            handled_json_tool_call = True
-                break
-
-            readonly_output = _execute_readonly_fallback_tool(payload)
-            if readonly_output is None:
-                log.warning(
-                    "graph.code_tool | unknown_tool_in_fallback | tool=%s | session=%s",
-                    tool_name,
-                    state.get("session_id", ""),
-                )
-                break
-
-            fallback_turn += 1
-            followup_prompt = (
-                "You emitted a tool call as JSON text instead of a structured tool call.\n"
-                f"Tool name: {tool_name}\n"
-                "Tool output:\n"
-                f"{readonly_output}\n\n"
-                f"Original user request: {state.get('message', '')}\n"
-                "Continue solving the request now. If you need to create or edit files, "
-                "emit a write_file JSON tool call with relative_path and content."
-            )
-            log.info(
-                "graph.code_tool | fallback_followup_turn=%d | tool=%s | session=%s",
-                fallback_turn,
-                tool_name,
-                state.get("session_id", ""),
-            )
-            response_text = await _run_agent_once(followup_prompt)
-
-        if not handled_json_tool_call and response_text.strip() and not response_text.startswith("Code tool error:"):
-            writer({"text": response_text})
-
-        result: dict[str, Any] = {
-            "response_text": response_text.strip(),
-            "response_model": coder_model_name,
-            "active_files": sorted(touched_files),
-        }
-        if _pending:
-            result["pending_write"] = dict(_pending)
-            result["awaiting_confirmation"] = True
-            log.info(
-                "graph.code_tool | pending_write=%s | session=%s",
-                _pending.get("relative_path"),
-                state.get("session_id", ""),
-            )
-        else:
-            # Clear any stale pending_write from previous turn
-            result["pending_write"] = {}
-            result["awaiting_confirmation"] = False
-
-        return result
-
-    async def write_executor(state: AssistantState) -> dict[str, Any]:
-        """Execute a confirmed file write from pending_write state."""
-        writer = get_stream_writer()
-        pending = state.get("pending_write") or {}
-        touched_files: set[str] = set(state.get("active_files", []))
-
-        if not pending or not pending.get("path") or not pending.get("content"):
-            msg = "No pending write to execute."
-            writer({"text": msg})
-            return {
-                "response_text": msg,
-                "pending_write": {},
-                "awaiting_confirmation": False,
-            }
-
-        resolved_path = pending["path"]
-        relative_path = pending.get("relative_path", resolved_path)
-        content = pending["content"]
-
-        # Re-validate path (defence in depth — state could be replayed)
-        try:
-            _resolve_workspace_path(relative_path)
-        except ValueError as exc:
-            msg = f"Write blocked: {exc}"
-            log.warning("graph.write_executor | blocked | %s", exc)
-            writer({"text": msg})
-            return {
-                "response_text": msg,
-                "pending_write": {},
-                "awaiting_confirmation": False,
-            }
-
-        try:
-            wrote_with_tool = False
-            try:
-                from langchain_community.tools import WriteFileTool  # type: ignore[import-untyped]
-                wf = WriteFileTool(root_dir=_workspace_root)
-                wf.invoke({"file_path": relative_path, "text": content})
-                wrote_with_tool = True
-            except Exception:
-                wrote_with_tool = False
-
-            if not wrote_with_tool:
-                Path(resolved_path).parent.mkdir(parents=True, exist_ok=True)
-                Path(resolved_path).write_text(content, encoding="utf-8")
-
-            touched_files.add(relative_path)
-            msg = f"Written: `{relative_path}`"
-            log.info("graph.write_executor | written | path=%s | session=%s", relative_path, state.get("session_id", ""))
-        except OSError as exc:
-            msg = f"Write failed: {exc}"
-            log.error("graph.write_executor | os_error | path=%s | %s", relative_path, exc)
-
-        writer({"text": msg})
-        return {
-            "response_text": msg,
-            "response_model": deps.chat_model,
-            "pending_write": {},
-            "awaiting_confirmation": False,
-            "active_files": sorted(touched_files),
-        }
-
-    async def coding_agent_tool(state: AssistantState) -> dict[str, Any]:
-        """Confirmation gate for project-scoped coding tasks.
-
-        Presents the planned task to the user and waits for explicit confirmation
-        before dispatching to the coding runtime adapter. Sets
-        awaiting_agent_confirmation=True and
-        stores the task in pending_code_task state.
-        """
-        writer = get_stream_writer()
-        if not str(state.get("project_id", "") or "").strip():
-            msg = "Coding edits are project-only. Open a project first."
-            writer({"text": msg})
-            return {
-                "response_text": msg,
-                "response_model": deps.chat_model,
-                "pending_code_task": "",
-                "awaiting_agent_confirmation": False,
-            }
-
-        task = str(state.get("message", "")).strip()
-        modality = state.get("modality", "chat")
-
-        if modality == "voice":
-            words = task.split()
-            task_preview = " ".join(words[:12]) + ("..." if len(words) > 12 else "")
-            confirm_text = (
-                f"Got it. {task_preview}. "
-                "Say yes to confirm, or tell me what to change."
-            )
-        else:
-            confirm_text = (
-                "I'll run this coding task in the current project:\n\n"
-                f"> {task}\n\n"
-                "Type **yes** to confirm, or describe what you want changed."
-            )
-
-        writer({"text": confirm_text})
-        log.info(
-            "graph.coding_agent_tool | awaiting_confirmation | session=%s task_len=%d",
-            state.get("session_id", ""),
-            len(task),
-        )
-        return {
-            "response_text": confirm_text,
-            "response_model": deps.coder_model or deps.chat_model,
-            "pending_code_task": task,
-            "awaiting_agent_confirmation": True,
-        }
-
-    async def coding_agent_executor(state: AssistantState) -> dict[str, Any]:
-        """Execute a confirmed coding task via the coding-agent runtime adapter.
-
-        Reads pending_code_task and code_context from state, calls coding_agent.run(),
-        shapes the result based on modality, and clears the confirmation flags.
-        """
-        writer = get_stream_writer()
-        task = str(state.get("pending_code_task", "") or state.get("message", "")).strip()
-        code_context = state.get("code_context", "") or ""
-        session_id = state.get("session_id", "")
-        modality = state.get("modality", "chat")
-
-        _base: dict[str, Any] = {
-            "pending_code_task": "",
-            "awaiting_agent_confirmation": False,
-            "response_model": deps.coder_model or deps.chat_model,
-        }
-
-        if not task:
-            msg = "No pending coding task to execute."
-            writer({"text": msg})
-            return {**_base, "response_text": msg}
-
-        log.info(
-            "graph.coding_agent_executor | dispatching | session=%s task_len=%d context_len=%d",
-            session_id,
-            len(task),
-            len(code_context),
-        )
-
-        try:
-            from tools.coding_agent import run as _agent_run
-        except ImportError:
-            msg = "Coding agent tool is not available. Check backend/tools/coding_agent.py."
-            writer({"text": msg})
-            return {**_base, "response_text": msg}
-
-        result = await _agent_run({
-            "task": task,
-            "context": code_context,
-            "session_id": session_id,
-        })
-
-        if not result.ok:
-            msg = result.error or "The coding agent returned an error."
-            writer({"text": msg})
-            return {**_base, "response_text": msg}
-
-        result_text: str = result.data.get("result", "")
-        files_changed: list[str] = result.data.get("files_changed", [])
-
-        if modality == "voice":
-            if files_changed:
-                names = [f.split("/")[-1] for f in files_changed[:3]]
-                files_summary = ", ".join(names)
-                if len(files_changed) > 3:
-                    files_summary += f" and {len(files_changed) - 3} more"
-                spoken_base = f"Done. Modified {files_summary}."
-            else:
-                spoken_base = "Done. The coding agent completed the task."
-            full_spoken = spoken_base + (f" {result_text}" if result_text else "")
-            response_text = await _compress_response_for_voice(full_spoken, deps.chat_model)
-            writer({"text": response_text})
-        else:
-            parts: list[str] = []
-            if files_changed:
-                files_list = "\n".join(f"- `{f}`" for f in files_changed)
-                parts.append(f"**Files changed:**\n{files_list}")
-            if result_text:
-                parts.append(result_text)
-            if not parts:
-                parts.append("The coding agent completed the task.")
-            response_text = "\n\n".join(parts)
-            writer({"text": response_text})
-
-        log.info(
-            "graph.coding_agent_executor | done | files=%d session=%s",
-            len(files_changed),
-            session_id,
-        )
-        return {**_base, "response_text": response_text}
 
     _VOICE_COMPRESS_SYSTEM = (
         "You convert assistant responses to natural spoken English for audio output. "
@@ -1458,7 +796,6 @@ def build_assistant_graph(
         writer = get_stream_writer()
         user_id = str(state.get("user_id", ""))
         session_id = str(state.get("session_id", ""))
-        project_id = str(state.get("project_id", "") or "").strip() or None
         message = str(state.get("message", "") or "")
         response_text = str(state.get("response_text", "") or "").strip()
 
@@ -1466,41 +803,21 @@ def build_assistant_graph(
             return {"memory_result": {}}
 
         # 1) Persist the turn in conversation_log.
-        if project_id:
-            await asyncio.to_thread(
-                deps.memory_store.log_turn,
-                session_id,
-                user_id,
-                "user",
-                message,
-                project_id,
-            )
-        else:
-            await asyncio.to_thread(
-                deps.memory_store.log_turn,
-                session_id,
-                user_id,
-                "user",
-                message,
-            )
+        await asyncio.to_thread(
+            deps.memory_store.log_turn,
+            session_id,
+            user_id,
+            "user",
+            message,
+        )
         if response_text:
-            if project_id:
-                await asyncio.to_thread(
-                    deps.memory_store.log_turn,
-                    session_id,
-                    user_id,
-                    "assistant",
-                    response_text,
-                    project_id,
-                )
-            else:
-                await asyncio.to_thread(
-                    deps.memory_store.log_turn,
-                    session_id,
-                    user_id,
-                    "assistant",
-                    response_text,
-                )
+            await asyncio.to_thread(
+                deps.memory_store.log_turn,
+                session_id,
+                user_id,
+                "assistant",
+                response_text,
+            )
 
         # 2) Extract explicit/inline memory from the user message.
         raw_memory_result = await asyncio.to_thread(
@@ -1527,17 +844,10 @@ def build_assistant_graph(
             writer({"memory": memory_payload})
 
         # 3) Threshold-based consolidation trigger.
-        if project_id:
-            unconsolidated = await asyncio.to_thread(
-                deps.memory_store.count_unconsolidated,
-                user_id,
-                project_id,
-            )
-        else:
-            unconsolidated = await asyncio.to_thread(
-                deps.memory_store.count_unconsolidated,
-                user_id,
-            )
+        unconsolidated = await asyncio.to_thread(
+            deps.memory_store.count_unconsolidated,
+            user_id,
+        )
         consolidation_threshold = int(os.getenv("MEMORY_CONSOLIDATION_THRESHOLD", "3"))
         if unconsolidated >= consolidation_threshold:
             consolidation_batch = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
@@ -1555,17 +865,9 @@ def build_assistant_graph(
     # ── Edge routing helpers ───────────────────────────────────────────────────
 
     def _after_intent_classifier(state: AssistantState) -> str:
-        if state.get("intent") == "confirm_write":
-            return "write_executor"
-        if state.get("intent") == "confirm_agent_task":
-            return "coding_agent_executor"
         return "memory_retrieval"
 
     def _after_tool_router(state: AssistantState) -> str:
-        if str(state.get("project_id", "") or "").strip():
-            return "coding_agent_tool"
-        if state.get("intent") == "code-question":
-            return "code_tool"
         return "responder"
 
     # ── Wire the graph ─────────────────────────────────────────────────────────
@@ -1574,10 +876,6 @@ def build_assistant_graph(
     graph.add_node("intent_classifier", intent_classifier)
     graph.add_node("memory_retrieval", memory_retrieval)
     graph.add_node("tool_router", tool_router)
-    graph.add_node("code_tool", code_tool)
-    graph.add_node("write_executor", write_executor)
-    graph.add_node("coding_agent_tool", coding_agent_tool)
-    graph.add_node("coding_agent_executor", coding_agent_executor)
     graph.add_node("responder", responder)
     graph.add_node("memory_writer", memory_writer)
 
@@ -1585,19 +883,11 @@ def build_assistant_graph(
     graph.add_edge("history_loader", "intent_classifier")
     graph.add_conditional_edges("intent_classifier", _after_intent_classifier, {
         "memory_retrieval": "memory_retrieval",
-        "write_executor": "write_executor",
-        "coding_agent_executor": "coding_agent_executor",
     })
     graph.add_edge("memory_retrieval", "tool_router")
     graph.add_conditional_edges("tool_router", _after_tool_router, {
-        "coding_agent_tool": "coding_agent_tool",
-        "code_tool": "code_tool",
         "responder": "responder",
     })
-    graph.add_edge("code_tool", "memory_writer")
-    graph.add_edge("write_executor", "memory_writer")
-    graph.add_edge("coding_agent_tool", "memory_writer")
-    graph.add_edge("coding_agent_executor", "memory_writer")
     graph.add_edge("responder", "memory_writer")
     graph.add_edge("memory_writer", END)
 

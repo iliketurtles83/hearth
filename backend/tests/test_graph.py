@@ -47,7 +47,7 @@ TEST_CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
 
 
 class _FakeMemoryStore:
-    def retrieve(self, _user_id: str, _query: str, _limit: int | None = None, _project_id: str | None = None):
+    def retrieve(self, _user_id: str, _query: str, _limit: int | None = None):
         return []
 
     def get_session_turns(
@@ -55,7 +55,6 @@ class _FakeMemoryStore:
         _session_id: str,
         _user_id: str,
         _limit: int = 500,
-        _project_id: str | None = None,
     ):
         return []
 
@@ -63,7 +62,6 @@ class _FakeMemoryStore:
         self,
         _session_id: str,
         _user_id: str,
-        _project_id: str | None = None,
     ) -> str:
         return ""
 
@@ -73,17 +71,16 @@ class _FakeMemoryStore:
         _user_id: str,
         _role: str,
         _content: str,
-        _project_id: str | None = None,
     ) -> None:
         return None
 
     def ingest_user_message(self, _user_id: str, _message: str, _source: str = "text"):
         return {"status": "none", "saved": [], "blocked": [], "needs_confirmation": []}
 
-    def count_unconsolidated(self, _user_id: str, _project_id: str | None = None) -> int:
+    def count_unconsolidated(self, _user_id: str) -> int:
         return 0
 
-    def consolidate_pending(self, _user_id=None, _limit: int = 50, _project_id: str | None = None):
+    def consolidate_pending(self, _user_id=None, _limit: int = 50):
         return {}
 
 
@@ -229,7 +226,7 @@ async def test_graph_checkpoint_resume_reloads_state_without_reexecution():
 
 
 @pytest.mark.asyncio
-async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
+async def test_graph_yes_after_old_write_prompt_routes_normally():
     async def _fake_router(_message: str):
         return SimpleNamespace(
             intent="quick-local",
@@ -243,18 +240,18 @@ async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
         )
 
     async def _fake_stream_local(_request, model_name=None):
-        yield "should not run"
+        yield "normal yes response"
 
     async def _fake_stream_cloud(_system: str, _messages: list[dict]):
-        yield "should not run"
+        yield "cloud"
 
     async def _fake_tool_dispatch(_tool_name: str, _params: dict):
-        raise AssertionError("tool dispatch should not run in confirm-write orphan test")
+        raise AssertionError("tool dispatch should not run in yes-routing test")
 
-    # history_loader populates state["history"] from the memory store, so the
-    # confirm-write prompt must be returned by get_session_turns.
+    # Keep legacy text in history to ensure it does not trigger removed
+    # confirm-write routing behavior.
     class _HistoryMemoryStore(_FakeMemoryStore):
-        def get_session_turns(self, _session_id, _user_id, _limit=500, _project_id=None):
+        def get_session_turns(self, _session_id, _user_id, _limit=500):
             return [
                 {
                     "role": "assistant",
@@ -276,158 +273,54 @@ async def test_graph_orphan_yes_after_write_prompt_returns_no_pending_write():
     graph = assistant_graph.build_assistant_graph(deps)
     state = _base_state()
     state["message"] = "yes"
-    state["pending_write"] = {}
-    state["awaiting_confirmation"] = False
 
     result = await graph.ainvoke(state)
-    assert result["intent"] == "confirm_write"
-    assert result["response_text"] == "No pending write to execute."
+    assert result["intent"] == "quick-local"
+    assert result["response_text"] == "normal yes response"
 
 
-# ── Phase 13 — coding agent integration ───────────────────────────────────────
+@pytest.mark.asyncio
+async def test_force_code_uses_chat_model_local_route():
+    graph = assistant_graph.build_assistant_graph(_deps_for_local_stream(["code answer"]))
+    state = _base_state()
+    state["message"] = "Refactor this sorting function"
+    state["force_code"] = True
 
-def _deps_for_code_write(*, embedding_router=None) -> assistant_graph.AssistantGraphDependencies:
-    """Return minimal deps for coding-agent tests (stream_local not needed)."""
+    result = await graph.ainvoke(state)
 
-    async def _fake_stream_local(_request, model_name=None):
-        yield "should not stream in coding agent gate tests"
+    assert result["intent"] == "code-question"
+    assert result["route_type"] == "local"
+    assert result["response_model"] == TEST_CHAT_MODEL
+    assert result["response_text"] == "code answer"
 
-    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
-        yield "cloud"
 
-    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
-        raise AssertionError("tool dispatch should not run in coding agent tests")
+@pytest.mark.asyncio
+async def test_code_question_uses_chat_model_when_router_selects_code_intent(monkeypatch):
+    class _CodeEmbeddingRouter:
+        def classify_embedding(self, _query_embedding):
+            return DualClassifierResult(
+                tool=ClassifierResult(label="code", score=0.93, gap=0.30),
+                dialogue=ClassifierResult(label="local", score=0.52, gap=0.08),
+                should_escalate=False,
+            )
 
-    return assistant_graph.AssistantGraphDependencies(
-        memory_store=_FakeMemoryStore(),
-        embedding_router=embedding_router,
-        router_route=lambda _m: None,
-        stream_local=_fake_stream_local,
-        stream_cloud=_fake_stream_cloud,
-        tool_dispatch=_fake_tool_dispatch,
-        chat_model=TEST_CHAT_MODEL,
-        cloud_model=TEST_CLOUD_MODEL,
+    async def _fake_embed_text(*_args, **_kwargs):
+        return np.array([0.2, 0.1, 0.3], dtype=np.float32)
+
+    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+
+    graph = assistant_graph.build_assistant_graph(
+        _deps_for_local_stream(["code via local chat"], embedding_router=_CodeEmbeddingRouter())
     )
-
-
-def _heuristic_returning(intent: str):
-    """Return a classifier stub that emits the given intent."""
-
-    def _classify(_prompt: str):
-        return assistant_graph.RouteDecision(
-            intent=intent,
-            confidence=0.9,
-            use_cloud=False,
-            model=TEST_CHAT_MODEL,
-            tool=None,
-            planner_status="heuristic",
-            reasoning_summary=f"test stub for {intent}",
-            needs_memory=False,
-        )
-
-    return _classify
-
-
-@pytest.mark.asyncio
-async def test_project_session_routes_to_coding_agent_tool():
-    """Project sessions should route directly to the coding-agent confirmation gate."""
-    graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
     state = _base_state()
-    state["message"] = "Write a Python function that sorts a list of integers."
-    state["project_id"] = "proj-123"
-    state["project_folder"] = "/tmp/proj-123"
+    state["message"] = "How does this SQL migration work?"
 
     result = await graph.ainvoke(state)
 
-    assert result["intent"] == "code-write"
-    assert result["awaiting_agent_confirmation"] is True
-    assert result["pending_code_task"] == state["message"]
-    # response_text should contain a confirmation prompt
-    assert "yes" in result["response_text"].lower()
-
-
-@pytest.mark.asyncio
-async def test_project_voice_prompt_is_short():
-    """Voice confirmation prompt should be ≤ 12-word preview, not full task."""
-    graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
-    long_task = "Write " + " ".join([f"word{i}" for i in range(30)])
-    state = _base_state()
-    state["message"] = long_task
-    state["modality"] = "voice"
-    state["project_id"] = "proj-123"
-    state["project_folder"] = "/tmp/proj-123"
-
-    result = await graph.ainvoke(state)
-
-    # The preview should be truncated — full task (30+ extra words) must not appear verbatim
-    assert result["pending_code_task"] == long_task
-    assert long_task not in result["response_text"]
-    assert "..." in result["response_text"]
-
-
-@pytest.mark.asyncio
-async def test_confirm_agent_task_routes_to_executor(monkeypatch):
-    """'yes' with pending agent task should invoke coding_agent_executor."""
-    import tools.coding_agent as _coding_agent_mod
-    from tools.base import ToolResult
-
-    async def _mock_agent_run(params: dict) -> ToolResult:
-        assert params["task"] == "Add type hints to utils.py"
-        return ToolResult(
-            ok=True,
-            data={"result": "Done.", "files_changed": ["utils.py"], "status": "success"},
-        )
-
-    monkeypatch.setattr(_coding_agent_mod, "run", _mock_agent_run)
-
-    graph = assistant_graph.build_assistant_graph(_deps_for_code_write())
-    state = _base_state()
-    state["message"] = "yes"
-    state["awaiting_agent_confirmation"] = True
-    state["pending_code_task"] = "Add type hints to utils.py"
-
-    result = await graph.ainvoke(state)
-
-    assert result["intent"] == "confirm_agent_task"
-    assert result["awaiting_agent_confirmation"] is False
-    assert result["pending_code_task"] == ""
-    assert "utils.py" in result["response_text"]
-
-
-@pytest.mark.asyncio
-async def test_orphan_yes_without_agent_pending_does_not_trigger_executor():
-    """'yes' without awaiting_agent_confirmation must not enter coding_agent_executor."""
-
-    async def _fake_stream_local(_request, model_name=None):
-        yield "normal response"
-
-    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
-        yield "cloud"
-
-    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
-        raise AssertionError("tool dispatch should not run")
-
-    deps = assistant_graph.AssistantGraphDependencies(
-        memory_store=_FakeMemoryStore(),
-        embedding_router=None,
-        router_route=lambda _m: None,
-        stream_local=_fake_stream_local,
-        stream_cloud=_fake_stream_cloud,
-        tool_dispatch=_fake_tool_dispatch,
-        chat_model=TEST_CHAT_MODEL,
-        cloud_model=TEST_CLOUD_MODEL,
-    )
-    graph = assistant_graph.build_assistant_graph(deps)
-    state = _base_state()
-    state["message"] = "yes"
-    state["awaiting_agent_confirmation"] = False
-    state["pending_code_task"] = ""
-
-    result = await graph.ainvoke(state)
-
-    # Should NOT be confirm_agent_task — routes normally
-    assert result.get("intent") != "confirm_agent_task"
-    assert result.get("awaiting_agent_confirmation") is not True
+    assert result["intent"] == "code-question"
+    assert result["route_type"] == "local"
+    assert result["response_model"] == TEST_CHAT_MODEL
+    assert result["response_text"] == "code via local chat"
 
 
 # ── Slice 1 — Heuristic gate tests ───────────────────────────────────────────
