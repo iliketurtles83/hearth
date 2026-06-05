@@ -42,6 +42,7 @@ _stub_if_missing("langgraph.graph")
 _stub_if_missing("kokoro_onnx")
 
 # Patch the heavy imports before loading main.
+# Delete stubs after loading to prevent shadowing real packages during test collection.
 with (
     patch.dict(os.environ, {
         "ANTHROPIC_API_KEY": "test",
@@ -115,6 +116,11 @@ def _load_helpers():
 
 
 _beets_db_has_items, _bootstrap_beets_library_if_empty = _load_helpers()
+
+# Clear stubs that were only needed for loading main.py helpers.
+# This prevents them from shadowing real packages during test collection.
+for _stub_name in ["chromadb", "chromadb.config", "langgraph", "langgraph.graph", "numpy", "musicpd", "faster_whisper", "openwakeword", "openwakeword.model", "kokoro_onnx"]:
+    sys.modules.pop(_stub_name, None)
 
 
 # ── _beets_db_has_items ───────────────────────────────────────────────────────

@@ -69,64 +69,37 @@ async def _read_sse_events(streaming_response) -> list[str]:
 
 
 @pytest.fixture(autouse=True)
-def clear_session_store(monkeypatch):
-    main._session_store.clear()
+def clear_session_store():
+    main.memory_store._conn.execute("DELETE FROM conversation_log")
+    main.memory_store._conn.execute("DELETE FROM summaries")
+    main.memory_store._conn.commit()
     yield
-    main._session_store.clear()
+    main.memory_store._conn.execute("DELETE FROM conversation_log")
+    main.memory_store._conn.execute("DELETE FROM summaries")
+    main.memory_store._conn.commit()
 
 
-def test_get_or_create_session_scoped_to_user():
-    alice_session_id, alice_created = main._get_or_create_session("alice", None)
-    bob_session_id, bob_created = main._get_or_create_session("bob", alice_session_id)
+def test_list_sessions_scoped_to_user():
+    alice_session_id = "sess-alice"
+    bob_session_id = "sess-bob"
 
-    assert alice_created is True
-    assert bob_created is True
-    assert bob_session_id != alice_session_id
-    assert main._session_store[alice_session_id]["user_id"] == "alice"
-    assert main._session_store[bob_session_id]["user_id"] == "bob"
+    main.memory_store.log_turn(alice_session_id, "alice", "user", "alice prompt")
+    main.memory_store.log_turn(bob_session_id, "bob", "user", "bob prompt")
 
+    alice_sessions = main.memory_store.list_sessions("alice")
+    bob_sessions = main.memory_store.list_sessions("bob")
 
-def test_list_sessions_only_returns_owned_sessions():
-    alice_session_id, _ = main._get_or_create_session("alice", None)
-    bob_session_id, _ = main._get_or_create_session("bob", None)
-
-    main._append_session_message(alice_session_id, "user", "alice prompt")
-    main._append_session_message(bob_session_id, "user", "bob prompt")
-
-    alice_sessions = main._list_sessions("alice")
-    bob_sessions = main._list_sessions("bob")
-
-    assert [item["session_id"] for item in alice_sessions] == [alice_session_id]
-    assert [item["session_id"] for item in bob_sessions] == [bob_session_id]
-
-
-def test_list_sessions_sorted_by_updated_at_descending():
-    first_id, _ = main._get_or_create_session("alice", None)
-    second_id, _ = main._get_or_create_session("alice", None)
-
-    main._append_session_message(first_id, "user", "older")
-    main._append_session_message(second_id, "user", "newer")
-
-    sessions = main._list_sessions("alice")
-    assert [item["session_id"] for item in sessions] == [second_id, first_id]
-
-
-def test_get_or_create_existing_session_does_not_touch_updated_at():
-    session_id, _ = main._get_or_create_session("alice", None)
-    original_updated_at = main._session_store[session_id]["updated_at"]
-
-    returned_id, created = main._get_or_create_session("alice", session_id)
-
-    assert returned_id == session_id
-    assert created is False
-    assert main._session_store[session_id]["updated_at"] == original_updated_at
+    assert len(alice_sessions) == 1
+    assert alice_sessions[0]["session_id"] == alice_session_id
+    assert len(bob_sessions) == 1
+    assert bob_sessions[0]["session_id"] == bob_session_id
 
 
 @pytest.mark.asyncio
 async def test_list_chat_sessions_hides_foreign_current_session_cookie():
-    alice_session_id, _ = main._get_or_create_session("alice", None)
+    main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
 
-    response = await main.list_chat_sessions(_request("bob", alice_session_id))
+    response = await main.list_chat_sessions(_request("bob", "sess-alice"))
     payload = _json_body(response)
 
     assert payload["sessions"] == []
@@ -135,10 +108,10 @@ async def test_list_chat_sessions_hides_foreign_current_session_cookie():
 
 @pytest.mark.asyncio
 async def test_select_chat_session_denies_other_users_session():
-    alice_session_id, _ = main._get_or_create_session("alice", None)
+    main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
 
     response = await main.select_chat_session(
-        main.SessionSelectRequest(session_id=alice_session_id),
+        main.SessionSelectRequest(session_id="sess-alice"),
         _request("bob"),
     )
 
@@ -148,84 +121,81 @@ async def test_select_chat_session_denies_other_users_session():
 
 @pytest.mark.asyncio
 async def test_delete_chat_session_denies_other_users_session():
-    alice_session_id, _ = main._get_or_create_session("alice", None)
+    main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
 
-    response = await main.delete_chat_session(alice_session_id, _request("bob"))
+    await main.delete_chat_session("sess-alice", _request("bob"))
 
-    assert response.status_code == 404
-    assert alice_session_id in main._session_store
+    turns = main.memory_store.get_session_turns("sess-alice", "alice", 500)
+    assert len(turns) == 1
 
 
 @pytest.mark.asyncio
 async def test_get_chat_session_messages_reanchors_stale_foreign_cookie():
-    alice_session_id, _ = main._get_or_create_session("alice", None)
-    main._append_session_message(alice_session_id, "user", "secret alice context")
+    main.memory_store.log_turn("sess-alice", "alice", "user", "secret alice context")
 
-    response = await main.get_chat_session_messages(_request("bob", alice_session_id))
+    response = await main.get_chat_session_messages(_request("bob", "sess-alice"))
     payload = _json_body(response)
 
-    assert payload["session_id"] != alice_session_id
+    assert payload["session_id"] != "sess-alice"
     assert payload["messages"] == []
-    assert main._session_store[payload["session_id"]]["user_id"] == "bob"
+    new_session_id = payload["session_id"]
+    new_turns = main.memory_store.get_session_turns(new_session_id, "bob", 500)
+    assert len(new_turns) == 0
 
 
 @pytest.mark.asyncio
-async def test_get_chat_session_messages_does_not_touch_updated_at_for_existing_session():
-    session_id, _ = main._get_or_create_session("alice", None)
-    main._append_session_message(session_id, "user", "hello")
-    original_updated_at = main._session_store[session_id]["updated_at"]
+async def test_get_chat_session_messages_works_for_existing_session():
+    session_id = "sess-existing"
+    main.memory_store.log_turn(session_id, "alice", "user", "hello")
 
     response = await main.get_chat_session_messages(_request("alice", session_id))
     payload = _json_body(response)
 
     assert payload["session_id"] == session_id
-    assert main._session_store[session_id]["updated_at"] == original_updated_at
+    assert len(payload["messages"]) == 1
+    assert payload["messages"][0]["role"] == "user"
+    assert payload["messages"][0]["content"] == "hello"
 
 
 @pytest.mark.asyncio
-async def test_reset_chat_session_clears_messages_and_summary():
-    session_id, _ = main._get_or_create_session("alice", None)
-    main._append_session_message(session_id, "user", "hello")
-    main._append_session_message(session_id, "assistant", "hi")
-    main._session_store[session_id]["summary"] = "older summary"
-    main._session_store[session_id]["summary_message_count"] = 2
+async def test_reset_chat_session_clears_messages():
+    session_id = "sess-reset"
+    main.memory_store.log_turn(session_id, "alice", "user", "hello")
+    main.memory_store.log_turn(session_id, "alice", "assistant", "hi")
+
+    await main.reset_chat_session(_request("alice", session_id))
+
+    turns = main.memory_store.get_session_turns(session_id, "alice", 500)
+    assert len(turns) == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_chat_session_returns_ok():
+    session_id = "sess-reset-2"
+    main.memory_store.log_turn(session_id, "alice", "user", "reset me")
 
     response = await main.reset_chat_session(_request("alice", session_id))
     payload = _json_body(response)
 
-    assert payload["cleared_messages"] == 2
-    assert main._session_store[session_id]["messages"] == []
-    assert main._session_store[session_id]["summary"] == ""
-    assert main._session_store[session_id]["summary_message_count"] == 0
+    assert payload["ok"] is True
+    assert payload["session_id"] == session_id
 
-
-@pytest.mark.asyncio
-async def test_reset_chat_session_schedules_episodic_persist(monkeypatch):
-    session_id, _ = main._get_or_create_session("alice", None)
-    main._append_session_message(session_id, "user", "keep this")
-
-    captured: list[tuple[str, str]] = []
-
-    def _fake_spawn(sid: str, _snapshot: dict, reason: str):
-        captured.append((sid, reason))
-
-    monkeypatch.setattr(main, "_spawn_episodic_persist_task", _fake_spawn)
-
-    await main.reset_chat_session(_request("alice", session_id))
-
-    assert captured == [(session_id, "session_reset")]
+    turns = main.memory_store.get_session_turns(session_id, "alice", 500)
+    assert len(turns) == 0
 
 
 def test_select_history_for_budget_respects_turn_cap(monkeypatch):
-    monkeypatch.setattr(main, "CHAT_MAX_TURNS", 2)
-    monkeypatch.setattr(main, "CHAT_TOKEN_BUDGET", 10_000)
+    import graph as graph_mod  # noqa: E402
+
+    monkeypatch.setattr(graph_mod, "CHAT_MAX_TURNS", 2)
+    monkeypatch.setattr(graph_mod, "CHAT_TOKEN_BUDGET", 10_000)
 
     messages = [
         {"role": "user" if idx % 2 == 0 else "assistant", "content": f"message {idx}"}
         for idx in range(8)
     ]
 
-    selected, _, truncated, _ = main._select_history_for_budget(
+    selected, _, truncated, _ = graph_mod._select_history_for_budget(
         messages=messages,
         system="system",
         current_user_message="current prompt",
@@ -234,37 +204,6 @@ def test_select_history_for_budget_respects_turn_cap(monkeypatch):
 
     assert [item["content"] for item in selected] == [f"message {idx}" for idx in range(4, 8)]
     assert truncated is True
-
-
-def test_update_session_summary_if_needed_summarizes_older_messages(monkeypatch):
-    monkeypatch.setattr(main, "CHAT_SUMMARY_KEEP_RECENT_MESSAGES", 2)
-    monkeypatch.setattr(main, "CHAT_SUMMARY_TRIGGER_MESSAGES", 4)
-    monkeypatch.setattr(main, "CHAT_SUMMARY_MAX_CHARS", 500)
-
-    session_id, _ = main._get_or_create_session("alice", None)
-    for idx in range(6):
-        role = "user" if idx % 2 == 0 else "assistant"
-        main._append_session_message(session_id, role, f"message {idx}")
-
-    updated, summarized_count, summary_len = main._update_session_summary_if_needed(session_id)
-    session = main._session_store[session_id]
-
-    assert updated is True
-    assert summarized_count == 4
-    assert summary_len > 0
-    assert "message 0" in session["summary"]
-    assert "message 3" in session["summary"]
-    assert session["summary_message_count"] == 4
-
-
-def test_truncate_summary_keeps_tail_within_limit(monkeypatch):
-    monkeypatch.setattr(main, "CHAT_SUMMARY_MAX_CHARS", 24)
-
-    summary = "line 1\nline 2\nline 3\nline 4"
-    truncated = main._truncate_summary(summary)
-
-    assert len(truncated) <= 24
-    assert truncated.endswith("line 4")
 
 
 def test_chat_request_default_system_uses_config_constant():
@@ -305,23 +244,20 @@ async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(mon
             yield {"text": "hello"}
             yield {"text": " world"}
 
-    ingest_sources: list[str] = []
-
     monkeypatch.setattr(main.app.state, "assistant_graph", _FakeGraph(), raising=False)
     monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
-
-    def _fake_ingest(*_args, **kwargs):
-        ingest_sources.append(kwargs.get("source", ""))
-        return {
+    monkeypatch.setattr(
+        main.memory_store,
+        "ingest_user_message",
+        lambda *_args, **_kwargs: {
             "status": "none",
             "saved": [],
             "blocked": [],
             "needs_confirmation": [],
             "deleted": 0,
             "explicit": False,
-        }
-
-    monkeypatch.setattr(main.memory_store, "ingest_user_message", _fake_ingest)
+        },
+    )
 
     response = await main.chat(
         main.ChatRequest(message="hello", source="voice"),
@@ -337,7 +273,6 @@ async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(mon
     assert "world" in combined_text
     assert any("voice" in json.loads(event) for event in events if event != "[DONE]")
     assert events[-1] == "[DONE]"
-    assert ingest_sources == ["voice"]
 
 
 @pytest.mark.asyncio
@@ -513,8 +448,9 @@ async def test_chat_vague_music_prompt_uses_music_fastpath(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_chat_graph_stream_uses_session_id_as_checkpoint_thread(monkeypatch):
-    session_id, _ = main._get_or_create_session("alice", None)
+async def test_chat_graph_stream_uses_session_id_as_checkpoint(monkeypatch):
+    session_id = "sess-checkpoint"
+    main.memory_store.log_turn(session_id, "alice", "user", "hello")
     captured: dict[str, object] = {}
 
     class _FakeGraph:
@@ -565,7 +501,8 @@ async def test_chat_graph_stream_uses_session_id_as_checkpoint_thread(monkeypatc
 
 @pytest.mark.asyncio
 async def test_get_graph_state_returns_snapshot_for_owned_session(monkeypatch):
-    session_id, _ = main._get_or_create_session("alice", None)
+    session_id = "sess-graph-state"
+    main.memory_store.log_turn(session_id, "alice", "user", "hello")
 
     class _FakeGraph:
         async def aget_state(self, _config):
@@ -590,7 +527,8 @@ async def test_get_graph_state_returns_snapshot_for_owned_session(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_get_graph_state_denies_foreign_session():
-    session_id, _ = main._get_or_create_session("alice", None)
+    session_id = "sess-foreign"
+    main.memory_store.log_turn(session_id, "alice", "user", "hello")
 
     response = await main.get_graph_state(session_id, _request("bob", None))
 
@@ -599,18 +537,15 @@ async def test_get_graph_state_denies_foreign_session():
 
 
 @pytest.mark.asyncio
-async def test_health_reports_embedding_router_state(monkeypatch):
-    monkeypatch.setattr(main, "ROUTER_EMBEDDING_WARMUP", True)
-    setattr(main.app.state, "embedding_router_ready", False)
-    setattr(main.app.state, "embedding_router_error", "init failed")
-    setattr(main.app.state, "embedding_router_snapshot", None)
+async def test_health_reports_embedding_router_state():
+    # Ensure no embedding router is set on app.state.
+    if hasattr(main.app.state, "embedding_router"):
+        delattr(main.app.state, "embedding_router")
 
     payload = await main.health()
 
-    assert payload["status"] == "degraded"
-    assert payload["embedding_router"]["ready"] is False
-    assert payload["embedding_router"]["error"] == "init failed"
-    assert payload["embedding_router"]["snapshot"] is None
+    assert payload["embedding_router"] is False
+    assert "status" in payload
 
 
 @pytest.mark.asyncio

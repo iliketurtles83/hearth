@@ -29,7 +29,6 @@ run_step "Run focused backend regression suite" \
     backend/tests/test_router.py \
     backend/tests/test_graph.py \
     backend/tests/test_memory_isolation.py \
-    backend/tests/test_code_tool.py \
     backend/tests/test_weather.py \
     -q
 

@@ -110,7 +110,6 @@ class AssistantGraphDependencies:
     tool_dispatch: Callable[[str, dict[str, Any]], Awaitable[Any]]
     chat_model: str
     cloud_model: str
-    coder_model: str = ""             # OLLAMA_CODER_MODEL for code_tool node
     # Vision model callable — calls Ollama /api/chat with images
     stream_local_vision: Callable[[PromptRequest, str, str], AsyncIterator[str]] | None = None
     vision_model: str = ""            # OLLAMA_VISION_MODEL (defaults to chat_model)

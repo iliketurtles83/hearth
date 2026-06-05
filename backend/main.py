@@ -680,7 +680,6 @@ def _make_graph_deps(*, embedding_router=None) -> AssistantGraphDependencies:
         tool_dispatch=_late_tool_dispatch,
         chat_model=CHAT_MODEL,
         cloud_model=CLOUD_MODEL,
-        coder_model=CHAT_MODEL,
         vision_model=OLLAMA_VISION_MODEL,
     )
 
@@ -863,6 +862,13 @@ async def chat(request: ChatRequest, http_request: Request):
 
 @app.get("/graph/state/{session_id}")
 async def get_graph_state(session_id: str, http_request: Request):
+    user_id: str = http_request.state.user_id
+
+    # Verify session ownership before checking graph availability.
+    turns = memory_store.get_session_turns(session_id, user_id, limit=1)
+    if not turns and memory_store.session_exists(session_id):
+        return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
+
     graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
     if graph_runner is None:
         return _error_response("Graph not initialized", "GRAPH_UNAVAILABLE", True, status_code=503)
@@ -907,6 +913,9 @@ async def list_chat_sessions(http_request: Request):
     user_id: str = http_request.state.user_id
     current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
     sessions = memory_store.list_sessions(user_id)
+    # Validate that current_session_id belongs to the user; strip foreign cookies.
+    if current_session_id and not any(s["session_id"] == current_session_id for s in sessions):
+        current_session_id = None
     return JSONResponse(
         {
             "sessions": sessions,
@@ -918,7 +927,17 @@ async def list_chat_sessions(http_request: Request):
 @app.get("/chat/session/messages")
 async def get_chat_session_messages(http_request: Request):
     user_id: str = http_request.state.user_id
-    session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
+    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
+    if cookie_session_id:
+        # Check ownership: if turns exist for another user, this is a stale/foreign cookie.
+        turns = memory_store.get_session_turns(cookie_session_id, user_id, limit=500)
+        if not turns and memory_store.session_exists(cookie_session_id):
+            # Foreign session — generate a new one for this user.
+            session_id = str(uuid4())
+        else:
+            session_id = cookie_session_id
+    else:
+        session_id = str(uuid4())
     turns = memory_store.get_session_turns(session_id, user_id, limit=500)
     response = JSONResponse({"session_id": session_id, "messages": turns})
     _set_session_cookie(response, session_id)

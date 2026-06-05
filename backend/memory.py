@@ -280,6 +280,14 @@ class MemoryStore:
     def reset_session(self, session_id: str, user_id: str) -> None:
         self.delete_session(session_id, user_id)
 
+    def session_exists(self, session_id: str) -> bool:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT 1 FROM conversation_log WHERE session_id = ? LIMIT 1",
+                (session_id,),
+            ).fetchone()
+        return row is not None
+
     def get_latest_session_summary(
         self,
         session_id: str,
