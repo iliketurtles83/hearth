@@ -67,8 +67,6 @@ class AssistantState(TypedDict, total=False):
     message: str
     system: str
     source: str
-    project_id: str
-    project_folder: str
     history: list[dict[str, Any]]
     session_summary: str
     selected_history: list[dict[str, Any]]
@@ -99,9 +97,6 @@ class AssistantState(TypedDict, total=False):
     force_code: bool                  # True for /code endpoint to bypass classifier
     # Responder modality split
     modality: str                     # "voice" or "chat"; set by /chat endpoint from request source
-    # Coding agent tool
-    pending_code_task: str            # coding task description awaiting agent confirmation
-    awaiting_agent_confirmation: bool # True when a coding task needs user approval before dispatch
     # Vision input
     image_base64: str | None          # raw base64 image (ephemeral, not persisted)
     image_mime: str | None            # "image/png" | "image/jpeg" | "image/webp"
@@ -124,7 +119,6 @@ class AssistantGraphDependencies:
     chat_model: str
     cloud_model: str
     coder_model: str = ""             # OLLAMA_CODER_MODEL for code_tool node
-    chroma_path: str = ""             # path to ChromaDB directory for code_context
     # Vision model callable — calls Ollama /api/chat with images
     stream_local_vision: Callable[[PromptRequest, str, str], AsyncIterator[str]] | None = None
     vision_model: str = ""            # OLLAMA_VISION_MODEL (defaults to chat_model)
@@ -364,38 +358,6 @@ def _pick_model_for_decision(
     return chat_model
 
 
-def code_context_retrieval(
-    query: str,
-    chroma_path: str,
-    max_snippets: int = 5,
-    project_id: str | None = None,
-) -> str:
-    """Fetch and format code-context snippets for prompt injection."""
-    if not chroma_path:
-        return ""
-    try:
-        from tools.code_indexer import query_code_context
-    except Exception:
-        return ""
-
-    collection_name = "code_context"
-    if project_id:
-        collection_name = f"code_context_{project_id}"
-    snippets = query_code_context(
-        query,
-        chroma_path,
-        n=max_snippets,
-        collection_name=collection_name,
-    )
-    if not snippets:
-        return ""
-
-    formatted: list[str] = []
-    for idx, snippet in enumerate(snippets, start=1):
-        formatted.append(f"[code_context {idx}]\n{snippet}")
-    return "\n\n---\n\n".join(formatted)
-
-
 def build_assistant_graph(
     deps: AssistantGraphDependencies,
     *,
@@ -404,31 +366,6 @@ def build_assistant_graph(
     graph = StateGraph(AssistantState)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
-
-    _workspace_root: str = os.getenv("CODE_WORKSPACE_ROOT", "")
-
-    def _resolve_workspace_path(relative_path: str) -> str:
-        """Resolve a path within the workspace root.  Raises ValueError on traversal."""
-        return resolve_workspace_path(_workspace_root, relative_path)
-
-    def _make_unified_diff(relative_path: str, original: str, proposed: str) -> str:
-        return make_unified_diff(relative_path, original, proposed)
-
-    def _write_summary_for_voice(relative_path: str, diff_text: str) -> str:
-        additions = 0
-        deletions = 0
-        for line in diff_text.splitlines():
-            if line.startswith("+++") or line.startswith("---"):
-                continue
-            if line.startswith("+"):
-                additions += 1
-            elif line.startswith("-"):
-                deletions += 1
-        return (
-            f"Planned write to {relative_path}. "
-            f"About {additions} additions and {deletions} deletions. "
-            "Say yes to apply, or tell me what to change."
-        )
 
     _CONFIRM_PATTERN = re.compile(
         r"^\s*(yes|confirm|approve|go ahead|do it|write it|apply|proceed)\s*[.!]?\s*$",
@@ -439,39 +376,12 @@ def build_assistant_graph(
 
     async def intent_classifier(state: AssistantState) -> dict[str, Any]:
         writer = get_stream_writer()
-        project_id = str(state.get("project_id", "") or "").strip()
 
         def _last_assistant_message() -> str:
             for item in reversed(list(state.get("history", []))):
                 if item.get("role") == "assistant":
                     return str(item.get("content", ""))
             return ""
-
-        # Project sessions are deterministic coding sessions.
-        if project_id:
-            writer({
-                "meta": {
-                    "model": deps.coder_model or deps.chat_model,
-                    "intent": "code-write",
-                    "confidence": 1.0,
-                    "route_type": "coding_agent",
-                    "needs_memory": False,
-                    "tool": None,
-                    "planner_status": "deterministic",
-                    "reasoning_summary": "",
-                }
-            })
-            return {
-                "intent": "code-write",
-                "confidence": 1.0,
-                "use_cloud": False,
-                "model": deps.coder_model or deps.chat_model,
-                "tool": None,
-                "planner_status": "deterministic",
-                "reasoning_summary": "",
-                "needs_memory": False,
-                "route_type": "coding_agent",
-            }
 
         # Dedicated /code endpoint can force code routing deterministically.
         if state.get("force_code"):
@@ -512,26 +422,6 @@ def build_assistant_graph(
                 return {
                     "intent": "confirm_write",
                     "route_type": "write_executor",
-                    "confidence": 1.0,
-                    "use_cloud": False,
-                    "planner_status": "deterministic",
-                    "reasoning_summary": "",
-                    "needs_memory": False,
-                }
-
-        # Short-circuit: if a coding agent task is pending and the user confirmed it,
-        # skip normal routing and go straight to coding_agent_executor.
-        if state.get("awaiting_agent_confirmation") and state.get("pending_code_task"):
-            msg = str(state.get("message", "")).strip()
-            if _CONFIRM_PATTERN.match(msg):
-                log.info(
-                    "graph.intent_classifier | confirm_agent_task detected | session=%s",
-                    state.get("session_id", ""),
-                )
-                writer({"meta": {"intent": "confirm_agent_task", "route_type": "coding_agent_executor"}})
-                return {
-                    "intent": "confirm_agent_task",
-                    "route_type": "coding_agent_executor",
                     "confidence": 1.0,
                     "use_cloud": False,
                     "planner_status": "deterministic",
@@ -713,36 +603,20 @@ def build_assistant_graph(
     async def history_loader(state: AssistantState) -> dict[str, Any]:
         session_id = str(state.get("session_id", ""))
         user_id = str(state.get("user_id", ""))
-        project_id = str(state.get("project_id", "") or "").strip() or None
         if not session_id or not user_id:
             return {"history": [], "session_summary": ""}
 
-        if project_id:
-            turns = await asyncio.to_thread(
-                deps.memory_store.get_session_turns,
-                session_id,
-                user_id,
-                CHAT_MAX_TURNS * 2,
-                project_id,
-            )
-            session_summary = await asyncio.to_thread(
-                deps.memory_store.get_latest_session_summary,
-                session_id,
-                user_id,
-                project_id,
-            )
-        else:
-            turns = await asyncio.to_thread(
-                deps.memory_store.get_session_turns,
-                session_id,
-                user_id,
-                CHAT_MAX_TURNS * 2,
-            )
-            session_summary = await asyncio.to_thread(
-                deps.memory_store.get_latest_session_summary,
-                session_id,
-                user_id,
-            )
+        turns = await asyncio.to_thread(
+            deps.memory_store.get_session_turns,
+            session_id,
+            user_id,
+            CHAT_MAX_TURNS * 2,
+        )
+        session_summary = await asyncio.to_thread(
+            deps.memory_store.get_latest_session_summary,
+            session_id,
+            user_id,
+        )
         history = [
             {
                 "role": str(turn.get("role", "")),
@@ -753,7 +627,6 @@ def build_assistant_graph(
         return {"history": history, "session_summary": str(session_summary or "")}
 
     async def memory_retrieval(state: AssistantState) -> dict[str, Any]:
-        project_id = str(state.get("project_id", "") or "").strip() or None
         history = list(state.get("history", []))
         session_summary = str(state.get("session_summary", "") or "")
         selected_history, history_tokens, truncated, summary_tokens = _select_history_for_budget(
@@ -762,62 +635,21 @@ def build_assistant_graph(
             current_user_message=state["message"],
             summary_text=session_summary,
         )
-        if project_id:
-            memory_hits_all = []
-        else:
-            memory_hits_all = await asyncio.to_thread(
-                deps.memory_store.retrieve,
-                state["user_id"],
-                state["message"],
-            )
+        memory_hits_all = await asyncio.to_thread(
+            deps.memory_store.retrieve,
+            state["user_id"],
+            state["message"],
+        )
         inject_memory = _should_inject_memory(state["intent"], memory_hits_all, state["message"])
         memory_hits = memory_hits_all if inject_memory else []
         system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
         augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
 
-        # Route ChromaDB queries by intent.
-        # - Non-code intents: deps.memory_store.retrieve() queries 'conversation_memory' only.
-        # - Code intents: code_context_retrieval() queries 'code_context' only.
-        # The two collections are strictly separate.
-        code_context = ""
-        if project_id:
-            log.info(
-                "graph.memory_retrieval | collection=code_context_%s | session=%s",
-                project_id,
-                state.get("session_id", ""),
-            )
-            code_context = code_context_retrieval(
-                state["message"],
-                deps.chroma_path,
-                max_snippets=5,
-                project_id=project_id,
-            )
-            if code_context:
-                log.info(
-                    "graph.memory_retrieval | code_context_injected=true | session=%s",
-                    state.get("session_id", ""),
-                )
-        elif state.get("intent", "") == "code-question":
-            log.info(
-                "graph.memory_retrieval | collection=code_context | session=%s",
-                state.get("session_id", ""),
-            )
-            code_context = code_context_retrieval(
-                state["message"],
-                deps.chroma_path,
-                max_snippets=5,
-            )
-            if code_context:
-                log.info(
-                    "graph.memory_retrieval | code_context_injected=true | session=%s",
-                    state.get("session_id", ""),
-                )
-        else:
-            log.debug(
-                "graph.memory_retrieval | collection=conversation_memory | hits=%d | session=%s",
-                len(memory_hits),
-                state.get("session_id", ""),
-            )
+        log.debug(
+            "graph.memory_retrieval | collection=conversation_memory | hits=%d | session=%s",
+            len(memory_hits),
+            state.get("session_id", ""),
+        )
 
         return {
             "selected_history": selected_history,
@@ -826,7 +658,6 @@ def build_assistant_graph(
             "summary_tokens": summary_tokens,
             "memories": memory_hits,
             "augmented_system": augmented_system,
-            "code_context": code_context,
         }
 
     async def tool_router(state: AssistantState) -> dict[str, Any]:
