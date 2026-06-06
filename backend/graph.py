@@ -240,6 +240,20 @@ def _tool_summary_prompt(user_message: str, tool_data: dict[str, Any]) -> str:
     )
 
 
+def _rolling_summary_prompt(turns: list[dict[str, Any]]) -> str:
+    role_map = {"user": "User", "assistant": "Assistant"}
+    lines = ["Recent conversation turns:"]
+    for turn in turns:
+        role = role_map.get(str(turn.get("role", "")).lower(), "User")
+        content = str(turn.get("content", "") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+    lines.append("")
+    lines.append("Session summary:")
+    return "\n".join(lines)
+
+
 def _similarity_to_confidence(score: float) -> float:
     # Cosine similarity range is [-1, 1]; remap to confidence range [0, 1].
     return max(0.0, min(1.0, (score + 1.0) / 2.0))
@@ -495,12 +509,41 @@ def build_assistant_graph(
         else:
             decision = _heuristic_router_decision()
 
-        if is_write_like_code_request(state["message"]) and decision.intent != "code-question":
+        followup_message = state["message"].strip().lower()
+        last_assistant = _last_assistant_message().lower()
+        looks_like_write_followup = followup_message in {
+            "yes",
+            "y",
+            "ok",
+            "okay",
+            "go ahead",
+            "do it",
+            "please do",
+            "sounds good",
+        } and any(
+            marker in last_assistant
+            for marker in [
+                "write",
+                "edit",
+                "create",
+                "implement",
+                "modify",
+                "patch",
+                "file",
+                "confirm",
+            ]
+        )
+
+        if (is_write_like_code_request(state["message"]) or looks_like_write_followup) and decision.intent != "code-question":
             decision.intent = "code-question"
             decision.use_cloud = False
             decision.tool = None
             decision.model = deps.chat_model
-            decision.planner_status = "write_downgraded_to_code_question"
+            decision.planner_status = (
+                "write_followup_downgraded_to_code_question"
+                if looks_like_write_followup
+                else "write_downgraded_to_code_question"
+            )
 
         route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
 
@@ -842,6 +885,60 @@ def build_assistant_graph(
         if memory_payload["status"] != "none" or memory_payload["hint"]:
             writer({"memory": memory_payload})
 
+        async def _rolling_summary_task(trigger_turns: int) -> None:
+            try:
+                turns = await asyncio.to_thread(
+                    deps.memory_store.get_session_turns,
+                    session_id,
+                    user_id,
+                    trigger_turns,
+                )
+                if not turns:
+                    return
+                summary_request = PromptRequest(
+                    message=_rolling_summary_prompt(turns[-trigger_turns:]),
+                    system=(
+                        "Summarize the recent conversation turns for future context. "
+                        "Keep it concise and factual. Include user preferences, commitments, "
+                        "decisions, and unresolved follow-ups. Do not invent details."
+                    ),
+                )
+                summary_text = ""
+                async for chunk in deps.stream_local(summary_request, model_name=deps.chat_model):
+                    summary_text += chunk
+                summary_text = summary_text.strip()
+                if not summary_text:
+                    return
+                await asyncio.to_thread(
+                    deps.memory_store.save_summary,
+                    user_id,
+                    session_id,
+                    summary_text,
+                )
+                log.debug(
+                    "graph.memory_writer.summary_saved | session_id=%s user_id=%s turns=%d",
+                    session_id,
+                    user_id,
+                    trigger_turns,
+                )
+            except Exception as exc:
+                log.warning(
+                    "graph.memory_writer.summary_failed | session_id=%s user_id=%s error=%s",
+                    session_id,
+                    user_id,
+                    exc,
+                )
+
+        summary_trigger = int(os.getenv("MEMORY_SUMMARY_TRIGGER", "18"))
+        if summary_trigger > 0:
+            turn_count = await asyncio.to_thread(
+                deps.memory_store.count_session_turns,
+                session_id,
+                user_id,
+            )
+            if turn_count and turn_count % summary_trigger == 0:
+                _track_background_task(asyncio.create_task(_rolling_summary_task(summary_trigger)))
+
         # 3) Threshold-based consolidation trigger.
         unconsolidated = await asyncio.to_thread(
             deps.memory_store.count_unconsolidated,
@@ -887,6 +984,8 @@ def build_assistant_graph(
     graph.add_conditional_edges("tool_router", _after_tool_router, {
         "responder": "responder",
     })
+    # The coding-agent confirmation nodes were removed in the code-question-only
+    # architecture, so responder is the sole response-producing terminal path.
     graph.add_edge("responder", "memory_writer")
     graph.add_edge("memory_writer", END)
 

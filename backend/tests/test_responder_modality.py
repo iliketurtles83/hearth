@@ -64,6 +64,9 @@ _REQUIRED_FACTS = [
 
 
 class _FakeMemoryStore:
+    def __init__(self):
+        self._turn_count = 0
+
     def retrieve(self, _user_id: str, _query: str):
         return []
 
@@ -74,6 +77,7 @@ class _FakeMemoryStore:
         return ""
 
     def log_turn(self, _session_id: str, _user_id: str, _role: str, _content: str) -> None:
+        self._turn_count += 1
         return None
 
     def ingest_user_message(self, _user_id: str, _message: str, _source: str = "text"):
@@ -81,6 +85,12 @@ class _FakeMemoryStore:
 
     def count_unconsolidated(self, _user_id: str) -> int:
         return 0
+
+    def count_session_turns(self, _session_id: str, _user_id: str) -> int:
+        return self._turn_count
+
+    def save_summary(self, _user_id: str, _session_id: str, _summary: str) -> int:
+        return 1
 
     def consolidate_pending(self, _user_id=None, _limit: int = 50):
         return {}

@@ -1099,7 +1099,7 @@ async def transcribe(audio: UploadFile = File(...)):
     return JSONResponse({"text": text})
 
 
-@app.post("/code", summary="Stream code generation/editing via graph code_tool")
+@app.post("/code", summary="Stream code-question responses via graph with local code intent bias")
 async def code(request: CodeRequest, http_request: Request):
     user_id: str = http_request.state.user_id
     cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)

@@ -133,6 +133,26 @@ async def test_delete_chat_session_denies_other_users_session():
 
 
 @pytest.mark.asyncio
+async def test_delete_chat_session_clears_checkpoint_thread_for_owned_session(monkeypatch):
+    session_id = "sess-delete-owned"
+    main.memory_store.log_turn(session_id, "alice", "user", "hello")
+    cleared: list[str] = []
+
+    async def _fake_clear_checkpoint_thread(target_session_id: str) -> None:
+        cleared.append(target_session_id)
+
+    monkeypatch.setattr(main, "_clear_checkpoint_thread", _fake_clear_checkpoint_thread)
+
+    response = await main.delete_chat_session(session_id, _request("alice", session_id))
+    payload = _json_body(response)
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["session_id"] == session_id
+    assert cleared == [session_id]
+
+
+@pytest.mark.asyncio
 async def test_get_chat_session_messages_reanchors_stale_foreign_cookie():
     main.memory_store.log_turn("sess-alice", "alice", "user", "secret alice context")
 
@@ -185,6 +205,23 @@ async def test_reset_chat_session_returns_ok():
 
     turns = main.memory_store.get_session_turns(session_id, "alice", 500)
     assert len(turns) == 0
+
+
+@pytest.mark.asyncio
+async def test_reset_chat_session_clears_checkpoint_thread(monkeypatch):
+    session_id = "sess-reset-checkpoint"
+    main.memory_store.log_turn(session_id, "alice", "user", "reset me")
+    cleared: list[str] = []
+
+    async def _fake_clear_checkpoint_thread(target_session_id: str) -> None:
+        cleared.append(target_session_id)
+
+    monkeypatch.setattr(main, "_clear_checkpoint_thread", _fake_clear_checkpoint_thread)
+
+    response = await main.reset_chat_session(_request("alice", session_id))
+
+    assert response.status_code == 200
+    assert cleared == [session_id]
 
 
 def test_select_history_for_budget_respects_turn_cap(monkeypatch):

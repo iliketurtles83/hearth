@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -47,6 +48,9 @@ TEST_CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
 
 
 class _FakeMemoryStore:
+    def __init__(self):
+        self._turn_count = 0
+
     def retrieve(self, _user_id: str, _query: str, _limit: int | None = None):
         return []
 
@@ -72,6 +76,7 @@ class _FakeMemoryStore:
         _role: str,
         _content: str,
     ) -> None:
+        self._turn_count += 1
         return None
 
     def ingest_user_message(self, _user_id: str, _message: str, _source: str = "text"):
@@ -79,6 +84,12 @@ class _FakeMemoryStore:
 
     def count_unconsolidated(self, _user_id: str) -> int:
         return 0
+
+    def count_session_turns(self, _session_id: str, _user_id: str) -> int:
+        return self._turn_count
+
+    def save_summary(self, _user_id: str, _session_id: str, _summary: str) -> int:
+        return 1
 
     def consolidate_pending(self, _user_id=None, _limit: int = 50):
         return {}
@@ -275,7 +286,8 @@ async def test_graph_yes_after_old_write_prompt_routes_normally():
     state["message"] = "yes"
 
     result = await graph.ainvoke(state)
-    assert result["intent"] == "quick-local"
+    assert result["intent"] == "code-question"
+    assert result["planner_status"] == "write_followup_downgraded_to_code_question"
     assert result["response_text"] == "normal yes response"
 
 
@@ -558,3 +570,107 @@ async def test_embedding_snapshot_mismatch_falls_back_to_legacy_router(monkeypat
 
     assert result["intent"] == "quick-local"
     assert result["planner_status"] == "heuristic"
+
+
+@pytest.mark.asyncio
+async def test_memory_writer_triggers_rolling_summary_on_threshold(monkeypatch):
+    monkeypatch.setenv("MEMORY_SUMMARY_TRIGGER", "2")
+
+    class _SummaryMemoryStore(_FakeMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.turns: list[dict[str, str]] = []
+            self.saved_summaries: list[str] = []
+
+        def log_turn(self, _session_id: str, _user_id: str, role: str, content: str) -> None:
+            self._turn_count += 1
+            self.turns.append({"role": role, "content": content})
+
+        def get_session_turns(self, _session_id: str, _user_id: str, _limit: int = 500):
+            return list(self.turns)
+
+        def save_summary(self, _user_id: str, _session_id: str, summary: str) -> int:
+            self.saved_summaries.append(summary)
+            return len(self.saved_summaries)
+
+    store = _SummaryMemoryStore()
+
+    async def _fake_stream_local(request, model_name=None):
+        assert model_name == TEST_CHAT_MODEL
+        if "Summarize the recent conversation turns" in request.system:
+            yield "summary for recent turns"
+        else:
+            yield "assistant reply"
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=store,
+        embedding_router=None,
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+
+    tracked: list[asyncio.Task] = []
+    monkeypatch.setattr(assistant_graph, "_track_background_task", lambda task: tracked.append(task))
+
+    graph = assistant_graph.build_assistant_graph(deps)
+    result = await graph.ainvoke(_base_state())
+    assert result["response_text"] == "assistant reply"
+
+    if tracked:
+        await asyncio.gather(*tracked)
+
+    assert len(store.saved_summaries) == 1
+    assert "summary for recent turns" in store.saved_summaries[0]
+
+
+@pytest.mark.asyncio
+async def test_memory_writer_skips_assistant_when_response_empty():
+    class _CaptureMemoryStore(_FakeMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.logged: list[tuple[str, str]] = []
+
+        def log_turn(self, _session_id: str, _user_id: str, role: str, content: str) -> None:
+            self._turn_count += 1
+            self.logged.append((role, content))
+
+    store = _CaptureMemoryStore()
+
+    async def _fake_stream_local(_request, model_name=None):
+        assert model_name == TEST_CHAT_MODEL
+        if False:
+            yield ""
+        return
+
+    async def _fake_stream_cloud(_system: str, _messages: list[dict]):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=store,
+        embedding_router=None,
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+
+    graph = assistant_graph.build_assistant_graph(deps)
+    result = await graph.ainvoke(_base_state())
+
+    assert result["response_text"] == ""
+    assert store.logged == [("user", "hello")]
