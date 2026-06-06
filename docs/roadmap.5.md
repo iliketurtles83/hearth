@@ -73,6 +73,17 @@ Goal: Strip coding agent, project management, workspace indexing, and code file 
 	- Updated backend/tests/test_router.py assertions to reflect CHAT_MODEL routing for code-question intent.
 - Validation: backend/tests/test_router.py, backend/tests/test_graph.py, backend/tests/test_auth.py (48 passed).
 
+- Follow-up fixes from commit review:
+	- Hardened session ownership checks with user-scoped lookup in backend/memory.py and backend/main.py (`session_exists_for_user`).
+	- Enforced 404 on unauthorized session deletion and strengthened corresponding test assertion.
+	- Fixed scripts/review_changed_tests.sh stale reference to deleted test_code_tool.py.
+	- Updated scripts/review_baseline.sh pip-audit invocation to support explicit ignore IDs for currently-unpatched CVEs.
+
+- Completed Chunk 7 validation gate:
+	- `bash scripts/review_changed_tests.sh --dry-run` succeeded (selected 7 tests).
+	- `bash scripts/review_changed_tests.sh` succeeded (134 passed).
+	- `bash scripts/review_baseline.sh` succeeded (focused suite 108 passed; pip-audit: no known vulnerabilities found, 1 ignored; secret scan skipped because gitleaks not installed).
+
 - Completed Chunk 5:
   - Removed CODE_WORKSPACE_ROOT env var and /code-workspace bind mount from docker-compose.yml.
   - Removed OLLAMA_CODER_MODEL, CODE_INDEX_PATHS, CODE_ENABLE_SHELL, CODE_ENABLE_REPL from .env.example.
@@ -231,7 +242,7 @@ Exit criteria:
 - [x] Remove CODER_MODEL and simplify local model routing
 - [x] Remove workspace env/mount surface from compose and env example
 - [ ] Update and fix tests for new architecture
-- [ ] Run changed-tests and baseline validation scripts
+- [x] Run changed-tests and baseline validation scripts
 
 ---
 

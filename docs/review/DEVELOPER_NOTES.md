@@ -11,14 +11,22 @@
 - get model values from .env as opposed to being declared explicitly
 
 ### Tool calls
-- write json for weather tool call
+- write json for weather tool call???
 
 ## UI
+- make it more modern and sleek, less cluttered, more intuitive.
+
+### top bar
+- top bar only holds hamburger in top left and microphone in top rigght.
+- remove top bar
+- hamburger resides in left panel with Hearth written next to it. 
+- the microphone will remain top right without top bar
 
 ### sidebar
 - chats and music window: no more borders for songs and chats. 
-- same color for song and chat sessions as background.
+- **DONE** same color for song and chat sessions as background.
 - when hovering over, highlight entire background of the item
+- when expanding one tab, autocollapse other tabs?
 
 ### chats window
 - chat settings menu is accessible by vertical three dot menu on the right of each chat title.

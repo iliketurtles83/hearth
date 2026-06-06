@@ -236,10 +236,6 @@ MEMORY_MIN_RELEVANCE_SCORE=0.28
 # TTS_KOKORO_LANG=en-us
 # TTS_KOKORO_SPEED=1.0
 
-# Project coding runtime adapter (used by project-scoped coding flow)
-# CODING_AGENT_URL=http://localhost:3284
-# CODING_AGENT_TIMEOUT_SECONDS=120
-
 # HTTPS / CORS policy (Phase 0b)
 # Set CORS_ORIGINS to the exact Caddy origin once HTTPS is in use.
 # Multiple origins: comma-separated (e.g. https://192.168.1.42,https://assistant.lan)
@@ -256,7 +252,6 @@ Notes:
 - If `ANTHROPIC_API_KEY` is empty, cloud fallback is disabled and local responses continue.
 - Memory DB and Chroma data are stored under `backend/` by default.
 - Replace `192.168.1.42` with your actual LAN IP in `CORS_ORIGINS`.
-- `CODING_AGENT_URL` is optional. If unset, the coding agent feature is disabled with a clear error message when triggered.
 
 ## Run With Docker
 
@@ -339,18 +334,12 @@ If you prefer a different Kokoro model variant, set `TTS_KOKORO_MODEL` in `.env`
 to the matching file path. The compose defaults point at the int8 model to keep
 download size and memory usage lower.
 
-## Project Coding Agent (Roadmap v4 direction)
+## Code Question Mode
 
-External coding-agent integration is retired. Coding work now moves toward the
-project-scoped internal path documented in `docs/roadmap.4.md`.
-
-Current behavior to preserve:
-1. Main chat keeps `code-question` for explain/how-does flows.
-2. Project sessions use `coding_agent_tool` + `coding_agent_executor` for coding tasks.
-3. Confirmation gating, code-context injection, and result formatting are reused from prior work.
-
-`CODING_AGENT_URL` remains as a runtime adapter setting while project coding is
-being completed. If unavailable, Hearth returns a clear user-visible error.
+Hearth uses an internal code-question flow only:
+1. Main chat keeps code-question intent for explain and how-does requests.
+2. The /code endpoint is a local intent-bias path that forces code-question routing.
+3. There is no external coding-agent runtime dependency or adapter URL.
 
 - The backend includes a local music tool that uses [Beets](https://beets.io/) as
   the music library and MPD for playback.
