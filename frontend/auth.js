@@ -120,23 +120,19 @@ export async function logout() {
 function showLoginOverlay(message = '') {
   const overlay = document.getElementById('login-overlay');
   const appShell = document.getElementById('app-shell');
-  const header = document.querySelector('header');
   const errorEl = document.getElementById('login-error');
 
   if (overlay) overlay.style.display = 'flex';
   if (appShell) appShell.style.display = 'none';
-  if (header) header.style.display = 'none';
   if (errorEl) errorEl.textContent = message;
 }
 
 function hideLoginOverlay() {
   const overlay = document.getElementById('login-overlay');
   const appShell = document.getElementById('app-shell');
-  const header = document.querySelector('header');
 
   if (overlay) overlay.style.display = 'none';
   if (appShell) appShell.style.display = '';
-  if (header) header.style.display = '';
 }
 
 function updateUserDisplay() {
