@@ -167,6 +167,8 @@ Create `.env` in the repo root. Example:
 # Model routing
 ANTHROPIC_API_KEY=your_key_here
 OLLAMA_CHAT_MODEL=gemma4:e4b
+ROUTER_EMBED_MODEL=nomic-embed-text
+ROUTER_EMBED_TIMEOUT_MS=10000
 OLLAMA_CODER_MODEL=qwen2.5-coder:14b
 MODEL_CLOUD=claude-sonnet-4-20250514
 

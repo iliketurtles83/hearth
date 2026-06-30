@@ -18,6 +18,7 @@
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
   const ttsEnableBtn = document.getElementById('tts-enable-btn');
   const ttsStopBtn = document.getElementById('tts-stop-btn');
+  const reasoningToggleBtn = document.getElementById('reasoning-toggle-btn');
 
   window.appUi = { messagesEl, messagesInner, input, sendBtn };
   let currentSessionId = null;
@@ -26,6 +27,8 @@
   let pendingVoicePlayback = null;
   let currentQueuePos = null;
   let _currentAbortController = null;
+  const _REASONING_PREF_KEY = 'ui.showReasoning';
+  let _showReasoning = true;
 
   // Phase 14: pending image attachment state
   let pendingImage = null; // { base64: string, mime: string, dataUrl: string } | null
@@ -83,6 +86,44 @@
   if (imageClearBtn) {
     imageClearBtn.addEventListener('click', clearPendingImage);
   }
+
+  function _setReasoningVisible(visible) {
+    _showReasoning = !!visible;
+    document.body.classList.toggle('hide-reasoning', !_showReasoning);
+    if (reasoningToggleBtn) {
+      reasoningToggleBtn.textContent = `Reasoning: ${_showReasoning ? 'On' : 'Off'}`;
+      reasoningToggleBtn.setAttribute('aria-pressed', String(_showReasoning));
+      reasoningToggleBtn.title = _showReasoning
+        ? 'Hide reasoning summaries'
+        : 'Show reasoning summaries';
+    }
+  }
+
+  function _loadReasoningPref() {
+    try {
+      const raw = window.localStorage.getItem(_REASONING_PREF_KEY);
+      if (raw === null) {
+        _setReasoningVisible(true);
+        return;
+      }
+      _setReasoningVisible(raw === '1');
+    } catch {
+      _setReasoningVisible(true);
+    }
+  }
+
+  function _saveReasoningPref() {
+    try {
+      window.localStorage.setItem(_REASONING_PREF_KEY, _showReasoning ? '1' : '0');
+    } catch {
+      // best effort
+    }
+  }
+
+  reasoningToggleBtn?.addEventListener('click', () => {
+    _setReasoningVisible(!_showReasoning);
+    _saveReasoningPref();
+  });
 
   // eslint-disable-next-line no-unused-vars
   function setTtsStatus(_text) { /* text removed; mic colour conveys state */ }
@@ -391,6 +432,30 @@
     badge.style.opacity = '0.75';
     badge.textContent = [label, memory.hint || ''].filter(Boolean).join(' ');
     wrapper.appendChild(badge);
+  }
+
+  function appendReasoningSummary(wrapper, summary, routeType, plannerStatus) {
+    const text = String(summary || '').trim();
+    if (!text) return;
+
+    wrapper.querySelector('.reasoning-block')?.remove();
+
+    const details = document.createElement('details');
+    details.className = 'reasoning-block';
+
+    const summaryEl = document.createElement('summary');
+    summaryEl.textContent = 'Reasoning summary';
+
+    const contentEl = document.createElement('div');
+    contentEl.className = 'reasoning-content';
+    const meta = [];
+    if (routeType) meta.push(`route=${routeType}`);
+    if (plannerStatus) meta.push(`planner=${plannerStatus}`);
+    contentEl.textContent = meta.length ? `${meta.join(' · ')}\n${text}` : text;
+
+    details.appendChild(summaryEl);
+    details.appendChild(contentEl);
+    wrapper.appendChild(details);
   }
 
   function showVoiceError(msg) {
@@ -780,6 +845,8 @@
 
     let accumulated = '';
     let voiceMeta = null;
+    let metaRouteType = '';
+    let metaPlannerStatus = '';
     const abortController = new AbortController();
     _currentAbortController = abortController;
 
@@ -835,6 +902,23 @@
 
           if (parsed.model) {
             appendModelBadge(wrapper, parsed.model, parsed.intent, parsed.fallback);
+          }
+
+          if (parsed.route_type) {
+            metaRouteType = String(parsed.route_type || '');
+          }
+
+          if (parsed.planner_status) {
+            metaPlannerStatus = String(parsed.planner_status || '');
+          }
+
+          if (parsed.reasoning_summary || parsed.reasoning || parsed.thinking) {
+            appendReasoningSummary(
+              wrapper,
+              parsed.reasoning_summary || parsed.reasoning || parsed.thinking,
+              metaRouteType,
+              metaPlannerStatus,
+            );
           }
 
           if (parsed.notice) {
@@ -925,6 +1009,7 @@
 
   async function bootstrap() {
     _bindCollapsiblePanels();
+    _loadReasoningPref();
     _setSidebarSection('chats');
     await Promise.all([refreshSessions(), refreshMemory()]);
     await loadCurrentSessionMessages();

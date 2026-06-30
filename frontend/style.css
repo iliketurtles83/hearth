@@ -454,7 +454,64 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
+}
+
+#reasoning-toggle-btn {
   margin-left: auto;
+  font-size: 0.68rem;
+  height: 24px;
+  padding: 0.2rem 0.5rem;
+  white-space: nowrap;
+}
+
+.reasoning-block {
+  width: 100%;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.02);
+  margin-top: 0.2rem;
+}
+
+.reasoning-block summary {
+  cursor: pointer;
+  list-style: none;
+  font-family: var(--font-ui);
+  font-size: 0.74rem;
+  letter-spacing: 0.02em;
+  color: var(--text-muted);
+  padding: 0.38rem 0.5rem;
+}
+
+.reasoning-block summary::-webkit-details-marker {
+  display: none;
+}
+
+.reasoning-block summary::before {
+  content: "▸";
+  display: inline-block;
+  margin-right: 0.32rem;
+  color: var(--text-muted);
+  transform: translateY(-1px);
+}
+
+.reasoning-block[open] summary::before {
+  content: "▾";
+}
+
+.reasoning-content {
+  border-top: 1px solid var(--border);
+  padding: 0.44rem 0.5rem 0.5rem;
+  color: var(--text-muted);
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 0.72rem;
+  line-height: 1.42;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+body.hide-reasoning .reasoning-block {
+  display: none;
 }
 
 #tts-enable-btn,

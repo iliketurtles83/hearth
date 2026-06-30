@@ -850,7 +850,7 @@ async def chat(request: ChatRequest, http_request: Request):
                     )
                     if meta.get("reasoning_summary"):
                         log.debug("chat.planner_reasoning | session_id=%s reasoning=%s", session_id, meta["reasoning_summary"])
-                    yield f"data: {json.dumps({'model': active_model, 'intent': intent_for_log, 'confidence': confidence_for_log})}\n\n"
+                    yield f"data: {json.dumps({'model': active_model, 'intent': intent_for_log, 'confidence': confidence_for_log, 'route_type': route_for_log, 'planner_status': meta.get('planner_status', ''), 'reasoning_summary': meta.get('reasoning_summary', '')})}\n\n"
                 elif "text" in event:
                     chunk = event["text"]
                     if first_token_time is None:

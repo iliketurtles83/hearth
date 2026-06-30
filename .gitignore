@@ -5,6 +5,7 @@ __pycache__
 *.pyc
 .venv/
 .vscode
+.github
 *.onnx
 *.mp3
 *.bin
