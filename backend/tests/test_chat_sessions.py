@@ -360,6 +360,52 @@ async def test_chat_stream_omits_voice_metadata_for_text_source(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_chat_stream_includes_thinking_chunks_when_available(monkeypatch):
+    class _FakeGraph:
+        async def astream(self, _state, config=None, stream_mode=None):
+            yield {
+                "meta": {
+                    "model": main.CHAT_MODEL,
+                    "intent": "quick-local",
+                    "confidence": 0.99,
+                    "route_type": "local",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "ok",
+                    "reasoning_summary": "",
+                }
+            }
+            yield {"thinking": "let me think this through"}
+            yield {"text": "final answer"}
+
+    monkeypatch.setattr(main.app.state, "assistant_graph", _FakeGraph(), raising=False)
+    monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        main.memory_store,
+        "ingest_user_message",
+        lambda *_args, **_kwargs: {
+            "status": "none",
+            "saved": [],
+            "blocked": [],
+            "needs_confirmation": [],
+            "deleted": 0,
+            "explicit": False,
+        },
+    )
+
+    response = await main.chat(
+        main.ChatRequest(message="hello", source="text"),
+        _request("alice"),
+    )
+    events = await _read_sse_events(response)
+
+    parsed = [json.loads(event) for event in events if event != "[DONE]"]
+    assert any(item.get("thinking") == "let me think this through" for item in parsed)
+    assert any(item.get("text") == "final answer" for item in parsed)
+    assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
 async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(monkeypatch):
     class _UnexpectedGraph:
         async def astream(self, *_args, **_kwargs):

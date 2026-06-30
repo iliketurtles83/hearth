@@ -105,7 +105,7 @@ class AssistantGraphDependencies:
     memory_store: Any
     embedding_router: Any | None
     router_route: Callable[[str], Awaitable[Any]]
-    stream_local: Callable[[PromptRequest, str], AsyncIterator[str]]
+    stream_local: Callable[[PromptRequest, str], AsyncIterator[Any]]
     stream_cloud: Callable[[str, list[dict[str, Any]]], AsyncIterator[str]]
     tool_dispatch: Callable[[str, dict[str, Any]], Awaitable[Any]]
     chat_model: str
@@ -128,6 +128,18 @@ def default_checkpoint_path() -> str:
 
 def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
+
+
+def _chunk_text(chunk: Any) -> str:
+    if isinstance(chunk, dict):
+        return str(chunk.get("text", "") or "")
+    return str(chunk or "")
+
+
+def _chunk_thinking(chunk: Any) -> str:
+    if isinstance(chunk, dict):
+        return str(chunk.get("thinking", "") or "")
+    return ""
 
 
 def _select_history_for_budget(
@@ -674,7 +686,7 @@ def build_assistant_graph(
         )
         compressed = ""
         async for chunk in deps.stream_local(compress_request, model_name=model_name):
-            compressed += chunk
+            compressed += _chunk_text(chunk)
         result = compressed.strip()
         log.info(
             "graph.responder | voice_compress | original_words=%d compressed_words=%d",
@@ -684,7 +696,7 @@ def build_assistant_graph(
         return result if result else original
 
     async def _emit_response_chunks(
-        stream: AsyncIterator[str],
+        stream: AsyncIterator[Any],
         *,
         modality: str,
         compress_model: str,
@@ -693,13 +705,19 @@ def build_assistant_graph(
         if modality == "voice":
             collected = ""
             async for chunk in stream:
-                collected += chunk
+                collected += _chunk_text(chunk)
             return await _compress_response_for_voice(collected, compress_model)
 
         response_text = ""
         async for chunk in stream:
-            writer({"text": chunk})
-            response_text += chunk
+            thinking = _chunk_thinking(chunk)
+            if thinking:
+                writer({"thinking": thinking})
+
+            text = _chunk_text(chunk)
+            if text:
+                writer({"text": text})
+                response_text += text
         return response_text
 
     async def responder(state: AssistantState) -> dict[str, Any]:
@@ -905,7 +923,7 @@ def build_assistant_graph(
                 )
                 summary_text = ""
                 async for chunk in deps.stream_local(summary_request, model_name=deps.chat_model):
-                    summary_text += chunk
+                    summary_text += _chunk_text(chunk)
                 summary_text = summary_text.strip()
                 if not summary_text:
                     return

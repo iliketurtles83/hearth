@@ -844,6 +844,7 @@
     bubble.appendChild(cursor);
 
     let accumulated = '';
+    let reasoningAccumulated = '';
     let voiceMeta = null;
     let metaRouteType = '';
     let metaPlannerStatus = '';
@@ -912,10 +913,20 @@
             metaPlannerStatus = String(parsed.planner_status || '');
           }
 
-          if (parsed.reasoning_summary || parsed.reasoning || parsed.thinking) {
+          if (parsed.reasoning_summary) {
             appendReasoningSummary(
               wrapper,
-              parsed.reasoning_summary || parsed.reasoning || parsed.thinking,
+              parsed.reasoning_summary,
+              metaRouteType,
+              metaPlannerStatus,
+            );
+          }
+
+          if (parsed.thinking) {
+            reasoningAccumulated += String(parsed.thinking || '');
+            appendReasoningSummary(
+              wrapper,
+              reasoningAccumulated,
               metaRouteType,
               metaPlannerStatus,
             );

@@ -595,19 +595,37 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def _ollama_think_setting() -> bool | str:
+    raw = (os.getenv("OLLAMA_THINK", "true") or "").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"low", "medium", "high", "max"}:
+        return raw
+    return True
+
+
 async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
+    think_mode = _ollama_think_setting()
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", f"{OLLAMA_URL}/api/generate", json={
             "model": model_name,
             "prompt": request.message,
             "system": request.system,
             "stream": True,
+            "think": think_mode,
         }) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line:
                     data = json.loads(line)
-                    yield data.get("response", "")
+                    thinking = data.get("thinking") or data.get("message", {}).get("thinking", "")
+                    if thinking:
+                        yield {"thinking": thinking}
+
+                    text = data.get("response") or data.get("message", {}).get("content", "")
+                    if text:
+                        yield {"text": text}
+
                     if data.get("done"):
                         break
 
@@ -857,6 +875,8 @@ async def chat(request: ChatRequest, http_request: Request):
                         first_token_time = time.monotonic()
                     assistant_accumulated += chunk
                     yield f"data: {json.dumps({'text': chunk})}\n\n"
+                elif "thinking" in event:
+                    yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
                 elif "notice" in event:
                     fallback_used = True
                     yield f"data: {json.dumps({'notice': event['notice']})}\n\n"
