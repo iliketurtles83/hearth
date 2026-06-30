@@ -417,15 +417,37 @@ body {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  min-height: 34px;
+  padding-left: 2.25rem;
   padding-bottom: 0.6rem;
   border-bottom: none;
 }
 
 #sidebar-brand-name {
+  font-family: var(--font-chat);
   font-size: 1rem;
   font-weight: 600;
   letter-spacing: 0.03em;
   color: var(--text);
+}
+
+#shell-topbar {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  z-index: 40;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+#shell-brand {
+  font-family: var(--font-chat);
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--text);
+  line-height: 1;
 }
 
 #tts-controls {
@@ -801,7 +823,7 @@ body {
 #voice-status.transcribing { display: inline-block; background: rgba(64, 192, 87, 0.15); color: var(--model-local); }
 
 #sidebar-toggle-btn {
-  display: none;
+  display: inline-flex;
   background: var(--surface-raised);
   border: none;
   border-radius: var(--radius);
@@ -830,31 +852,23 @@ body {
   position: relative;
 }
 
-#sidebar-toggle-btn {
-  position: absolute;
-  top: 0.5rem;
-  left: 0.5rem;
-  z-index: 10;
-}
-
 @media (min-width: 901px) {
   #app-shell {
     position: static;
   }
 
-  #sidebar-toggle-btn {
-    position: absolute;
+  #shell-topbar {
     top: 0.6rem;
     left: 0.6rem;
-    z-index: 5;
+    z-index: 40;
+  }
+
+  body:not(.sidebar-collapsed) #shell-brand {
+    display: none;
   }
 
   body.sidebar-collapsed #sidebar {
     display: none;
-  }
-  
-  body.sidebar-collapsed #sidebar-toggle-btn {
-    display: inline-flex;
   }
 }
 

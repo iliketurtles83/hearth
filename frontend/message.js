@@ -321,7 +321,7 @@
   function appendHistoryMessage(role, text = '') {
     const { bubble } = appendMessage(role, '');
     if (role === 'assistant') {
-      bubble.innerHTML = marked.parse(text || '');
+      bubble.innerHTML = _renderMarkdownSafe(text || '');
     } else {
       bubble.textContent = text || '';
     }
@@ -458,11 +458,11 @@
       const div = document.createElement('div');
       div.className = 'list-item';
       div.innerHTML = `
-        <div class="list-item-title">${item.key}</div>
-        <div class="list-item-meta">${(item.value || '').slice(0, 90)}</div>
-        <div class="list-item-meta">${tierLabel}${consolidatedLabel ? ` · ${consolidatedLabel}` : ''}</div>
+        <div class="list-item-title">${_esc(item.key)}</div>
+        <div class="list-item-meta">${_esc((item.value || '').slice(0, 90))}</div>
+        <div class="list-item-meta">${_esc(tierLabel)}${consolidatedLabel ? ` · ${_esc(consolidatedLabel)}` : ''}</div>
         <div class="memory-actions">
-          <button class="memory-delete-btn" data-id="${item.id}">Delete</button>
+          <button class="memory-delete-btn" data-id="${_esc(item.id)}">Delete</button>
         </div>
       `;
       div.querySelector('.memory-delete-btn')?.addEventListener('click', async (e) => {
@@ -499,7 +499,75 @@
   // ── Music panel (Phase 8) ────────────────────────────────────────────────────
 
   function _esc(str) {
-    return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return String(str)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  function _safeHref(url) {
+    const raw = String(url || '').trim();
+    if (!raw) return '#';
+    try {
+      const parsed = new URL(raw, window.location.origin);
+      const protocol = parsed.protocol.toLowerCase();
+      if (protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:' || protocol === 'tel:') {
+        return parsed.href;
+      }
+    } catch {
+      // fall through to safe default
+    }
+    return '#';
+  }
+
+  function _sanitizeMarkdownHtml(root) {
+    const allowedTags = new Set([
+      'A', 'P', 'BR', 'STRONG', 'EM', 'CODE', 'PRE', 'UL', 'OL', 'LI',
+      'BLOCKQUOTE', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HR'
+    ]);
+
+    const walk = (node) => {
+      if (node.nodeType === Node.ELEMENT_NODE) {
+        const tag = node.tagName;
+
+        if (!allowedTags.has(tag)) {
+          const replacement = document.createTextNode(node.textContent || '');
+          node.replaceWith(replacement);
+          return;
+        }
+
+        for (const attr of Array.from(node.attributes)) {
+          const name = attr.name.toLowerCase();
+          if (tag === 'A' && (name === 'href' || name === 'title')) {
+            continue;
+          }
+          node.removeAttribute(attr.name);
+        }
+
+        if (tag === 'A') {
+          node.setAttribute('href', _safeHref(node.getAttribute('href')));
+          node.setAttribute('rel', 'noopener noreferrer nofollow ugc');
+          node.setAttribute('target', '_blank');
+        }
+      }
+
+      const children = Array.from(node.childNodes);
+      for (const child of children) {
+        walk(child);
+      }
+    };
+
+    walk(root);
+  }
+
+  function _renderMarkdownSafe(text) {
+    const rendered = marked.parse(text || '');
+    const tpl = document.createElement('template');
+    tpl.innerHTML = rendered;
+    _sanitizeMarkdownHtml(tpl.content);
+    return tpl.innerHTML;
   }
 
   async function refreshNowPlaying() {
@@ -788,7 +856,7 @@
 
           if (parsed.text) {
             accumulated += parsed.text;
-            bubble.innerHTML = marked.parse(accumulated);
+            bubble.innerHTML = _renderMarkdownSafe(accumulated);
             bubble.appendChild(cursor);
             scrollToBottom();
           }
