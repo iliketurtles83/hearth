@@ -65,3 +65,7 @@ def test_voice_tts_metadata_for_voice_source():
 
 def test_voice_tts_metadata_for_text_source_is_none():
     assert main._voice_tts_metadata("text") is None
+
+
+def test_transcribe_is_not_unprotected_path():
+    assert "/transcribe" not in main._UNPROTECTED_PATHS

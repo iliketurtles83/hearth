@@ -61,9 +61,3 @@ class LoginRequest(BaseModel):
     password: str
     device_name: str | None = None
     persistent: bool = False
-
-
-class WriteRequest(BaseModel):
-    content: str
-    confirm: bool = False
-    request_id: str | None = None

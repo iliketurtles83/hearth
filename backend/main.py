@@ -114,6 +114,14 @@ OLLAMA_VISION_MODEL: str = (
     or CHAT_MODEL
 )
 MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
+_GENERIC_STREAM_ERROR_TEXT = "⚠ Something went wrong. Please try again."
+
+
+def _stream_error_payload(code: str = "INTERNAL") -> dict[str, str]:
+    return {
+        "text": _GENERIC_STREAM_ERROR_TEXT,
+        "code": code,
+    }
 
 
 def _load_hearth_prompt(filename: str, env_var: str, fallback: str) -> str:
@@ -288,7 +296,7 @@ _validate_startup()
 # Resolves the bearer token (from Authorization header or auth_token cookie)
 # and attaches user_id to request.state.  Returns 401 for protected routes
 # that have no valid token.
-_UNPROTECTED_PATHS = frozenset(["/health", "/", "/transcribe", "/ws/wake"])
+_UNPROTECTED_PATHS = frozenset(["/health", "/", "/ws/wake"])
 
 # Path prefixes that correspond to JSON API routes and must always be
 # auth-checked, even for browser navigations.  Frontend API calls use fetch()
@@ -388,6 +396,20 @@ def _extract_bearer_token(request: Request) -> str | None:
     return request.cookies.get(AUTH_COOKIE_NAME)
 
 
+_CSP_POLICY = (
+    "default-src 'self'; "
+    "base-uri 'self'; "
+    "object-src 'none'; "
+    "frame-ancestors 'none'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "font-src 'self' data:; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self' ws: wss:; "
+    "media-src 'self' data: blob:"
+)
+
+
 # ── Cross-Origin isolation headers (required for SharedArrayBuffer / vad-web) ──
 class COOPCOEPMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -397,6 +419,10 @@ class COOPCOEPMiddleware(BaseHTTPMiddleware):
         # (needed by vad-web's threaded WASM) while allowing cross-origin CDN
         # resources that don't set Cross-Origin-Resource-Policy headers.
         response.headers["Cross-Origin-Embedder-Policy"] = "credentialless"
+        response.headers["Content-Security-Policy"] = _CSP_POLICY
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["X-Frame-Options"] = "DENY"
         return response
 
 # Module-level graph instance — initialized after stream_local/stream_cloud are defined.
@@ -637,7 +663,18 @@ async def stream_local_vision(
                         break
 
 async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[override]
-    client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise RuntimeError("Cloud model is unavailable: ANTHROPIC_API_KEY is not configured")
+
+    # Reuse one client instance per process to avoid per-request setup churn.
+    global _anthropic_client
+    try:
+        client = _anthropic_client
+    except NameError:
+        _anthropic_client = anthropic.Anthropic(api_key=api_key)
+        client = _anthropic_client
+
     with client.messages.stream(
         model=CLOUD_MODEL,
         max_tokens=2048,
@@ -727,8 +764,7 @@ async def chat(request: ChatRequest, http_request: Request):
                 tool_result: ToolResult = await tools.dispatch("music", music_cmd)
             except Exception as exc:
                 log.error("chat.music_fast | session_id=%s error=%s", session_id, exc)
-                msg = f"⚠ Music command failed: {exc}"
-                yield f"data: {json.dumps({'text': msg})}\n\n"
+                yield f"data: {json.dumps(_stream_error_payload('MUSIC_COMMAND_FAILED'))}\n\n"
                 yield "data: [DONE]\n\n"
                 return
             log.info(
@@ -831,7 +867,7 @@ async def chat(request: ChatRequest, http_request: Request):
                     yield f"data: {json.dumps(event)}\n\n"
         except Exception as exc:
             log.error("chat.graph_error | session_id=%s error=%s", session_id, exc)
-            yield f"data: {json.dumps({'text': f'⚠ Error: {exc}'})}\n\n"
+            yield f"data: {json.dumps(_stream_error_payload())}\n\n"
 
         completion_time = time.monotonic()
         first_token_ms = (first_token_time - start_time) * 1000 if first_token_time else -1
@@ -1079,8 +1115,7 @@ _MAX_TRANSCRIBE_BYTES = int(os.getenv("MAX_TRANSCRIBE_BYTES", str(25 * 1024 * 10
 
 @app.post("/transcribe")
 async def transcribe(audio: UploadFile = File(...)):
-    # /transcribe is unauthenticated (voice wake flow), so cap the upload size to
-    # avoid an unbounded-read / compute-DoS surface before touching Whisper.
+    # /transcribe is auth-protected; still cap upload size to avoid unbounded reads.
     raw = await audio.read(_MAX_TRANSCRIBE_BYTES + 1)
     if len(raw) > _MAX_TRANSCRIBE_BYTES:
         return JSONResponse(
@@ -1141,7 +1176,7 @@ async def code(request: CodeRequest, http_request: Request):
                     yield f"data: {json.dumps({'notice': event['notice']})}\n\n"
         except Exception as exc:
             log.error("code.graph_error | session_id=%s error=%s", session_id, exc)
-            yield f"data: {json.dumps({'text': f'⚠ Error: {exc}'})}\n\n"
+            yield f"data: {json.dumps(_stream_error_payload())}\n\n"
 
         voice_meta = _voice_tts_metadata(code_source)
         if voice_meta is not None:

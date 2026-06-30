@@ -66,6 +66,22 @@ def test_login_unknown_user_raises(svc):
     assert exc_info.value.code == "INVALID_CREDENTIALS"
 
 
+def test_login_unknown_user_still_hashes_password(svc, monkeypatch):
+    calls = {"count": 0}
+
+    def _fake_hash(_password: str, _salt: bytes) -> str:
+        calls["count"] += 1
+        return "0" * 64
+
+    monkeypatch.setattr(AuthService, "_hash_password", staticmethod(_fake_hash))
+
+    with pytest.raises(AuthError) as exc_info:
+        svc.login("missing-user", "password123")
+
+    assert exc_info.value.code == "INVALID_CREDENTIALS"
+    assert calls["count"] >= 1
+
+
 def test_login_case_insensitive_username(svc):
     svc.register("alice", "hunter2secret")
     result = svc.login("ALICE", "hunter2secret")

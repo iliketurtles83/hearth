@@ -99,8 +99,24 @@ class MemoryStore:
         os.makedirs(self.chroma_path, exist_ok=True)
 
         self._lock = Lock()
+        self._consolidation_lock = Lock()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
+        # Improve concurrency characteristics for mixed read/write workload.
+        # Some deployments mount the DB file read-only; in that case treat these
+        # pragmas as best-effort and continue with SQLite defaults.
+        try:
+            self._conn.execute("PRAGMA journal_mode=WAL")
+            self._conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.OperationalError as exc:
+            if "readonly" in str(exc).lower():
+                log.warning(
+                    "memory.sqlite_pragmas_skipped | db=%s reason=readonly",
+                    self.db_path,
+                )
+            else:
+                raise
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_db()
 
         self._embedder = HashEmbeddingFunction()
@@ -193,6 +209,35 @@ class MemoryStore:
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+
+            # Live-instance migration: enforce one fact per (user_id, key).
+            # Keep the most recent row for each key so unique index creation succeeds.
+            # Read-only DB mounts cannot apply migrations; skip them gracefully.
+            try:
+                self._conn.execute(
+                    """
+                    DELETE FROM facts
+                    WHERE id NOT IN (
+                        SELECT MAX(id)
+                        FROM facts
+                        GROUP BY user_id, key
+                    )
+                    """
+                )
+                self._conn.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_user_key
+                    ON facts(user_id, key)
+                    """
+                )
+            except sqlite3.OperationalError as exc:
+                if "readonly" in str(exc).lower():
+                    log.warning(
+                        "memory.migration_skipped | db=%s migration=facts_unique_index reason=readonly",
+                        self.db_path,
+                    )
+                else:
+                    raise
             self._conn.commit()
 
     def log_turn(self, session_id: str, user_id: str, role: str, content: str) -> None:
@@ -588,7 +633,7 @@ class MemoryStore:
                 WHERE user_id = ? AND (lower(key) LIKE ? OR lower(value) LIKE ?)
                 """,
                 (user_id, f"%{q}%", f"%{q}%", user_id, f"%{q}%", f"%{q}%"),
-            ).fetchall()
+            ).fetchall()  # nosec B608 - query uses bound parameters; wildcard pattern is parameterized.
 
             for row in rows:
                 table = row["table_name"]
@@ -695,10 +740,19 @@ class MemoryStore:
                         """
                         INSERT INTO facts (user_id, key, value, source, created_at, expires_at, sensitive)
                         VALUES (?, ?, ?, ?, ?, NULL, 0)
+                        ON CONFLICT(user_id, key)
+                            DO UPDATE SET
+                                value = excluded.value,
+                                source = excluded.source,
+                                created_at = excluded.created_at
                         """,
                         (user_id, c.key, c.value, c.source, now),
                     )
-                    row_id = cur.lastrowid
+                    fact_row = cur.execute(
+                        "SELECT id FROM facts WHERE user_id = ? AND key = ? LIMIT 1",
+                        (user_id, c.key),
+                    ).fetchone()
+                    row_id = int(fact_row["id"])
                     memory_id = f"facts:{row_id}"
 
                 saved.append(memory_id)
@@ -809,7 +863,7 @@ class MemoryStore:
                 LIMIT ? OFFSET ?
                 """,
                 (user_id, user_id, user_id, limit, offset),
-            ).fetchall()
+            ).fetchall()  # nosec B608 - static SQL with bound parameters only.
 
             total = cur.execute(
                 """
@@ -904,108 +958,130 @@ class MemoryStore:
         return {"items": items, "total": int(total), "limit": limit, "offset": offset}
 
     def consolidate_pending(self, user_id: str | None = None, limit: int = 50) -> dict[str, int]:
+        # Single-flight guard: background tasks may trigger consolidation on
+        # consecutive turns. Serialize passes so the same unconsolidated batch
+        # cannot be promoted twice concurrently.
+        if not self._consolidation_lock.acquire(blocking=False):
+            return {
+                "processed": 0,
+                "promoted": 0,
+                "blocked": 0,
+            }
+
         now = time.time()
-        # Phase 1: read the pending summaries under the lock, then release it so
-        # the blocking LLM extraction does not stall every other memory operation.
-        with self._lock:
-            cur = self._conn.cursor()
-            if user_id:
-                rows = cur.execute(
-                    """
-                    SELECT id, user_id, session_id, summary
-                    FROM summaries
-                    WHERE user_id = ? AND consolidated = 0
-                    ORDER BY created_at ASC
-                    LIMIT ?
-                    """,
-                    (user_id, limit),
-                ).fetchall()
-            else:
-                rows = cur.execute(
-                    """
-                    SELECT id, user_id, session_id, summary
-                    FROM summaries
-                    WHERE consolidated = 0
-                    ORDER BY created_at ASC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
+        try:
+            # Phase 1: read the pending summaries under the lock, then release it so
+            # the blocking LLM extraction does not stall every other memory operation.
+            with self._lock:
+                cur = self._conn.cursor()
+                if user_id:
+                    rows = cur.execute(
+                        """
+                        SELECT id, user_id, session_id, summary
+                        FROM summaries
+                        WHERE user_id = ? AND consolidated = 0
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                        """,
+                        (user_id, limit),
+                    ).fetchall()
+                else:
+                    rows = cur.execute(
+                        """
+                        SELECT id, user_id, session_id, summary
+                        FROM summaries
+                        WHERE consolidated = 0
+                        ORDER BY created_at ASC
+                        LIMIT ?
+                        """,
+                        (limit,),
+                    ).fetchall()
 
-        # Phase 2: run the (blocking) LLM extraction for every summary WITHOUT
-        # holding the lock.  Build a flat work list of writes to apply afterwards.
-        extracted: list[tuple[int, str, list[MemoryCandidate]]] = []
-        for row in rows:
-            summary_id = int(row["id"])
-            summary_text = str(row["summary"] or "")
-            summary_user_id = str(row["user_id"])
-            # Phase 12b: Use LLM-based extraction instead of regex for richer candidates
-            candidates = self._extract_candidates_llm_sync(summary_text, source="consolidation")
-            extracted.append((summary_id, summary_user_id, candidates))
+            # Phase 2: run the (blocking) LLM extraction for every summary WITHOUT
+            # holding the lock.  Build a flat work list of writes to apply afterwards.
+            extracted: list[tuple[int, str, list[MemoryCandidate]]] = []
+            for row in rows:
+                summary_id = int(row["id"])
+                summary_text = str(row["summary"] or "")
+                summary_user_id = str(row["user_id"])
+                # Phase 12b: Use LLM-based extraction instead of regex for richer candidates
+                candidates = self._extract_candidates_llm_sync(summary_text, source="consolidation")
+                extracted.append((summary_id, summary_user_id, candidates))
 
-        # Phase 3: apply all DB + Chroma writes under the lock (no LLM calls here).
-        processed = 0
-        promoted = 0
-        blocked = 0
-        with self._lock:
-            cur = self._conn.cursor()
-            for summary_id, summary_user_id, candidates in extracted:
-                for c in candidates:
-                    text = f"{c.key}: {c.value}"
-                    if self._is_sensitive(text):
-                        blocked += 1
-                        continue
+            # Phase 3: apply all DB + Chroma writes under the lock (no LLM calls here).
+            processed = 0
+            promoted = 0
+            blocked = 0
+            with self._lock:
+                cur = self._conn.cursor()
+                for summary_id, summary_user_id, candidates in extracted:
+                    for c in candidates:
+                        text = f"{c.key}: {c.value}"
+                        if self._is_sensitive(text):
+                            blocked += 1
+                            continue
 
-                    if c.table == "preferences":
-                        cur.execute(
-                            """
-                            INSERT INTO preferences (user_id, key, value, updated_at, sensitive)
-                            VALUES (?, ?, ?, ?, 0)
-                            ON CONFLICT(user_id, key)
-                                DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-                            """,
-                            (summary_user_id, c.key, c.value, now),
+                        if c.table == "preferences":
+                            cur.execute(
+                                """
+                                INSERT INTO preferences (user_id, key, value, updated_at, sensitive)
+                                VALUES (?, ?, ?, ?, 0)
+                                ON CONFLICT(user_id, key)
+                                    DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                                """,
+                                (summary_user_id, c.key, c.value, now),
+                            )
+                            pref_row = cur.execute(
+                                "SELECT id FROM preferences WHERE user_id = ? AND key = ? LIMIT 1",
+                                (summary_user_id, c.key),
+                            ).fetchone()
+                            memory_id = f"preferences:{int(pref_row['id'])}"
+                        else:
+                            cur.execute(
+                                """
+                                INSERT INTO facts (user_id, key, value, source, created_at, expires_at, sensitive)
+                                VALUES (?, ?, ?, ?, ?, NULL, 0)
+                                ON CONFLICT(user_id, key)
+                                    DO UPDATE SET
+                                        value = excluded.value,
+                                        source = excluded.source,
+                                        created_at = excluded.created_at
+                                """,
+                                (summary_user_id, c.key, c.value, c.source, now),
+                            )
+                            fact_row = cur.execute(
+                                "SELECT id FROM facts WHERE user_id = ? AND key = ? LIMIT 1",
+                                (summary_user_id, c.key),
+                            ).fetchone()
+                            memory_id = f"facts:{int(fact_row['id'])}"
+
+                        self._upsert_chroma(
+                            memory_id,
+                            text,
+                            {
+                                "table": c.table,
+                                "key": c.key,
+                                "source": "consolidation",
+                                "user_id": summary_user_id,
+                                "created_at": now,
+                                "consent_status": "consolidated",
+                                "from_summary_id": summary_id,
+                            },
                         )
-                        pref_row = cur.execute(
-                            "SELECT id FROM preferences WHERE user_id = ? AND key = ? LIMIT 1",
-                            (summary_user_id, c.key),
-                        ).fetchone()
-                        memory_id = f"preferences:{int(pref_row['id'])}"
-                    else:
-                        cur.execute(
-                            """
-                            INSERT INTO facts (user_id, key, value, source, created_at, expires_at, sensitive)
-                            VALUES (?, ?, ?, ?, ?, NULL, 0)
-                            """,
-                            (summary_user_id, c.key, c.value, c.source, now),
-                        )
-                        memory_id = f"facts:{int(cur.lastrowid)}"
+                        promoted += 1
 
-                    self._upsert_chroma(
-                        memory_id,
-                        text,
-                        {
-                            "table": c.table,
-                            "key": c.key,
-                            "source": "consolidation",
-                            "user_id": summary_user_id,
-                            "created_at": now,
-                            "consent_status": "consolidated",
-                            "from_summary_id": summary_id,
-                        },
-                    )
-                    promoted += 1
+                    cur.execute("UPDATE summaries SET consolidated = 1 WHERE id = ?", (summary_id,))
+                    processed += 1
 
-                cur.execute("UPDATE summaries SET consolidated = 1 WHERE id = ?", (summary_id,))
-                processed += 1
+                self._conn.commit()
 
-            self._conn.commit()
-
-        return {
-            "processed": int(processed),
-            "promoted": int(promoted),
-            "blocked": int(blocked),
-        }
+            return {
+                "processed": int(processed),
+                "promoted": int(promoted),
+                "blocked": int(blocked),
+            }
+        finally:
+            self._consolidation_lock.release()
 
     def delete_item(self, user_id: str, memory_id: str) -> bool:
         if ":" not in memory_id:

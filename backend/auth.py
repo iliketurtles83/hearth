@@ -41,6 +41,19 @@ _SCRYPT_R = 8
 _SCRYPT_P = 1
 _SCRYPT_DKLEN = 32
 
+# Constant-time fallback inputs used when a username does not exist.  This
+# forces login() to pay the same scrypt cost as a real-user password check and
+# reduces username-enumeration timing differences.
+_DUMMY_SALT = b"authsvc_dummy_salt"
+_DUMMY_HASH = scrypt(
+    b"authsvc_dummy_password",
+    salt=_DUMMY_SALT,
+    n=_SCRYPT_N,
+    r=_SCRYPT_R,
+    p=_SCRYPT_P,
+    dklen=_SCRYPT_DKLEN,
+).hex()
+
 
 class AuthError(Exception):
     """Raised for expected authentication failures (wrong password, user exists, etc.)."""
@@ -192,6 +205,9 @@ class AuthService:
             ).fetchone()
 
         if row is None:
+            # Constant-time fallback to reduce username-enumeration timing.
+            candidate = self._hash_password(password, _DUMMY_SALT)
+            secrets.compare_digest(candidate, _DUMMY_HASH)
             raise AuthError("Invalid username or password.", code="INVALID_CREDENTIALS", status=401)
 
         expected = self._hash_password(password, bytes.fromhex(row["pw_salt"]))

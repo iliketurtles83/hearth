@@ -6,6 +6,7 @@ __pycache__
 .venv/
 .vscode
 *.onnx
+*.mp3
 *.bin
 *.db
 *.sqlite

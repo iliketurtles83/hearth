@@ -58,11 +58,8 @@ Main backend endpoints:
 
 Chat sessions are bounded and ephemeral: each authenticated user has their own in-memory session list, recent context is capped by turn/token budget, and older session history is compacted into a rolling summary for continuity.
 
-Code tool endpoints (Phase 10b):
+Code tool endpoint:
 - `POST /code` — stream code generation/editing via graph `code_tool` node
-- `GET /code/files` — list workspace files
-- `GET /code/files/{file_path}` — read a workspace file
-- `PUT /code/files/{file_path}` — write a workspace file (confirmation-gated)
 
 Music endpoints (Phase 8):
 - `POST /music/search` — search the Beets library DB (title / artist / album)
