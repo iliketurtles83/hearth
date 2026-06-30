@@ -16,19 +16,26 @@
 ## UI
 - make it more modern and sleek, less cluttered, more intuitive.
 
-### top bar
-- top bar only holds hamburger in top left and microphone in top rigght.
+### Task: UI top bar removal **DONE**
+- Folder: frontend/
+- currently top bar only holds hamburger in top left and microphone in top rigght.
 - remove top bar
 - hamburger resides in left panel with Hearth written next to it. 
 - the microphone will remain top right without top bar
 
-### sidebar
-- chats and music window: no more borders for songs and chats. 
-- **DONE** same color for song and chat sessions as background.
+### Task: sidebar visual improvements
+- Scope folder: frontend/
+- no more borders for songs, chats or memories 
+- they have the same color as background.
 - when hovering over, highlight entire background of the item
-- when expanding one tab, autocollapse other tabs?
 
-### chats window
+### Task: sidebar menu improvements
+- no more total scroll bar
+- vertical height is total height
+- collapse expand sidebar sections
+
+### Task: per chat settings
+- Folder: frontend/
 - chat settings menu is accessible by vertical three dot menu on the right of each chat title.
 - will pop up a small chat settings menu
 - chat settings menu will include delete, rename
@@ -36,4 +43,5 @@
 - create rename chat, also from chat settings menu
 
 ### music window
+- Folder: frontend/
 - artist - song on one line
