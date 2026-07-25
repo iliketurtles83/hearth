@@ -658,14 +658,20 @@ async def stream_local_vision(
     image_mime: str,
     model_name: str = OLLAMA_VISION_MODEL,
 ):
-    """Ollama /api/chat endpoint with image tokens (multimodal forward pass)."""
-    user_msg: dict = {"role": "user", "content": request.message, "images": [image_base64]}
+    """Ollama /api/chat endpoint with image tokens (multimodal forward pass).
+
+    The system prompt is embedded into the user message content because
+    Ollama's /api/chat endpoint ignores the "system" role for most models.
+    """
+    system_content = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
+    user_msg: dict = {
+        "role": "user",
+        "content": f"{system_content}\n\n{request.message}",
+        "images": [image_base64],
+    }
     payload = {
         "model": model_name,
-        "messages": [
-            {"role": "system", "content": request.system or CHAT_DEFAULT_SYSTEM_PROMPT},
-            user_msg,
-        ],
+        "messages": [user_msg],
         "stream": True,
     }
     async with httpx.AsyncClient(timeout=120) as client:
