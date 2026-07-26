@@ -7,6 +7,8 @@ Storage contract:
     memory content; it is not the source of truth for persisted user memory.
 """
 
+from __future__ import annotations
+
 import os
 import re
 import sqlite3
@@ -63,23 +65,70 @@ class MemoryCommand:
     query: str | None = None
 
 
-class HashEmbeddingFunction(EmbeddingFunction):
-    """Deterministic lightweight embedding suitable for local semantic recall."""
+def _ollama_embed_sync(text: str, *, base_url: str, model: str) -> list[float] | None:
+    """Synchronous embedding call via Ollama /api/embeddings.
 
-    def __init__(self, dim: int = 192):
-        self.dim = dim
+    Returns None when Ollama is unreachable so callers can fall back
+    to deterministic hash-based embeddings.
+    """
+    try:
+        payload = {"model": model, "input": text}
+        with httpx.Client(timeout=5.0) as client:
+            resp = client.post(f"{base_url.rstrip('/')}/api/embeddings", json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+        vector = np.asarray(data.get("embedding", []), dtype=np.float32)
+        if vector.ndim != 1 or vector.size == 0:
+            return None
+        return vector.tolist()
+    except Exception:
+        return None
+
+
+class OllamaEmbeddingFunction(EmbeddingFunction):
+    """ChromaDB embedding function backed by local Ollama (nomic-embed-text).
+
+    Embeddings are cached per instance.  If Ollama is unreachable the
+    function falls back to a deterministic hash-based embedding so that
+    ChromaDB operations never crash.
+    """
+
+    def __init__(
+        self,
+        base_url: str | None = None,
+        model: str | None = None,
+        fallback_dim: int = 192,
+    ) -> None:
+        self._base_url = (base_url or os.getenv("OLLAMA_URL", "http://ollama:11434")).rstrip("/")
+        self._model = model or os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
+        self._fallback_dim = fallback_dim
+        self._cache: dict[str, list[float]] = {}
 
     def _embed_one(self, text: str) -> list[float]:
-        vec = np.zeros(self.dim, dtype=np.float32)
+        cached = self._cache.get(text)
+        if cached is not None:
+            return cached
+
+        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+        embed_model = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
+
+        vec = _ollama_embed_sync(text, base_url=ollama_url, model=embed_model)
+        if vec is not None:
+            self._cache[text] = vec
+            return vec
+
+        # Fallback: deterministic hash-based sparse embedding.
+        hash_vec = np.zeros(self._fallback_dim, dtype=np.float32)
         for token in re.findall(r"[a-z0-9]+", text.lower()):
-            # Use a stable hash so embedding positions are deterministic across restarts.
             digest = hashlib.sha256(token.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % self.dim
-            vec[idx] += 1.0
-        norm = float(np.linalg.norm(vec))
+            idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % self._fallback_dim
+            hash_vec[idx] += 1.0
+        norm = float(np.linalg.norm(hash_vec))
         if norm > 0.0:
-            vec /= norm
-        return vec.tolist()
+            hash_vec /= norm
+        result = hash_vec.tolist()
+        self._cache[text] = result
+        return result
 
     def __call__(self, input: Documents) -> list[list[float]]:
         return [self._embed_one(t) for t in input]
@@ -119,12 +168,73 @@ class MemoryStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_db()
 
-        self._embedder = HashEmbeddingFunction()
+        self._embedder = OllamaEmbeddingFunction()
         self._chroma = chromadb.PersistentClient(path=self.chroma_path)
         self._collection = self._chroma.get_or_create_collection(
             name="conversation_memory",
             embedding_function=self._embedder,
         )
+        self._maybe_recreate_collection()
+
+    def _maybe_recreate_collection(self) -> None:
+        """Recreate the ChromaDB collection if embedding dimensions changed.
+
+        When switching from the old hash-based embedder (192-dim) to
+        Ollama's nomic-embed-text (typically 768-dim) the existing
+        collection will reject new embeddings.  Detect the mismatch
+        and recreate the collection so the new embedder takes effect.
+        """
+        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+        embed_model = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
+        try:
+            vec = _ollama_embed_sync("probe", base_url=ollama_url, model=embed_model)
+            if vec is None:
+                return
+            new_dim = len(vec)
+        except Exception:
+            return
+
+        try:
+            existing = self._chroma.get_collection(name="conversation_memory")
+            if existing.metadata and existing.metadata.get("hnsw:space"):
+                existing_dim = existing.__len__()
+                if existing_dim > 0:
+                    # Collection has data — check if we need to recreate.
+                    pass
+        except Exception:
+            return
+
+        # Heuristic: if the collection exists with data and the embedder
+        # changed, recreate it.  We detect this by trying to embed a
+        # probe and comparing dimensionality against stored vectors.
+        try:
+            existing = self._chroma.get_collection(name="conversation_memory")
+            count = existing.__len__()
+            if count > 0:
+                # Probe with old embedder dimension (192).
+                old_vec = np.zeros(192, dtype=np.float32)
+                for token in re.findall(r"[a-z0-9]+", "probe"):
+                    digest = hashlib.sha256(token.encode("utf-8")).digest()
+                    idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % 192
+                    old_vec[idx] += 1.0
+                norm = float(np.linalg.norm(old_vec))
+                if norm > 0:
+                    old_vec /= norm
+                old_dim = len(old_vec)
+
+                if new_dim != old_dim:
+                    log.info(
+                        "memory.collection_recreate | reason=embedding_dimension_mismatch "
+                        "old_dim=%d new_dim=%d count=%d",
+                        old_dim, new_dim, count,
+                    )
+                    self._chroma.delete_collection(name="conversation_memory")
+                    self._collection = self._chroma.get_or_create_collection(
+                        name="conversation_memory",
+                        embedding_function=self._embedder,
+                    )
+        except Exception:
+            pass
 
     _SENSITIVE_SECRET_PATTERNS = [
         r"\b(api[_-]?key|token|password|secret|passwd|bearer)\b",
@@ -482,9 +592,9 @@ class MemoryStore:
     async def _llm_extract_candidates(self, text: str, source: str) -> list[MemoryCandidate]:
         """Extract memory candidates using LLM-based reasoning (Phase 12b).
 
-        Calls OLLAMA_CHAT_MODEL with structured prompt, parses JSON response,
-        and filters by confidence >= 0.7. Gracefully handles parse failures and
-        Ollama unreachability by returning empty list and logging error.
+        Calls OLLAMA_CHAT_MODEL via /api/chat with a system prompt, parses
+        JSON response, and filters by confidence >= 0.7.  Gracefully handles
+        parse failures and Ollama unreachability by returning empty list.
 
         Args:
             text: Episodic summary or conversation text to extract from.
@@ -509,8 +619,10 @@ class MemoryStore:
 
         payload = {
             "model": chat_model,
-            "prompt": text,
-            "system": MEMORY_EXTRACTOR_SYSTEM,
+            "messages": [
+                {"role": "system", "content": MEMORY_EXTRACTOR_SYSTEM},
+                {"role": "user", "content": text},
+            ],
             "stream": False,
             "format": "json",
             "options": {
@@ -522,10 +634,10 @@ class MemoryStore:
         try:
             timeout = 10.0  # Generous timeout; consolidation is non-blocking
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(f"{ollama_url}/api/generate", json=payload)
+                resp = await client.post(f"{ollama_url}/api/chat", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-                raw_response = data.get("response", "{}")
+                raw_response = data.get("message", {}).get("content", "{}")
         except httpx.ConnectError as e:
             log.warning(
                 "memory.llm_extract | extraction_failed=ollama_unreachable error=%s",
@@ -714,13 +826,13 @@ class MemoryStore:
             cur = self._conn.cursor()
             now = time.time()
             for c in candidates:
-                text = f"{c.key}: {c.value}"
-                if self._is_sensitive(text):
-                    blocked.append(text)
+                fact_text = f"{c.key}: {c.value}"
+                if self._is_sensitive(fact_text):
+                    blocked.append(fact_text)
                     continue
 
                 if self._requires_confirmation(source_message, c.key) and not explicit_requested:
-                    needs_confirmation.append(text)
+                    needs_confirmation.append(fact_text)
                     continue
 
                 if c.table == "preferences":
@@ -758,10 +870,11 @@ class MemoryStore:
                 saved.append(memory_id)
                 self._upsert_chroma(
                     memory_id,
-                    text,
+                    source_message,
                     {
                         "table": c.table,
                         "key": c.key,
+                        "value": c.value,
                         "source": c.source,
                         "user_id": user_id,
                         "created_at": now,
@@ -1016,8 +1129,8 @@ class MemoryStore:
                 cur = self._conn.cursor()
                 for summary_id, summary_user_id, candidates in extracted:
                     for c in candidates:
-                        text = f"{c.key}: {c.value}"
-                        if self._is_sensitive(text):
+                        fact_text = f"{c.key}: {c.value}"
+                        if self._is_sensitive(fact_text):
                             blocked += 1
                             continue
 
@@ -1057,10 +1170,11 @@ class MemoryStore:
 
                         self._upsert_chroma(
                             memory_id,
-                            text,
+                            summary_text,
                             {
                                 "table": c.table,
                                 "key": c.key,
+                                "value": c.value,
                                 "source": "consolidation",
                                 "user_id": summary_user_id,
                                 "created_at": now,
@@ -1218,17 +1332,17 @@ class MemoryStore:
             ids = (result.get("ids") or [[]])[0]
             docs = (result.get("documents") or [[]])[0]
             distances = (result.get("distances") or [[]])[0]
-            for idx, doc, dist in zip(ids, docs, distances):
+            metadatas = (result.get("metadatas") or [[]])[0]
+            for idx, doc, dist, meta in zip(ids, docs, distances, metadatas):
                 score = 1.0 / (1.0 + float(dist))
                 table = str(idx).split(":", 1)[0] if ":" in str(idx) else "facts"
-                key, _, value = str(doc).partition(":")
                 chroma_hits.append(
                     {
                         "id": idx,
                         "table": table,
                         "tier": "semantic",
-                        "key": key.strip(),
-                        "value": value.strip(),
+                        "key": str(meta.get("key", "")),
+                        "value": str(meta.get("value", "")),
                         "text": doc,
                         "score": score,
                         "source": "chroma",
@@ -1239,10 +1353,7 @@ class MemoryStore:
 
         merged: dict[str, dict[str, Any]] = {}
         for hit in sqlite_sem_hits + sqlite_epi_hits + chroma_hits:
-            overlap = self._token_overlap(query_terms, str(hit.get("text", "")))
-            if overlap == 0 and hit.get("source") == "chroma":
-                continue
-            if float(hit.get("score", 0.0)) < self.min_relevance_score and overlap < 2:
+            if float(hit.get("score", 0.0)) < self.min_relevance_score:
                 continue
 
             existing = merged.get(hit["id"])

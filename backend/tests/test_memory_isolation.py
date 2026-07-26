@@ -5,7 +5,16 @@ and that no data leaks across users.
 """
 import pytest
 
-from memory import MemoryStore
+from memory import MemoryStore, _ollama_embed_sync
+
+
+@pytest.fixture(autouse=True)
+def mock_ollama_embed_sync(monkeypatch):
+    """Prevent OllamaEmbeddingFunction from hitting Ollama during init."""
+    monkeypatch.setattr(
+        "memory._ollama_embed_sync",
+        lambda *a, **kw: [0.0] * 768,
+    )
 
 
 @pytest.fixture
@@ -143,12 +152,14 @@ def test_consolidate_pending_promotes_summary_facts(store):
 
     # Mock Ollama response with extracted facts
     mock_response = {
-        "response": json.dumps({
-            "candidates": [
-                {"key": "name", "value": "Alice", "type": "fact", "confidence": 0.95},
-                {"key": "location", "value": "Tallinn", "type": "fact", "confidence": 0.90},
-            ]
-        })
+        "message": {
+            "content": json.dumps({
+                "candidates": [
+                    {"key": "name", "value": "Alice", "type": "fact", "confidence": 0.95},
+                    {"key": "location", "value": "Tallinn", "type": "fact", "confidence": 0.90},
+                ]
+            })
+        }
     }
 
     async def mock_post_fn(*args, **kwargs):
@@ -237,36 +248,38 @@ def test_llm_extract_filters_by_confidence(store, monkeypatch):
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    # Mock Ollama response with mixed confidence scores
+    # Mock Ollama /api/chat response with mixed confidence scores
     mock_response = {
-        "response": json.dumps({
-            "candidates": [
-                {
-                    "key": "favorite_language",
-                    "value": "Python",
-                    "type": "preference",
-                    "confidence": 0.95,  # High confidence → included
-                },
-                {
-                    "key": "workspace_language",
-                    "value": "JavaScript",
-                    "type": "preference",
-                    "confidence": 0.6,  # Low confidence → filtered out
-                },
-                {
-                    "key": "location",
-                    "value": "Helsinki",
-                    "type": "fact",
-                    "confidence": 0.85,  # High confidence → included
-                },
-                {
-                    "key": "maybe_interest",
-                    "value": "machine learning",
-                    "type": "fact",
-                    "confidence": 0.65,  # Below threshold → filtered out
-                },
-            ]
-        })
+        "message": {
+            "content": json.dumps({
+                "candidates": [
+                    {
+                        "key": "favorite_language",
+                        "value": "Python",
+                        "type": "preference",
+                        "confidence": 0.95,  # High confidence → included
+                    },
+                    {
+                        "key": "workspace_language",
+                        "value": "JavaScript",
+                        "type": "preference",
+                        "confidence": 0.6,  # Low confidence → filtered out
+                    },
+                    {
+                        "key": "location",
+                        "value": "Helsinki",
+                        "type": "fact",
+                        "confidence": 0.85,  # High confidence → included
+                    },
+                    {
+                        "key": "maybe_interest",
+                        "value": "machine learning",
+                        "type": "fact",
+                        "confidence": 0.65,  # Below threshold → filtered out
+                    },
+                ]
+            })
+        }
     }
 
     async def mock_post_fn(*args, **kwargs):
@@ -302,10 +315,10 @@ def test_llm_extract_json_parse_failure(store, monkeypatch):
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    # Mock Ollama response with invalid JSON
+    # Mock Ollama /api/chat response with invalid JSON in message.content
     async def mock_post_fn(*args, **kwargs):
         resp = MagicMock()
-        resp.json = MagicMock(return_value={"response": "not valid json { [ }"})
+        resp.json = MagicMock(return_value={"message": {"content": "not valid json { [ }"}})
         resp.raise_for_status = MagicMock()
         return resp
 
@@ -356,24 +369,26 @@ def test_consolidate_uses_llm_extraction(store, monkeypatch):
     import json
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    # Mock Ollama with realistic extraction
+    # Mock Ollama /api/chat response with realistic extraction
     mock_response = {
-        "response": json.dumps({
-            "candidates": [
-                {
-                    "key": "name",
-                    "value": "Alice",
-                    "type": "fact",
-                    "confidence": 0.95,
-                },
-                {
-                    "key": "location",
-                    "value": "Tokyo",
-                    "type": "fact",
-                    "confidence": 0.88,
-                },
-            ]
-        })
+        "message": {
+            "content": json.dumps({
+                "candidates": [
+                    {
+                        "key": "name",
+                        "value": "Alice",
+                        "type": "fact",
+                        "confidence": 0.95,
+                    },
+                    {
+                        "key": "location",
+                        "value": "Tokyo",
+                        "type": "fact",
+                        "confidence": 0.88,
+                    },
+                ]
+            })
+        }
     }
 
     async def mock_post_fn(*args, **kwargs):
