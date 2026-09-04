@@ -31,7 +31,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from intents import CLOUD_MODEL, CHAT_MODEL
-from embedding_router import build_embedding_router
+from embedding_router import (
+    get_embedding_router,
+    get_embedding_router_error,
+    get_embedding_router_snapshot,
+    warmup_embedding_router,
+)
 from memory import MemoryStore
 from routing_config import ROUTING_CONFIG
 from graph import (
@@ -440,15 +445,38 @@ async def _graph_lifespan(_app: FastAPI):
     except Exception as exc:
         log.warning("auth.tokens.purge_failed | error=%s", exc)
     embed_router = None
-    try:
-        embed_router, embed_snapshot = await build_embedding_router()
+    # Retry the router build with backoff: the backend can start before
+    # Ollama is fully ready (depends_on only waits for container start), and
+    # the first embed call also has to load the model into VRAM.
+    max_attempts = max(1, int(os.getenv("ROUTER_EMBEDDING_RETRIES", "3")))
+    retry_backoff = max(0.0, float(os.getenv("ROUTER_EMBEDDING_RETRY_BACKOFF_SECONDS", "2.0")))
+    warm_ok = False
+    for attempt in range(1, max_attempts + 1):
+        warm_ok = await warmup_embedding_router(force_refresh=True)
+        if warm_ok:
+            break
+        if attempt < max_attempts:
+            log.info(
+                "embedding_router.retry | attempt=%d/%d backoff=%.1fs error=%s",
+                attempt,
+                max_attempts,
+                retry_backoff * attempt,
+                get_embedding_router_error(),
+            )
+            await asyncio.sleep(retry_backoff * attempt)
+    if warm_ok:
+        embed_router = get_embedding_router()
+        embed_snapshot = get_embedding_router_snapshot()
         log.info(
             "embedding_router.ready | model=%s dim=%d",
             embed_snapshot.model,
             embed_snapshot.dim,
         )
-    except Exception as exc:
-        log.warning("embedding_router.failed | error=%s | using heuristic fallback", exc)
+    else:
+        log.warning(
+            "embedding_router.failed | error=%s | using heuristic fallback",
+            get_embedding_router_error(),
+        )
 
     async with create_assistant_graph(
         _make_graph_deps(embedding_router=embed_router),

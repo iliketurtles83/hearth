@@ -4,7 +4,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Awaitable, Callable
 
 import httpx
 import numpy as np
@@ -367,12 +367,23 @@ async def build_embedding_router(
     base_url: str | None = None,
     model: str | None = None,
     timeout_seconds: float = 8.0,
+    warmup_timeout_seconds: float = 60.0,
 ) -> tuple[EmbeddingIntentRouter, EmbeddingRouterSnapshot]:
     tool_bank = tool_exemplars or DEFAULT_TOOL_EXEMPLARS
     dialogue_bank = dialogue_exemplars or DEFAULT_DIALOGUE_EXEMPLARS
 
     ollama_url = (base_url or os.getenv("OLLAMA_URL", "http://ollama:11434")).rstrip("/")
     embed_model = model or os.getenv("ROUTER_EMBED_MODEL", ROUTER_EMBED_MODEL)
+
+    # Absorb the cold embed-model load on a single probe with a generous
+    # timeout so the per-exemplar calls below don't trip `timeout_seconds`
+    # while Ollama is still loading the model into VRAM.
+    await ollama_embed_text(
+        "hearth embedding router warmup",
+        base_url=ollama_url,
+        model=embed_model,
+        timeout_seconds=warmup_timeout_seconds,
+    )
 
     all_texts: list[str] = []
     for samples in tool_bank.values():
@@ -409,3 +420,70 @@ async def build_embedding_router(
         dialogue_rows=int(dialogue_index.matrix.shape[0]),
     )
     return router, snapshot
+
+
+# ── Module-level router cache + warmup ─────────────────────────────────
+# Built once at startup (see main._graph_lifespan) and reused for the
+# process lifetime. On failure the error is stored here so callers can
+# surface a diagnosable reason instead of an empty exception string.
+_router_cache: EmbeddingIntentRouter | None = None
+_router_snapshot: EmbeddingRouterSnapshot | None = None
+_router_error: str = ""
+
+
+def embedding_router_ready() -> bool:
+    return _router_cache is not None
+
+
+def get_embedding_router() -> EmbeddingIntentRouter | None:
+    return _router_cache
+
+
+def get_embedding_router_snapshot() -> EmbeddingRouterSnapshot | None:
+    return _router_snapshot
+
+
+def get_embedding_router_error() -> str:
+    return _router_error
+
+
+async def _default_router_factory() -> tuple[EmbeddingIntentRouter, EmbeddingRouterSnapshot]:
+    # Honor the configured embed timeout (ROUTER_EMBED_TIMEOUT_MS) instead of
+    # the hardcoded 8s default, which is too short for a cold model load.
+    from routing_config import ROUTING_CONFIG
+
+    timeout_seconds = max(1.0, ROUTING_CONFIG.router_embed_timeout_ms / 1000.0)
+    return await build_embedding_router(timeout_seconds=timeout_seconds)
+
+
+async def warmup_embedding_router(
+    *,
+    router_factory: Callable[[], Awaitable[tuple[EmbeddingIntentRouter, EmbeddingRouterSnapshot]]] | None = None,
+    force_refresh: bool = False,
+) -> bool:
+    """Build (and cache) the embedding router, absorbing the cold model load.
+
+    Returns True on success. On failure stores a diagnosable error string
+    (falling back to ``repr`` when the exception message is empty) and
+    returns False. A successful router is cached and reused unless
+    ``force_refresh`` is set.
+    """
+    global _router_cache, _router_snapshot, _router_error
+    if _router_cache is not None and not force_refresh:
+        return True
+
+    factory = router_factory or _default_router_factory
+    try:
+        router, snapshot = await factory()
+    except Exception as exc:
+        message = str(exc)
+        _router_error = message if message else repr(exc)
+        _router_cache = None
+        _router_snapshot = None
+        log.warning("embedding_router.warmup_failed | error=%s", _router_error)
+        return False
+
+    _router_cache = router
+    _router_snapshot = snapshot
+    _router_error = ""
+    return True
