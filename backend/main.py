@@ -166,6 +166,9 @@ WAKEWORD_THRESHOLD = float(os.getenv("WAKEWORD_THRESHOLD", "0.5"))
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "").strip().lower()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "").strip().lower()
+# Optional explicit local model dir (downloaded by scripts/download-whisper-model.sh).
+# When empty, we auto-detect backend/models/whisper/<WHISPER_MODEL>.
+WHISPER_MODEL_DIR = os.getenv("WHISPER_MODEL_DIR", "").strip()
 
 # ── Model swap latency baseline (measured 2026-04-28, RTX 3060 12 GB NVMe) ────
 # Run backend/tests/test_swap_latency.py to re-measure after hardware changes.
@@ -522,6 +525,19 @@ def get_oww_model():
 # ── faster-whisper model (lazy-loaded on first /transcribe call) ──
 _whisper_model = None
 
+def _resolve_whisper_model_source():
+    # Prefer a local, persistent model dir (downloaded by
+    # scripts/download-whisper-model.sh) over the HuggingFace size string, so a
+    # Docker container does not re-fetch the model into an ephemeral cache on the
+    # first /transcribe call. backend/models is bind-mounted (./backend:/app), so
+    # the downloaded dir survives rebuilds.
+    if WHISPER_MODEL_DIR:
+        return WHISPER_MODEL_DIR
+    default_dir = os.path.join(os.path.dirname(__file__), "models", "whisper", WHISPER_MODEL)
+    if os.path.isfile(os.path.join(default_dir, "model.bin")):
+        return default_dir
+    return WHISPER_MODEL
+
 def get_whisper_model():
     global _whisper_model
     if _whisper_model is None:
@@ -531,7 +547,9 @@ def get_whisper_model():
         else:
             device = "cuda" if os.path.exists("/dev/nvidia0") else "cpu"
         compute = WHISPER_COMPUTE_TYPE or ("float16" if device == "cuda" else "int8")
-        _whisper_model = WhisperModel(WHISPER_MODEL, device=device, compute_type=compute)
+        model_source = _resolve_whisper_model_source()
+        log.info("whisper.model_source | source=%s device=%s compute=%s", model_source, device, compute)
+        _whisper_model = WhisperModel(model_source, device=device, compute_type=compute)
     return _whisper_model
 
 

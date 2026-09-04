@@ -17,6 +17,8 @@ mpd.pid
 graph_checkpoints.*
 # Chroma persistence (all generated files/subdirs)
 backend/chroma/
+# faster-whisper model assets (downloaded by scripts/download-whisper-model.sh)
+backend/models/whisper/
 # mkcert-generated certificates — never commit private keys
 caddy/certs/
 backend/tests/artifacts/tts-benchmark.json
