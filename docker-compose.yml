@@ -3,6 +3,10 @@ services:
     image: ollama/ollama
     container_name: ollama
     restart: unless-stopped
+    environment:
+      # Keep loaded models resident in VRAM beyond Ollama's 5m default so idle
+      # gaps don't force the ~80s gemma4:e4b reload on the next request.
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-30m}
     ports:
       - "127.0.0.1:11434:11434"
     volumes:
@@ -122,7 +126,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 30s
+      # Generous grace period: the startup chat-model warmup (see
+      # main._graph_lifespan) can take ~80s to load gemma4:e4b before the app
+      # starts serving /health. Without this the container would flip unhealthy
+      # mid-warmup.
+      start_period: 120s
 
   # Caddy terminates TLS on the LAN edge and reverse-proxies to the backend.
   # Certificates are generated with mkcert and mounted read-only.

@@ -118,6 +118,12 @@ OLLAMA_VISION_MODEL: str = (
     os.getenv("OLLAMA_VISION_MODEL")
     or CHAT_MODEL
 )
+# Startup chat-model warmup: pre-loads the (large) chat model into VRAM so the
+# first /chat doesn't pay the one-time model-load. Kept in sync with the
+# OLLAMA_KEEP_ALIVE the ollama service is started with.
+CHAT_MODEL_WARMUP = os.getenv("CHAT_MODEL_WARMUP", "true").strip().lower() == "true"
+CHAT_MODEL_WARMUP_TIMEOUT_S = float(os.getenv("CHAT_MODEL_WARMUP_TIMEOUT_S", "180"))
+CHAT_MODEL_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
 MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
 _GENERIC_STREAM_ERROR_TEXT = "⚠ Something went wrong. Please try again."
 
@@ -452,6 +458,10 @@ async def _graph_lifespan(_app: FastAPI):
             log.info("auth.tokens.purged | count=%d", purged)
     except Exception as exc:
         log.warning("auth.tokens.purge_failed | error=%s", exc)
+    # Kick off the chat-model warmup up front so the ~80s cold load overlaps
+    # the (fast) embedding-router warmup and graph build below. It is awaited
+    # before we start serving (see end of this lifespan).
+    chat_warmup_task = asyncio.create_task(warmup_chat_model())
     embed_router = None
     # Retry the router build with backoff: the backend can start before
     # Ollama is fully ready (depends_on only waits for container start), and
@@ -486,15 +496,29 @@ async def _graph_lifespan(_app: FastAPI):
             get_embedding_router_error(),
         )
 
-    async with create_assistant_graph(
-        _make_graph_deps(embedding_router=embed_router),
-        checkpoint_path=default_checkpoint_path(),
-    ) as checkpointed_graph:
-        _assistant_graph = checkpointed_graph
-        _app.state.assistant_graph = checkpointed_graph
-        _app.state.embedding_router = embed_router
-        log.info("graph.ready | checkpointer=sqlite path=%s", default_checkpoint_path())
-        yield
+    try:
+        async with create_assistant_graph(
+            _make_graph_deps(embedding_router=embed_router),
+            checkpoint_path=default_checkpoint_path(),
+        ) as checkpointed_graph:
+            _assistant_graph = checkpointed_graph
+            _app.state.assistant_graph = checkpointed_graph
+            _app.state.embedding_router = embed_router
+            log.info("graph.ready | checkpointer=sqlite path=%s", default_checkpoint_path())
+            # Await the chat-model warmup (started above, running in parallel) so
+            # the model is resident before we start serving — guarantees the
+            # first /chat takes the fast path. warmup_chat_model never raises.
+            if chat_warmup_task is not None:
+                try:
+                    await chat_warmup_task
+                except Exception as exc:  # defensive; warmup already self-guards
+                    log.warning("chat_warmup.await_failed | error=%s", exc if str(exc) else repr(exc))
+            yield
+    finally:
+        # If the graph build failed before we reached the await, don't leave the
+        # warmup task orphaned (it would hold an open httpx client past shutdown).
+        if chat_warmup_task is not None and not chat_warmup_task.done():
+            chat_warmup_task.cancel()
 
 app = FastAPI(lifespan=_graph_lifespan)
 
@@ -653,6 +677,40 @@ def _ollama_think_setting() -> bool | str:
     if raw in {"low", "medium", "high", "max"}:
         return raw
     return True
+
+
+async def warmup_chat_model() -> bool:
+    """Pre-load the chat model into VRAM so the first /chat is fast.
+
+    Mirrors warmup_embedding_router(): a single minimal /api/generate probe
+    with a generous timeout absorbs the cold model load at startup. Returns
+    True on success. On failure it logs a diagnosable error (never an empty
+    ``error=``) and returns False; a warmup failure must never block startup.
+    """
+    if not CHAT_MODEL_WARMUP:
+        log.info("chat_warmup.skipped | reason=disabled")
+        return False
+    payload = {
+        "model": CHAT_MODEL,
+        "prompt": "warmup",
+        "stream": False,
+        "num_predict": 1,
+        "keep_alive": CHAT_MODEL_KEEP_ALIVE,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=CHAT_MODEL_WARMUP_TIMEOUT_S) as client:
+            resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+            resp.raise_for_status()
+        log.info("chat_warmup.ready | model=%s", CHAT_MODEL)
+        return True
+    except Exception as exc:
+        message = str(exc)
+        log.warning(
+            "chat_warmup.failed | model=%s error=%s",
+            CHAT_MODEL,
+            message if message else repr(exc),
+        )
+        return False
 
 
 async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
