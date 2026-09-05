@@ -46,6 +46,17 @@ os.environ["AUTH_DB_PATH"] = os.path.join(_tmp_dir, "auth.db")
 import main  # noqa: E402
 
 
+def _route_endpoint(path: str, method: str):
+    for route in main.app.routes:
+        if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
+            return route.endpoint
+    raise AssertionError(f"Route not found: {method} {path}")
+
+
+# The /transcribe handler lives in routes/voice_routes.py; reach it through the router.
+_transcribe_ep = _route_endpoint("/transcribe", "POST")
+
+
 def test_normalize_chat_source_defaults_to_text():
     assert main._normalize_chat_source(None) == "text"
     assert main._normalize_chat_source("") == "text"
@@ -79,13 +90,13 @@ async def test_transcribe_returns_503_when_model_not_loaded(monkeypatch):
     def _explode(*_args, **_kwargs):
         raise RuntimeError("simulated: model unavailable / offline")
 
-    monkeypatch.setattr(main, "get_whisper_model", _explode)
+    monkeypatch.setattr(main.services, "get_whisper_model", _explode)
 
     class _FakeUploadFile:
         async def read(self, _n=None):
             return b"\x00" * 16
 
-    response = await main.transcribe(_FakeUploadFile())
+    response = await _transcribe_ep(_FakeUploadFile())
     payload = json.loads(response.body.decode("utf-8"))
 
     assert response.status_code == 503

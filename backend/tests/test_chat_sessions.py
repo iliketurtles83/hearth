@@ -55,6 +55,18 @@ def _route_endpoint(path: str, method: str):
     raise AssertionError(f"Route not found: {method} {path}")
 
 
+# Endpoint references resolved once at import (the app is fully wired by `import main`).
+# Handlers now live in routes/* closures, so tests reach them through the router.
+_chat_ep = _route_endpoint("/chat", "POST")
+_list_sessions_ep = _route_endpoint("/chat/sessions", "GET")
+_get_messages_ep = _route_endpoint("/chat/session/messages", "GET")
+_select_session_ep = _route_endpoint("/chat/session/select", "POST")
+_delete_session_ep = _route_endpoint("/chat/sessions/{session_id}", "DELETE")
+_reset_session_ep = _route_endpoint("/chat/session", "DELETE")
+_get_state_ep = _route_endpoint("/graph/state/{session_id}", "GET")
+_health_ep = _route_endpoint("/health", "GET")
+
+
 async def _read_sse_events(streaming_response) -> list[str]:
     events: list[str] = []
     async for chunk in streaming_response.body_iterator:
@@ -99,7 +111,7 @@ def test_list_sessions_scoped_to_user():
 async def test_list_chat_sessions_hides_foreign_current_session_cookie():
     main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
 
-    response = await main.list_chat_sessions(_request("bob", "sess-alice"))
+    response = await _list_sessions_ep(_request("bob", "sess-alice"))
     payload = _json_body(response)
 
     assert payload["sessions"] == []
@@ -110,7 +122,7 @@ async def test_list_chat_sessions_hides_foreign_current_session_cookie():
 async def test_select_chat_session_denies_other_users_session():
     main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
 
-    response = await main.select_chat_session(
+    response = await _select_session_ep(
         main.SessionSelectRequest(session_id="sess-alice"),
         _request("bob"),
     )
@@ -123,7 +135,7 @@ async def test_select_chat_session_denies_other_users_session():
 async def test_delete_chat_session_denies_other_users_session():
     main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
 
-    response = await main.delete_chat_session("sess-alice", _request("bob"))
+    response = await _delete_session_ep("sess-alice", _request("bob"))
 
     assert response.status_code == 404
     assert _json_body(response)["code"] == "SESSION_NOT_FOUND"
@@ -141,9 +153,9 @@ async def test_delete_chat_session_clears_checkpoint_thread_for_owned_session(mo
     async def _fake_clear_checkpoint_thread(target_session_id: str) -> None:
         cleared.append(target_session_id)
 
-    monkeypatch.setattr(main, "_clear_checkpoint_thread", _fake_clear_checkpoint_thread)
+    monkeypatch.setattr(main.services, "clear_checkpoint_thread", _fake_clear_checkpoint_thread)
 
-    response = await main.delete_chat_session(session_id, _request("alice", session_id))
+    response = await _delete_session_ep(session_id, _request("alice", session_id))
     payload = _json_body(response)
 
     assert response.status_code == 200
@@ -156,7 +168,7 @@ async def test_delete_chat_session_clears_checkpoint_thread_for_owned_session(mo
 async def test_get_chat_session_messages_reanchors_stale_foreign_cookie():
     main.memory_store.log_turn("sess-alice", "alice", "user", "secret alice context")
 
-    response = await main.get_chat_session_messages(_request("bob", "sess-alice"))
+    response = await _get_messages_ep(_request("bob", "sess-alice"))
     payload = _json_body(response)
 
     assert payload["session_id"] != "sess-alice"
@@ -171,7 +183,7 @@ async def test_get_chat_session_messages_works_for_existing_session():
     session_id = "sess-existing"
     main.memory_store.log_turn(session_id, "alice", "user", "hello")
 
-    response = await main.get_chat_session_messages(_request("alice", session_id))
+    response = await _get_messages_ep(_request("alice", session_id))
     payload = _json_body(response)
 
     assert payload["session_id"] == session_id
@@ -186,7 +198,7 @@ async def test_reset_chat_session_clears_messages():
     main.memory_store.log_turn(session_id, "alice", "user", "hello")
     main.memory_store.log_turn(session_id, "alice", "assistant", "hi")
 
-    await main.reset_chat_session(_request("alice", session_id))
+    await _reset_session_ep(_request("alice", session_id))
 
     turns = main.memory_store.get_session_turns(session_id, "alice", 500)
     assert len(turns) == 0
@@ -197,7 +209,7 @@ async def test_reset_chat_session_returns_ok():
     session_id = "sess-reset-2"
     main.memory_store.log_turn(session_id, "alice", "user", "reset me")
 
-    response = await main.reset_chat_session(_request("alice", session_id))
+    response = await _reset_session_ep(_request("alice", session_id))
     payload = _json_body(response)
 
     assert payload["ok"] is True
@@ -216,9 +228,9 @@ async def test_reset_chat_session_clears_checkpoint_thread(monkeypatch):
     async def _fake_clear_checkpoint_thread(target_session_id: str) -> None:
         cleared.append(target_session_id)
 
-    monkeypatch.setattr(main, "_clear_checkpoint_thread", _fake_clear_checkpoint_thread)
+    monkeypatch.setattr(main.services, "clear_checkpoint_thread", _fake_clear_checkpoint_thread)
 
-    response = await main.reset_chat_session(_request("alice", session_id))
+    response = await _reset_session_ep(_request("alice", session_id))
 
     assert response.status_code == 200
     assert cleared == [session_id]
@@ -299,7 +311,7 @@ async def test_chat_stream_includes_done_and_voice_metadata_for_voice_source(mon
         },
     )
 
-    response = await main.chat(
+    response = await _chat_ep(
         main.ChatRequest(message="hello", source="voice"),
         _request("alice"),
     )
@@ -348,7 +360,7 @@ async def test_chat_stream_omits_voice_metadata_for_text_source(monkeypatch):
         },
     )
 
-    response = await main.chat(
+    response = await _chat_ep(
         main.ChatRequest(message="hello", source="text"),
         _request("alice"),
     )
@@ -393,7 +405,7 @@ async def test_chat_stream_includes_thinking_chunks_when_available(monkeypatch):
         },
     )
 
-    response = await main.chat(
+    response = await _chat_ep(
         main.ChatRequest(message="hello", source="text"),
         _request("alice"),
     )
@@ -426,7 +438,7 @@ async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(mo
     monkeypatch.setattr(main.app.state, "assistant_graph", _UnexpectedGraph(), raising=False)
     monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
 
-    response = await main.chat(
+    response = await _chat_ep(
         main.ChatRequest(message="play Battery by Metallica", source="text"),
         _request("alice"),
     )
@@ -472,7 +484,7 @@ async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypat
     monkeypatch.setattr(main.app.state, "assistant_graph", _UnexpectedGraph(), raising=False)
     monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
 
-    response = await main.chat(
+    response = await _chat_ep(
         main.ChatRequest(message="play Heavy Metal", source="text"),
         _request("alice"),
     )
@@ -521,7 +533,7 @@ async def test_chat_vague_music_prompt_uses_music_fastpath(monkeypatch):
         },
     )
 
-    response = await main.chat(
+    response = await _chat_ep(
         main.ChatRequest(message="play something chill", source="text"),
         _request("alice"),
     )
@@ -573,7 +585,7 @@ async def test_chat_graph_stream_uses_session_id_as_checkpoint(monkeypatch):
         },
     )
 
-    response = await main.chat(
+    response = await _chat_ep(
         main.ChatRequest(message="hello", source="text"),
         _request("alice", session_id),
     )
@@ -602,7 +614,7 @@ async def test_get_graph_state_returns_snapshot_for_owned_session(monkeypatch):
     if hasattr(main.app.state, "assistant_graph"):
         delattr(main.app.state, "assistant_graph")
 
-    response = await main.get_graph_state(session_id, _request("alice", session_id))
+    response = await _get_state_ep(session_id, _request("alice", session_id))
     payload = _json_body(response)
 
     assert payload["session_id"] == session_id
@@ -616,7 +628,7 @@ async def test_get_graph_state_denies_foreign_session():
     session_id = "sess-foreign"
     main.memory_store.log_turn(session_id, "alice", "user", "hello")
 
-    response = await main.get_graph_state(session_id, _request("bob", None))
+    response = await _get_state_ep(session_id, _request("bob", None))
 
     assert response.status_code == 404
     assert _json_body(response)["code"] == "SESSION_NOT_FOUND"
@@ -628,7 +640,7 @@ async def test_health_reports_embedding_router_state():
     if hasattr(main.app.state, "embedding_router"):
         delattr(main.app.state, "embedding_router")
 
-    payload = await main.health()
+    payload = await _health_ep()
 
     assert payload["embedding_router"] is False
     assert "status" in payload

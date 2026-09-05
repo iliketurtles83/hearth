@@ -65,6 +65,17 @@ os.environ["AUTH_DB_PATH"] = os.path.join(_tmp_dir, "auth.db")
 import main  # noqa: E402
 
 
+def _route_endpoint(path: str, method: str):
+    for route in main.app.routes:
+        if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
+            return route.endpoint
+    raise AssertionError(f"Route not found: {method} {path}")
+
+
+# The /tts handler lives in routes/tts_routes.py; reach it through the router.
+_tts_ep = _route_endpoint("/tts", "POST")
+
+
 def _json_body(response) -> dict:
     return json.loads(response.body.decode("utf-8"))
 
@@ -77,7 +88,7 @@ async def test_tts_endpoint_success(monkeypatch):
 
     monkeypatch.setattr(main.tts, "synthesize", _fake_synthesize)
 
-    response = await main.tts_synthesize(main.TTSRequest(text="Hello from test"))
+    response = await _tts_ep(main.TTSRequest(text="Hello from test"))
 
     assert response.status_code == 200
     assert response.media_type == "audio/wav"
@@ -91,7 +102,7 @@ async def test_tts_endpoint_invalid_text_maps_to_400(monkeypatch):
 
     monkeypatch.setattr(main.tts, "synthesize", _fake_synthesize)
 
-    response = await main.tts_synthesize(main.TTSRequest(text="   "))
+    response = await _tts_ep(main.TTSRequest(text="   "))
     payload = _json_body(response)
 
     assert response.status_code == 400
@@ -106,7 +117,7 @@ async def test_tts_endpoint_engine_unavailable_maps_to_503(monkeypatch):
 
     monkeypatch.setattr(main.tts, "synthesize", _fake_synthesize)
 
-    response = await main.tts_synthesize(main.TTSRequest(text="hello"))
+    response = await _tts_ep(main.TTSRequest(text="hello"))
     payload = _json_body(response)
 
     assert response.status_code == 503
@@ -121,7 +132,7 @@ async def test_tts_endpoint_retryable_runtime_error_maps_to_502(monkeypatch):
 
     monkeypatch.setattr(main.tts, "synthesize", _fake_synthesize)
 
-    response = await main.tts_synthesize(main.TTSRequest(text="hello"))
+    response = await _tts_ep(main.TTSRequest(text="hello"))
     payload = _json_body(response)
 
     assert response.status_code == 502

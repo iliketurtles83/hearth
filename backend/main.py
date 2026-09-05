@@ -1,6 +1,6 @@
-from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, Request
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
@@ -18,11 +18,8 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-import tempfile
-import time
+from dataclasses import dataclass
 from pathlib import Path
-from uuid import uuid4
-import numpy as np
 from dotenv import load_dotenv
 
 # Load .env BEFORE importing local modules — intents, routing_config, memory and
@@ -50,6 +47,12 @@ from auth import AuthService
 from music_fastpath import parse_music_command, format_music_response
 from routes.auth_routes import create_auth_router
 from routes.memory_tool_routes import create_memory_tool_router
+from routes.chat_routes import create_chat_router
+from routes.session_routes import create_session_router
+from routes.tts_routes import create_tts_router
+from routes.voice_routes import create_voice_router
+from routes.code_routes import create_code_router
+from routes.health_routes import create_health_router
 from app_schemas import (
     ChatRequest as BaseChatRequest,
     TTSRequest,
@@ -875,191 +878,9 @@ def _resolve_graph_runner():
     return _assistant_graph
 
 
-@app.post("/chat")
-async def chat(request: ChatRequest, http_request: Request):
-    user_id: str = http_request.state.user_id
-    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id = cookie_session_id or str(uuid4())
-    session_created = cookie_session_id is None
-    chat_source = _normalize_chat_source(request.source)
-    effective_system = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
-
-    # ── Deterministic music fast-path ─────────────────────────────────────────
-    # Check before graph routing so clear music commands never touch the LLM.
-    music_cmd = parse_music_command(request.message)
-    if music_cmd is not None:
-        music_cmd["prompt"] = request.message
-        music_cmd["user_id"] = user_id
-
-        async def generate_music():
-            yield f"data: {json.dumps({'model': 'music', 'intent': 'music', 'confidence': 1.0})}\n\n"
-            try:
-                tool_result: ToolResult = await tools.dispatch("music", music_cmd)
-            except Exception as exc:
-                log.error("chat.music_fast | session_id=%s error=%s", session_id, exc)
-                yield f"data: {json.dumps(_stream_error_payload('MUSIC_COMMAND_FAILED'))}\n\n"
-                yield "data: [DONE]\n\n"
-                return
-            log.info(
-                "chat.music_fast | session_id=%s action=%s ok=%s retryable=%s",
-                session_id, music_cmd.get("action"), tool_result.ok, tool_result.retryable,
-            )
-            response_text = format_music_response(tool_result, music_cmd)
-            # Persist the turn so music interactions appear in session history and
-            # provide follow-up context (mirrors graph.memory_writer logging).
-            if user_id:
-                try:
-                    await asyncio.to_thread(
-                        memory_store.log_turn,
-                        session_id,
-                        user_id,
-                        "user",
-                        request.message,
-                    )
-                    await asyncio.to_thread(
-                        memory_store.log_turn,
-                        session_id,
-                        user_id,
-                        "assistant",
-                        response_text,
-                    )
-                except Exception as exc:
-                    log.warning("chat.music_fast.log_turn | session_id=%s error=%s", session_id, exc)
-            yield f"data: {json.dumps({'text': response_text})}\n\n"
-            yield "data: [DONE]\n\n"
-
-        fast_response = StreamingResponse(generate_music(), media_type="text/event-stream")
-        _set_session_cookie(fast_response, session_id)
-        return fast_response
-    # ── End music fast-path ───────────────────────────────────────────────────
-
-    # Validate image payload if present
-    image_error = _validate_image(request.image_base64, request.image_mime)
-    if image_error:
-        log.warning("chat.image_invalid | session_id=%s reason=%s", session_id, image_error)
-        return JSONResponse({"error": image_error, "code": "INVALID_IMAGE"}, status_code=422)
-
-    graph_state = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "message": request.message,
-        "system": effective_system,
-        "source": chat_source,
-        "modality": "voice" if chat_source == "voice" else "chat",
-        # Pass image through state (ephemeral, not persisted to memory)
-        "image_base64": request.image_base64,
-        "image_mime": request.image_mime,
-    }
-    graph_runner = _resolve_graph_runner()
-
-    async def generate():
-        assistant_accumulated = ""
-        start_time = time.monotonic()
-        first_token_time: float | None = None
-        active_model = CHAT_MODEL
-        intent_for_log = "quick-local"
-        confidence_for_log = 1.0
-        route_for_log = "local"
-        fallback_used = False
-
-        try:
-            async for event in graph_runner.astream(
-                graph_state,
-                config=checkpoint_config(session_id),
-                stream_mode="custom",
-            ):
-                if "meta" in event:
-                    meta = event["meta"]
-                    active_model = meta.get("model", CHAT_MODEL)
-                    intent_for_log = meta.get("intent", "")
-                    confidence_for_log = float(meta.get("confidence", 0.0))
-                    route_for_log = meta.get("route_type", "local")
-                    log.info(
-                        "chat.route | session_id=%s source=%s intent=%s confidence=%.3f route=%s model=%s "
-                        "planner_status=%s needs_memory=%s tool=%s",
-                        session_id, chat_source, intent_for_log, confidence_for_log, route_for_log,
-                        active_model, meta.get("planner_status", ""), meta.get("needs_memory", False),
-                        meta.get("tool"),
-                    )
-                    if meta.get("reasoning_summary"):
-                        log.debug("chat.planner_reasoning | session_id=%s reasoning=%s", session_id, meta["reasoning_summary"])
-                    yield f"data: {json.dumps({'model': active_model, 'intent': intent_for_log, 'confidence': confidence_for_log, 'route_type': route_for_log, 'planner_status': meta.get('planner_status', ''), 'reasoning_summary': meta.get('reasoning_summary', '')})}\n\n"
-                elif "text" in event:
-                    chunk = event["text"]
-                    if first_token_time is None:
-                        first_token_time = time.monotonic()
-                    assistant_accumulated += chunk
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
-                elif "thinking" in event:
-                    yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
-                elif "notice" in event:
-                    fallback_used = True
-                    yield f"data: {json.dumps({'notice': event['notice']})}\n\n"
-                elif "memory" in event:
-                    yield f"data: {json.dumps({'memory': event['memory']})}\n\n"
-                elif event.get("fallback"):
-                    active_model = event.get("model", CHAT_MODEL)
-                    yield f"data: {json.dumps(event)}\n\n"
-        except Exception as exc:
-            log.error("chat.graph_error | session_id=%s error=%s", session_id, exc)
-            yield f"data: {json.dumps(_stream_error_payload())}\n\n"
-
-        completion_time = time.monotonic()
-        first_token_ms = (first_token_time - start_time) * 1000 if first_token_time else -1
-        completion_ms = (completion_time - start_time) * 1000
-        log.info(
-            "chat.telemetry | session_id=%s intent=%s confidence=%.3f route=%s "
-            "model=%s fallback=%s first_token_ms=%.0f completion_ms=%.0f response_tokens_approx=%d",
-            session_id, intent_for_log, confidence_for_log, route_for_log,
-            active_model, fallback_used, first_token_ms, completion_ms,
-            _estimate_tokens(assistant_accumulated),
-        )
-
-        voice_meta = _voice_tts_metadata(chat_source)
-        # Images are visual; suppress auto-TTS for vision responses.
-        if intent_for_log == "vision":
-            voice_meta = None
-        if voice_meta is not None:
-            yield "data: " + json.dumps(voice_meta) + "\n\n"
-
-        yield "data: [DONE]\n\n"
-
-    response = StreamingResponse(generate(), media_type="text/event-stream")
-    _set_session_cookie(response, session_id)
-    if session_created:
-        log.info("chat.session.cookie_set | session_id=%s", session_id)
-    return response
-
-
-@app.get("/graph/state/{session_id}")
-async def get_graph_state(session_id: str, http_request: Request):
-    user_id: str = http_request.state.user_id
-
-    # Verify session ownership before checking graph availability.
-    if not memory_store.session_exists_for_user(session_id, user_id):
-        return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
-
-    graph_runner = getattr(app.state, "assistant_graph", _assistant_graph)
-    if graph_runner is None:
-        return _error_response("Graph not initialized", "GRAPH_UNAVAILABLE", True, status_code=503)
-
-    try:
-        if hasattr(graph_runner, "aget_state"):
-            snapshot = await graph_runner.aget_state(checkpoint_config(session_id))
-        else:
-            snapshot = graph_runner.get_state(checkpoint_config(session_id))
-    except Exception as exc:
-        log.error("graph.state.error | session_id=%s error=%s", session_id, exc)
-        return _error_response("Graph state unavailable", "GRAPH_STATE_UNAVAILABLE", True, status_code=503)
-
-    return JSONResponse(
-        {
-            "session_id": session_id,
-            "state": getattr(snapshot, "values", {}) or {},
-            "next": list(getattr(snapshot, "next", ()) or ()),
-            "metadata": getattr(snapshot, "metadata", {}) or {},
-        }
-    )
+def _get_state_graph_runner():
+    """Return the graph used for /graph/state introspection (checkpointed or fallback)."""
+    return getattr(app.state, "assistant_graph", _assistant_graph)
 
 
 async def _clear_checkpoint_thread(session_id: str) -> None:
@@ -1078,264 +899,93 @@ async def _clear_checkpoint_thread(session_id: str) -> None:
         log.warning("checkpoint_cleanup_failed | session_id=%s | %s", session_id, exc)
 
 
-@app.get("/chat/sessions")
-async def list_chat_sessions(http_request: Request):
-    user_id: str = http_request.state.user_id
-    current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    sessions = memory_store.list_sessions(user_id)
-    # Validate that current_session_id belongs to the user; strip foreign cookies.
-    if current_session_id and not any(s["session_id"] == current_session_id for s in sessions):
-        current_session_id = None
-    return JSONResponse(
-        {
-            "sessions": sessions,
-            "current_session_id": current_session_id,
-        }
-    )
+@dataclass
+class AppServices:
+    """Shared state + dependency callables handed to the route factories.
+
+    Owned by main.py. Route modules read these at call time so tests can
+    monkeypatch main.services.<attr> and the shared singletons (tools/tts/
+    memory_store are the same objects as main.tools / main.tts / main.memory_store).
+    """
+
+    app: object
+    log: object
+    memory_store: object
+    tools: object
+    tts: object
+    resolve_graph_runner: object
+    get_state_graph_runner: object
+    clear_checkpoint_thread: object
+    set_session_cookie: object
+    get_whisper_model: object
+    get_oww_model: object
+    normalize_chat_source: object
+    voice_tts_metadata: object
+    validate_image: object
+    estimate_tokens: object
+    tts_error_status: object
+    stream_error_payload: object
+    error_response: object
+    checkpoint_config: object
+    ToolResult: object
+    chat_request: object
+    code_request: object
+    tts_request: object
+    session_select_request: object
+    parse_music_command: object
+    format_music_response: object
+    chat_model: str
+    chat_default_system_prompt: str
+    code_default_system_prompt: str
+    session_cookie_name: str
+    wakeword_threshold: float
+    max_transcribe_bytes: int
 
 
-@app.get("/chat/session/messages")
-async def get_chat_session_messages(http_request: Request):
-    user_id: str = http_request.state.user_id
-    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    if cookie_session_id:
-        # Check ownership: if session exists for another user, this is a stale/foreign cookie.
-        if (
-            memory_store.session_exists(cookie_session_id)
-            and not memory_store.session_exists_for_user(cookie_session_id, user_id)
-        ):
-            # Foreign session — generate a new one for this user.
-            session_id = str(uuid4())
-        else:
-            session_id = cookie_session_id
-    else:
-        session_id = str(uuid4())
-    turns = memory_store.get_session_turns(session_id, user_id, limit=500)
-    response = JSONResponse({"session_id": session_id, "messages": turns})
-    _set_session_cookie(response, session_id)
-    return response
-
-
-@app.post("/chat/session/new")
-async def create_chat_session(http_request: Request):
-    _ = http_request
-    session_id = str(uuid4())
-    response = JSONResponse({"ok": True, "session_id": session_id})
-    _set_session_cookie(response, session_id)
-    return response
-
-
-@app.post("/chat/session/select")
-async def select_chat_session(
-    payload: SessionSelectRequest,
-    http_request: Request,
-):
-    user_id: str = http_request.state.user_id
-    sessions = memory_store.list_sessions(user_id)
-    if not any(s.get("session_id") == payload.session_id for s in sessions):
-        return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
-
-    response = JSONResponse({"ok": True, "session_id": payload.session_id})
-    _set_session_cookie(response, payload.session_id)
-    return response
-
-
-@app.delete("/chat/sessions/{session_id}")
-async def delete_chat_session(
-    session_id: str,
-    http_request: Request,
-):
-    user_id: str = http_request.state.user_id
-    current_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-
-    if not memory_store.session_exists_for_user(session_id, user_id):
-        return _error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
-
-    memory_store.delete_session(session_id, user_id)
-    await _clear_checkpoint_thread(session_id)
-
-    next_session_id: str | None = None
-    if current_session_id == session_id:
-        sessions = memory_store.list_sessions(user_id)
-        next_session_id = sessions[0]["session_id"] if sessions else str(uuid4())
-
-    payload: dict[str, object] = {"ok": True, "session_id": session_id}
-    if next_session_id:
-        payload["active_session_id"] = next_session_id
-
-    response = JSONResponse(payload)
-    if next_session_id:
-        _set_session_cookie(response, next_session_id)
-    return response
-
-
-@app.delete("/chat/session")
-async def reset_chat_session(http_request: Request):
-    user_id: str = http_request.state.user_id
-    session_id = http_request.cookies.get(SESSION_COOKIE_NAME) or str(uuid4())
-    memory_store.reset_session(session_id, user_id)
-    await _clear_checkpoint_thread(session_id)
-    response = JSONResponse({"ok": True, "session_id": session_id})
-    _set_session_cookie(response, session_id)
-    return response
-
-
-@app.get("/health")
-async def health():
-    graph_ready = getattr(app.state, "assistant_graph", None) is not None
-    embed_router = getattr(app.state, "embedding_router", None)
-    return {
-        "status": "ok" if graph_ready else "starting",
-        "embedding_router": embed_router is not None,
-    }
-
-
-@app.head("/health")
-async def health_head():
-    # Respond to HEAD probes (no body).
-    return Response(status_code=200)
-
-
-@app.post("/tts")
-async def tts_synthesize(request: TTSRequest):
-    try:
-        audio = await tts.synthesize(request.text)
-        return Response(content=audio, media_type="audio/wav")
-    except Exception as exc:
-        payload = tts.error_to_payload(exc)
-        code = str(payload.get("code", "TTS_UNKNOWN_ERROR"))
-        retryable = bool(payload.get("retryable", False))
-        message = str(payload.get("error", "Unknown TTS error"))
-        status = _tts_error_status(code, retryable)
-        log.warning("tts.error | code=%s retryable=%s message=%s", code, retryable, message)
-        return _error_response(message, code, retryable, status_code=status)
-
-
-# Browser sends raw binary frames: 1280 int16 samples (80ms @ 16kHz).
-# Server replies with {"event": "wake"} when the wake word is detected.
-@app.websocket("/ws/wake")
-async def wake_websocket(ws: WebSocket):
-    await ws.accept()
-    log.info("Wake WebSocket connected from %s", ws.client)
-    model = get_oww_model()
-    model.reset()  # clear any stale state from a previous session
-    try:
-        while True:
-            data = await ws.receive_bytes()
-            # Keep as int16 — the library's melspectrogram model requires int16 PCM input.
-            # Converting to float32 here would silently zero-out all samples when the
-            # library casts back to int16, causing the model to see only silence.
-            samples = np.frombuffer(data, dtype=np.int16)
-            raw_prediction = model.predict(samples)
-            # openWakeWord can return either a dict or a tuple where index 0 is the dict.
-            if isinstance(raw_prediction, tuple):
-                prediction = raw_prediction[0] if raw_prediction else {}
-            else:
-                prediction = raw_prediction
-            if not isinstance(prediction, dict):
-                prediction = {}
-            score = float(prediction.get("computer_v2", 0.0) or 0.0)
-            log.debug("Wake score: %.3f (threshold: %.3f)", score, WAKEWORD_THRESHOLD)
-            if score > WAKEWORD_THRESHOLD:
-                log.info("Wake word detected — score: %.3f", score)
-                await ws.send_json({"event": "wake", "score": round(float(score), 3)})
-                model.reset()
-    except WebSocketDisconnect as exc:
-        log.info("Wake WebSocket disconnected — code: %d, reason: %s", exc.code, exc.reason or "(none)")
-
-
-# ── Transcription endpoint ─────────────────────────────────────────────────────
 _MAX_TRANSCRIBE_BYTES = int(os.getenv("MAX_TRANSCRIBE_BYTES", str(25 * 1024 * 1024)))  # 25 MB
 
 
-@app.post("/transcribe")
-async def transcribe(audio: UploadFile = File(...)):
-    # /transcribe is auth-protected; still cap upload size to avoid unbounded reads.
-    raw = await audio.read(_MAX_TRANSCRIBE_BYTES + 1)
-    if len(raw) > _MAX_TRANSCRIBE_BYTES:
-        return JSONResponse(
-            {"error": f"Audio too large. Maximum is {_MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB."},
-            status_code=413,
-        )
-    try:
-        whisper = get_whisper_model()
-    except Exception as exc:
-        # Missing model (no local copy + no reachable HF cache), an offline
-        # download, or a device/compute failure all surface here. Return a
-        # documented 503 instead of a raw 500.
-        log.error("whisper.load_failed | type=%s error=%r", type(exc).__name__, exc)
-        return _error_response(
-            "Speech-to-text model is not available. Run 'bash scripts/download-whisper-model.sh' to install it, then retry.",
-            "MODEL_NOT_LOADED",
-            retryable=False,
-            status_code=503,
-        )
-    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-        tmp.write(raw)
-        tmp_path = tmp.name
-    try:
-        segments, _ = whisper.transcribe(tmp_path, language="en", vad_filter=True)
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-    finally:
-        os.unlink(tmp_path)
-    return JSONResponse({"text": text})
+services = AppServices(
+    app=app,
+    log=log,
+    memory_store=memory_store,
+    tools=tools,
+    tts=tts,
+    resolve_graph_runner=_resolve_graph_runner,
+    get_state_graph_runner=_get_state_graph_runner,
+    clear_checkpoint_thread=_clear_checkpoint_thread,
+    set_session_cookie=_set_session_cookie,
+    get_whisper_model=get_whisper_model,
+    get_oww_model=get_oww_model,
+    normalize_chat_source=_normalize_chat_source,
+    voice_tts_metadata=_voice_tts_metadata,
+    validate_image=_validate_image,
+    estimate_tokens=_estimate_tokens,
+    tts_error_status=_tts_error_status,
+    stream_error_payload=_stream_error_payload,
+    error_response=_error_response,
+    checkpoint_config=checkpoint_config,
+    ToolResult=ToolResult,
+    chat_request=ChatRequest,
+    code_request=CodeRequest,
+    tts_request=TTSRequest,
+    session_select_request=SessionSelectRequest,
+    parse_music_command=parse_music_command,
+    format_music_response=format_music_response,
+    chat_model=CHAT_MODEL,
+    chat_default_system_prompt=CHAT_DEFAULT_SYSTEM_PROMPT,
+    code_default_system_prompt=CODE_DEFAULT_SYSTEM_PROMPT,
+    session_cookie_name=SESSION_COOKIE_NAME,
+    wakeword_threshold=WAKEWORD_THRESHOLD,
+    max_transcribe_bytes=_MAX_TRANSCRIBE_BYTES,
+)
 
-
-@app.post("/code", summary="Stream code-question responses via graph with local code intent bias")
-async def code(request: CodeRequest, http_request: Request):
-    user_id: str = http_request.state.user_id
-    cookie_session_id = http_request.cookies.get(SESSION_COOKIE_NAME)
-    session_id = cookie_session_id or str(uuid4())
-    session_created = cookie_session_id is None
-    code_source = _normalize_chat_source(request.source)
-    effective_system = request.system or CODE_DEFAULT_SYSTEM_PROMPT
-
-    graph_state = {
-        "user_id": user_id,
-        "session_id": session_id,
-        "message": request.message,
-        "system": effective_system,
-        "source": code_source,
-        "force_code": True,
-    }
-
-    graph_runner = _resolve_graph_runner()
-
-    async def generate():
-        assistant_accumulated = ""
-        active_model = CHAT_MODEL
-
-        try:
-            async for event in graph_runner.astream(
-                graph_state,
-                config=checkpoint_config(session_id),
-                stream_mode="custom",
-            ):
-                if "meta" in event:
-                    meta = event["meta"]
-                    active_model = meta.get("model", CHAT_MODEL)
-                    yield f"data: {json.dumps({'model': active_model, 'intent': meta.get('intent', 'code'), 'confidence': meta.get('confidence', 1.0)})}\n\n"
-                elif "text" in event:
-                    chunk = event["text"]
-                    assistant_accumulated += chunk
-                    yield f"data: {json.dumps({'text': chunk})}\n\n"
-                elif "notice" in event:
-                    yield f"data: {json.dumps({'notice': event['notice']})}\n\n"
-        except Exception as exc:
-            log.error("code.graph_error | session_id=%s error=%s", session_id, exc)
-            yield f"data: {json.dumps(_stream_error_payload())}\n\n"
-
-        voice_meta = _voice_tts_metadata(code_source)
-        if voice_meta is not None:
-            yield "data: " + json.dumps(voice_meta) + "\n\n"
-
-        yield "data: [DONE]\n\n"
-
-    response = StreamingResponse(generate(), media_type="text/event-stream")
-    _set_session_cookie(response, session_id)
-    if session_created:
-        log.info("code.session.cookie_set | session_id=%s", session_id)
-    return response
+app.include_router(create_health_router(services))
+app.include_router(create_chat_router(services))
+app.include_router(create_session_router(services))
+app.include_router(create_tts_router(services))
+app.include_router(create_voice_router(services))
+app.include_router(create_code_router(services))
 
 
 # ── Static frontend — MUST be last ────────────────────────────────────────────
