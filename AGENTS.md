@@ -9,7 +9,8 @@ Hearth is a local-first personal AI assistant: FastAPI backend serving both UI a
 
 ## High-Value Paths
 
-- `backend/main.py` — entrypoint, middleware, routes, startup validation, `load_dotenv()` at top (before any local imports)
+- `backend/main.py` — entrypoint, middleware, routes, startup validation. `import load_env` is its first local import (import-order invariant).
+- `backend/load_env.py` — single entry point that calls `load_dotenv()` once. Must be imported before any env-reading local module (routing_config, intents, embedding_router, memory, graph, auth, routes/*).
 - `backend/graph.py` — LangGraph state graph (6 nodes: history_loader → intent_classifier → memory_retrieval → tool_router → responder → memory_writer → END) + SqliteSaver checkpointing
 - `backend/intents.py` — deterministic intent classifier + shared model constants (ROUTE_CONFIDENCE_THRESHOLD, CHAT_MODEL, CLOUD_MODEL)
 - `backend/routing_config.py` — RoutingConfig dataclass loaded from env (singleton ROUTING_CONFIG)
@@ -67,7 +68,7 @@ docker compose build backend
 
 ## Gotchas
 
-- **`.env` is gitignored** — create from `.env.example`. All env vars are read at import time, so `load_dotenv()` runs early in `main.py` before any local imports. Do not move it.
+- **`.env` is gitignored** — create from `.env.example`. All env vars are read at import time, so `import load_env` (which calls `load_dotenv()`) must stay `main.py`'s first local import, ahead of any env-reading module. Do not reorder it.
 - **ChromaDB needs a writable path** — local `uvicorn` without Docker will fail if `CHROMA_PATH` points to a read-only location. Override it or use the writable-path workaround above.
 - **Voice features require HTTPS** — browser secure context for `navigator.mediaDevices`. Use Caddy's HTTPS or `https://localhost`. Plain `http://localhost:8000` breaks mic/audio-worklet.
 - **Tests must include `tools/` on PYTHONPATH** — when running tests outside Docker, `tools` is importable from `backend/`. In Docker the bind mount handles this.

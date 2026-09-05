@@ -20,12 +20,16 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from dotenv import load_dotenv
-
-# Load .env BEFORE importing local modules — intents, routing_config, memory and
-# other modules read os.getenv() at import time, so the environment must be
-# populated first or those module-level constants capture stale defaults.
-load_dotenv()
+# ── .env loading (import-order invariant) ───────────────────────────────────
+# `load_env` loads the project .env exactly once and MUST stay the first local
+# import. Several local modules read os.getenv() at import time and capture those
+# values into module-level constants (routing_config, intents, embedding_router,
+# memory, graph, auth, and the routes/* factory modules); importing any of them
+# above `load_env` would silently bake in the hardcoded defaults.
+#
+# Keep every local import below this line. If you add a new module that needs
+# env config, prefer reading os.getenv() lazily (at call time) over import time.
+import load_env  # noqa: F401
 
 from intents import CLOUD_MODEL, CHAT_MODEL
 from embedding_router import (
