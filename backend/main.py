@@ -288,6 +288,11 @@ def _validate_startup() -> None:
         log.warning("Missing ONNX model files (wake-word will fail): %s", missing_models)
         log.warning("Run: bash scripts/download-models.sh")
 
+    _whisper_dir = WHISPER_MODEL_DIR or os.path.join(_models_dir, "whisper", WHISPER_MODEL)
+    if not os.path.isfile(os.path.join(_whisper_dir, "model.bin")):
+        log.warning("Whisper STT model not found locally — /transcribe will return 503")
+        log.warning("Run: bash scripts/download-whisper-model.sh")
+
     if not os.getenv("ANTHROPIC_API_KEY"):
         log.warning("ANTHROPIC_API_KEY not set — cloud model fallback will be unavailable")
 
@@ -1194,7 +1199,19 @@ async def transcribe(audio: UploadFile = File(...)):
             {"error": f"Audio too large. Maximum is {_MAX_TRANSCRIBE_BYTES // (1024 * 1024)} MB."},
             status_code=413,
         )
-    whisper = get_whisper_model()
+    try:
+        whisper = get_whisper_model()
+    except Exception as exc:
+        # Missing model (no local copy + no reachable HF cache), an offline
+        # download, or a device/compute failure all surface here. Return a
+        # documented 503 instead of a raw 500.
+        log.error("whisper.load_failed | type=%s error=%r", type(exc).__name__, exc)
+        return _error_response(
+            "Speech-to-text model is not available. Run 'bash scripts/download-whisper-model.sh' to install it, then retry.",
+            "MODEL_NOT_LOADED",
+            retryable=False,
+            status_code=503,
+        )
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         tmp.write(raw)
         tmp_path = tmp.name

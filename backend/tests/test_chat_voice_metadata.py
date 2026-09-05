@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
 import types
+
+import pytest
 
 
 if "musicpd" not in sys.modules:
@@ -69,3 +72,35 @@ def test_voice_tts_metadata_for_text_source_is_none():
 
 def test_transcribe_is_not_unprotected_path():
     assert "/transcribe" not in main._UNPROTECTED_PATHS
+
+
+@pytest.mark.asyncio
+async def test_transcribe_returns_503_when_model_not_loaded(monkeypatch):
+    def _explode(*_args, **_kwargs):
+        raise RuntimeError("simulated: model unavailable / offline")
+
+    monkeypatch.setattr(main, "get_whisper_model", _explode)
+
+    class _FakeUploadFile:
+        async def read(self, _n=None):
+            return b"\x00" * 16
+
+    response = await main.transcribe(_FakeUploadFile())
+    payload = json.loads(response.body.decode("utf-8"))
+
+    assert response.status_code == 503
+    assert payload["code"] == "MODEL_NOT_LOADED"
+    assert payload["retryable"] is False
+    assert "download-whisper-model.sh" in payload["error"]
+
+
+def test_resolve_whisper_model_source_honors_env_override(tmp_path, monkeypatch):
+    target = str(tmp_path)
+    monkeypatch.setattr(main, "WHISPER_MODEL_DIR", target)
+    assert main._resolve_whisper_model_source() == target
+
+
+def test_resolve_whisper_model_source_falls_back_to_size_when_local_absent(monkeypatch):
+    monkeypatch.setattr(main, "WHISPER_MODEL_DIR", "")
+    monkeypatch.setattr(main, "WHISPER_MODEL", "definitely-missing-model-xyz")
+    assert main._resolve_whisper_model_source() == "definitely-missing-model-xyz"
