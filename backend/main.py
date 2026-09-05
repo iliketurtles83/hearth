@@ -99,10 +99,34 @@ async def _run_weather_tool(params: dict):
 
 _memory_db_default = os.path.join(os.path.dirname(__file__), "memory.db")
 _chroma_default = os.path.join(os.path.dirname(__file__), "chroma")
-memory_store = MemoryStore(
-    db_path=os.getenv("MEMORY_DB_PATH", _memory_db_default),
-    chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
-)
+_memory_store: MemoryStore | None = None
+
+
+def get_memory_store() -> MemoryStore:
+    """Return the shared MemoryStore, constructing it on first use.
+
+    Lazy on purpose: MemoryStore.__init__ creates directories, opens SQLite in
+    WAL mode, and opens a Chroma PersistentClient, so constructing it at import
+    time would make a bare ``import main`` write to state files.
+    """
+    global _memory_store
+    if _memory_store is None:
+        _memory_store = MemoryStore(
+            db_path=os.getenv("MEMORY_DB_PATH", _memory_db_default),
+            chroma_path=os.getenv("CHROMA_PATH", _chroma_default),
+        )
+    return _memory_store
+
+
+def __getattr__(name: str):
+    # PEP 562: keep the conventional ``main.memory_store`` attribute working
+    # (tests, ``from main import memory_store``) without building the store at
+    # import time. First access constructs and caches the singleton.
+    if name == "memory_store":
+        return get_memory_store()
+    if name == "auth_service":
+        return get_auth_service()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -208,7 +232,20 @@ AUTH_COOKIE_NAME: str = os.getenv("AUTH_COOKIE_NAME", "auth_token")
 
 # ── Auth service (shared singleton) ───────────────────────────────────────────
 _auth_db_default = os.path.join(os.path.dirname(__file__), "auth.db")
-auth_service = AuthService(os.getenv("AUTH_DB_PATH", _auth_db_default))
+_auth_service: AuthService | None = None
+
+
+def get_auth_service() -> AuthService:
+    """Return the shared AuthService, constructing it on first use.
+
+    Lazy for the same reason as get_memory_store: AuthService.__init__ opens
+    SQLite (creating auth.db), so a bare ``import main`` should not write
+    state files.
+    """
+    global _auth_service
+    if _auth_service is None:
+        _auth_service = AuthService(os.getenv("AUTH_DB_PATH", _auth_db_default))
+    return _auth_service
 
 # ── Startup validation ─────────────────────────────────────────────────────────
 def _required_wake_models() -> list[str]:
@@ -399,7 +436,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         token = _extract_bearer_token(request)
-        user_id = auth_service.verify_token(token) if token else None
+        user_id = get_auth_service().verify_token(token) if token else None
         request.state.user_id = user_id
 
         if user_id is None:
@@ -456,7 +493,7 @@ _assistant_graph = None  # type: ignore[assignment]
 async def _graph_lifespan(_app: FastAPI):
     global _assistant_graph
     try:
-        purged = auth_service.purge_expired_tokens()
+        purged = get_auth_service().purge_expired_tokens()
         if purged:
             log.info("auth.tokens.purged | count=%d", purged)
     except Exception as exc:
@@ -620,7 +657,7 @@ def _tts_error_status(code: str, retryable: bool) -> int:
 
 app.include_router(
     create_auth_router(
-        auth_service=auth_service,
+        get_auth_service=get_auth_service,
         auth_cookie_name=AUTH_COOKIE_NAME,
         session_cookie_secure=SESSION_COOKIE_SECURE,
         extract_bearer_token=_extract_bearer_token,
@@ -630,7 +667,7 @@ app.include_router(
 
 app.include_router(
     create_memory_tool_router(
-        memory_store=memory_store,
+        get_memory_store=get_memory_store,
         memory_consolidation_batch_size=MEMORY_CONSOLIDATION_BATCH_SIZE,
         error_response=_error_response,
         dispatch_tool=tools.dispatch,
@@ -844,7 +881,7 @@ def _make_graph_deps(*, embedding_router=None) -> AssistantGraphDependencies:
         return await tools.dispatch(tool_name, params)
 
     return AssistantGraphDependencies(
-        memory_store=memory_store,
+        memory_store=get_memory_store(),
         embedding_router=embedding_router,
         router_route=_unused_router_route,
         stream_local=_late_stream_local,
@@ -904,8 +941,10 @@ class AppServices:
     """Shared state + dependency callables handed to the route factories.
 
     Owned by main.py. Route modules read these at call time so tests can
-    monkeypatch main.services.<attr> and the shared singletons (tools/tts/
-    memory_store are the same objects as main.tools / main.tts / main.memory_store).
+    monkeypatch main.services.<attr> and the shared singletons (tools/tts are
+    the same objects as main.tools / main.tts). ``memory_store`` is the lazy
+    getter (main.get_memory_store); route modules call it inside handlers so
+    the store is only constructed on first real use, never at import time.
     """
 
     app: object
@@ -948,7 +987,7 @@ _MAX_TRANSCRIBE_BYTES = int(os.getenv("MAX_TRANSCRIBE_BYTES", str(25 * 1024 * 10
 services = AppServices(
     app=app,
     log=log,
-    memory_store=memory_store,
+    memory_store=get_memory_store,
     tools=tools,
     tts=tts,
     resolve_graph_runner=_resolve_graph_runner,

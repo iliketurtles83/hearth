@@ -64,7 +64,7 @@ def _build_client() -> tuple[TestClient, _FakeAuthService]:
     app = FastAPI()
     app.include_router(
         create_auth_router(
-            auth_service=svc,
+            get_auth_service=lambda: svc,
             auth_cookie_name="auth_token",
             session_cookie_secure=False,
             extract_bearer_token=lambda _req: None,

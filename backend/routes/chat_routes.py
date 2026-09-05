@@ -13,7 +13,9 @@ def create_chat_router(services) -> APIRouter:
     # Bind shared state/callables to locals so handler bodies read identically to
     # the pre-refactor code. `services` is the AppServices object owned by main.py.
     ChatRequest = services.chat_request
-    memory_store = services.memory_store
+    # NOTE: services.memory_store is the lazy getter (main.get_memory_store);
+    # call it inside handlers so the store is built on first use, not import.
+    get_memory_store = services.memory_store
     tools = services.tools
     ToolResult = services.ToolResult
     log = services.log
@@ -68,14 +70,14 @@ def create_chat_router(services) -> APIRouter:
                 if user_id:
                     try:
                         await asyncio.to_thread(
-                            memory_store.log_turn,
+                            get_memory_store().log_turn,
                             session_id,
                             user_id,
                             "user",
                             request.message,
                         )
                         await asyncio.to_thread(
-                            memory_store.log_turn,
+                            get_memory_store().log_turn,
                             session_id,
                             user_id,
                             "assistant",
@@ -193,7 +195,7 @@ def create_chat_router(services) -> APIRouter:
         user_id: str = http_request.state.user_id
 
         # Verify session ownership before checking graph availability.
-        if not memory_store.session_exists_for_user(session_id, user_id):
+        if not get_memory_store().session_exists_for_user(session_id, user_id):
             return error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
 
         graph_runner = get_state_graph_runner()

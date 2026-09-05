@@ -71,7 +71,7 @@ def _client_ip(request: Request) -> str:
 
 def create_auth_router(
     *,
-    auth_service,
+    get_auth_service,
     auth_cookie_name: str,
     session_cookie_secure: bool,
     extract_bearer_token: Callable[[Request], str | None],
@@ -117,7 +117,7 @@ def create_auth_router(
             return _rate_limited_response(max(ip_retry_after, user_retry_after))
 
         try:
-            result = auth_service.register(
+            result = get_auth_service().register(
                 payload.username,
                 payload.password,
                 device_name=payload.device_name,
@@ -151,7 +151,7 @@ def create_auth_router(
             return _rate_limited_response(max(ip_retry_after, user_retry_after))
 
         try:
-            result = auth_service.login(
+            result = get_auth_service().login(
                 payload.username,
                 payload.password,
                 device_name=payload.device_name,
@@ -172,7 +172,7 @@ def create_auth_router(
     async def auth_logout(http_request: Request):
         token = extract_bearer_token(http_request)
         if token:
-            auth_service.revoke_token(token)
+            get_auth_service().revoke_token(token)
         response = JSONResponse({"ok": True})
         response.delete_cookie(auth_cookie_name)
         return response
@@ -180,7 +180,7 @@ def create_auth_router(
     @router.post("/auth/logout/all")
     async def auth_logout_all(http_request: Request):
         user_id: str = http_request.state.user_id
-        count = auth_service.revoke_all_tokens(user_id)
+        count = get_auth_service().revoke_all_tokens(user_id)
         response = JSONResponse({"ok": True, "revoked": count})
         response.delete_cookie(auth_cookie_name)
         return response
@@ -188,7 +188,7 @@ def create_auth_router(
     @router.get("/auth/me")
     async def auth_me(http_request: Request):
         user_id: str = http_request.state.user_id
-        info = auth_service.get_user(user_id)
+        info = get_auth_service().get_user(user_id)
         if not info:
             return error_response("User not found.", "USER_NOT_FOUND", False, status_code=404)
         return JSONResponse(info)

@@ -371,6 +371,167 @@ def _pick_model_for_decision(
     return chat_model
 
 
+# ── Pure routing-decision helpers ────────────────────────────────────────────
+
+_WRITE_FOLLOWUP_CONFIRMATIONS = frozenset({
+    "yes",
+    "y",
+    "ok",
+    "okay",
+    "go ahead",
+    "do it",
+    "please do",
+    "sounds good",
+})
+
+_WRITE_FOLLOWUP_MARKERS = (
+    "write",
+    "edit",
+    "create",
+    "implement",
+    "modify",
+    "patch",
+    "file",
+    "confirm",
+)
+
+
+def _last_assistant_message(history: list[dict[str, Any]]) -> str:
+    for item in reversed(list(history)):
+        if item.get("role") == "assistant":
+            return str(item.get("content", ""))
+    return ""
+
+
+def _looks_like_write_followup(followup_message: str, last_assistant: str) -> bool:
+    return (
+        followup_message in _WRITE_FOLLOWUP_CONFIRMATIONS
+        and any(marker in last_assistant for marker in _WRITE_FOLLOWUP_MARKERS)
+    )
+
+
+def _downgrade_to_code_question(
+    decision: RouteDecision,
+    *,
+    chat_model: str,
+    looks_like_write_followup: bool,
+) -> RouteDecision:
+    if decision.intent == "code-question":
+        return decision
+    decision.intent = "code-question"
+    decision.use_cloud = False
+    decision.tool = None
+    decision.model = chat_model
+    decision.planner_status = (
+        "write_followup_downgraded_to_code_question"
+        if looks_like_write_followup
+        else "write_downgraded_to_code_question"
+    )
+    return decision
+
+
+def _heuristic_decision(
+    heuristic: RouteDecision,
+    *,
+    chat_model: str,
+    cloud_model: str,
+    vision_model: str,
+) -> RouteDecision:
+    heuristic.model = _pick_model_for_decision(
+        heuristic.intent,
+        use_cloud=heuristic.use_cloud,
+        chat_model=chat_model,
+        cloud_model=cloud_model,
+        vision_model=vision_model,
+    )
+    heuristic.planner_status = "heuristic"
+    return heuristic
+
+
+def _forced_code_decision(chat_model: str) -> RouteDecision:
+    return RouteDecision(
+        intent="code-question",
+        confidence=1.0,
+        use_cloud=False,
+        model=chat_model,
+        tool=None,
+        planner_status="forced",
+        reasoning_summary="",
+        needs_memory=True,
+    )
+
+
+def _deterministic_vision_decision(vision_model: str) -> RouteDecision:
+    return RouteDecision(
+        intent="vision",
+        confidence=1.0,
+        use_cloud=False,
+        model=vision_model,
+        tool=None,
+        planner_status="deterministic",
+        reasoning_summary="",
+        needs_memory=False,
+    )
+
+
+def _route_type_for_decision(decision: RouteDecision) -> str:
+    if getattr(decision, "tool", None):
+        return "tool"
+    return "cloud" if decision.use_cloud else "local"
+
+
+def _decision_meta(decision: RouteDecision, route_type: str) -> dict[str, Any]:
+    return {
+        "model": decision.model,
+        "intent": decision.intent,
+        "confidence": decision.confidence,
+        "route_type": route_type,
+        "needs_memory": decision.needs_memory,
+        "tool": decision.tool,
+        "planner_status": decision.planner_status,
+        "reasoning_summary": decision.reasoning_summary,
+    }
+
+
+def _decision_state_update(decision: RouteDecision, route_type: str) -> dict[str, Any]:
+    return {
+        "intent": decision.intent,
+        "confidence": decision.confidence,
+        "use_cloud": decision.use_cloud,
+        "model": decision.model,
+        "tool": decision.tool,
+        "planner_status": decision.planner_status,
+        "reasoning_summary": decision.reasoning_summary,
+        "needs_memory": decision.needs_memory,
+        "route_type": route_type,
+    }
+
+
+# ── Pure responder helpers ───────────────────────────────────────────────────
+
+def _is_weather_fastpath(tool: str, message: str) -> bool:
+    return tool == "weather" and not is_weather_reasoning(message)
+
+
+def _build_vision_cloud_messages(image_b64: str, image_mime: str, text: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": image_mime,
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": text},
+            ],
+        }
+    ]
+
+
 def build_assistant_graph(
     deps: AssistantGraphDependencies,
     *,
@@ -384,90 +545,42 @@ def build_assistant_graph(
 
     async def intent_classifier(state: AssistantState) -> dict[str, Any]:
         writer = get_stream_writer()
-
-        def _last_assistant_message() -> str:
-            for item in reversed(list(state.get("history", []))):
-                if item.get("role") == "assistant":
-                    return str(item.get("content", ""))
-            return ""
+        vision_model = deps.vision_model or deps.chat_model
 
         # Dedicated /code endpoint can force code routing deterministically.
         if state.get("force_code"):
-            writer({
-                "meta": {
-                    "model": deps.chat_model,
-                    "intent": "code-question",
-                    "confidence": 1.0,
-                    "route_type": "local",
-                    "needs_memory": True,
-                    "tool": None,
-                    "planner_status": "forced",
-                    "reasoning_summary": "",
-                }
-            })
-            return {
-                "intent": "code-question",
-                "confidence": 1.0,
-                "use_cloud": False,
-                "model": deps.chat_model,
-                "tool": None,
-                "planner_status": "forced",
-                "reasoning_summary": "",
-                "needs_memory": True,
-                "route_type": "local",
-            }
+            decision = _forced_code_decision(deps.chat_model)
+            route_type = _route_type_for_decision(decision)
+            writer({"meta": _decision_meta(decision, route_type)})
+            return _decision_state_update(decision, route_type)
 
         # Image attachment is a structural signal; skip the classifier
         # entirely.  There is no ambiguous case: an attached image always means
         # "vision request".  The classifier still runs for imageless visual queries
         # (e.g. "describe this photo?" with no image) so keyword scoring is preserved.
         if state.get("image_base64"):
-            vision_model = deps.vision_model or deps.chat_model
-            writer({
-                "meta": {
-                    "model": vision_model,
-                    "intent": "vision",
-                    "confidence": 1.0,
-                    "route_type": "vision",
-                    "needs_memory": False,
-                    "tool": None,
-                    "planner_status": "deterministic",
-                    "reasoning_summary": "",
-                }
-            })
-            return {
-                "intent": "vision",
-                "confidence": 1.0,
-                "use_cloud": False,
-                "model": vision_model,
-                "tool": None,
-                "planner_status": "deterministic",
-                "reasoning_summary": "",
-                "needs_memory": False,
-                "route_type": "vision",
-            }
+            decision = _deterministic_vision_decision(vision_model)
+            route_type = "vision"
+            writer({"meta": _decision_meta(decision, route_type)})
+            return _decision_state_update(decision, route_type)
 
-        # Compute heuristic once; used as deterministic fallback.
+        # Compute heuristic once; used as the deterministic fallback.
         heuristic = classify_intent(state["message"])
         decision: RouteDecision
 
-        def _heuristic_router_decision() -> RouteDecision:
-            fallback = heuristic
-            fallback.model = _pick_model_for_decision(
-                fallback.intent,
-                use_cloud=fallback.use_cloud,
+        def _heuristic_fallback() -> RouteDecision:
+            return _heuristic_decision(
+                heuristic,
                 chat_model=deps.chat_model,
                 cloud_model=deps.cloud_model,
-                vision_model=deps.vision_model or deps.chat_model,
+                vision_model=vision_model,
             )
-            fallback.planner_status = "heuristic"
-            return fallback
 
         if ROUTER_EMBEDDING_ENABLED:
             embed_router = deps.embedding_router
             if embed_router is None:
                 log.info("embedding_route.fallback | reason=router_unavailable")
-                decision = _heuristic_router_decision()
+                decision = _heuristic_fallback()
             else:
                 try:
                     query_embedding = await ollama_embed_text(
@@ -490,10 +603,10 @@ def build_assistant_graph(
                     )
                 except EmbeddingRouterSnapshotMismatchError as exc:
                     log.warning("embedding_route.snapshot_mismatch | error=%s", exc)
-                    decision = _heuristic_router_decision()
+                    decision = _heuristic_fallback()
                 except Exception as exc:
                     log.warning("embedding_route.fallback | reason=embedding_failed error=%s", exc)
-                    decision = _heuristic_router_decision()
+                    decision = _heuristic_fallback()
                 else:
                     reasoning_summary = (
                         "embed"
@@ -502,7 +615,7 @@ def build_assistant_graph(
                     )
                     if embed_result.should_escalate:
                         log.info("embedding_route.ambiguous | action=heuristic")
-                        decision = _heuristic_router_decision()
+                        decision = _heuristic_fallback()
                         decision.planner_status = "embedding_ambiguous_fallback"
                         if not decision.reasoning_summary:
                             decision.reasoning_summary = reasoning_summary
@@ -515,73 +628,28 @@ def build_assistant_graph(
                             heuristic,
                             chat_model=deps.chat_model,
                             cloud_model=deps.cloud_model,
-                            vision_model=deps.vision_model or deps.chat_model,
+                            vision_model=vision_model,
                             reasoning_summary=reasoning_summary,
                         )
         else:
-            decision = _heuristic_router_decision()
+            decision = _heuristic_fallback()
 
-        followup_message = state["message"].strip().lower()
-        last_assistant = _last_assistant_message().lower()
-        looks_like_write_followup = followup_message in {
-            "yes",
-            "y",
-            "ok",
-            "okay",
-            "go ahead",
-            "do it",
-            "please do",
-            "sounds good",
-        } and any(
-            marker in last_assistant
-            for marker in [
-                "write",
-                "edit",
-                "create",
-                "implement",
-                "modify",
-                "patch",
-                "file",
-                "confirm",
-            ]
+        looks_like_write_followup = _looks_like_write_followup(
+            state["message"].strip().lower(),
+            _last_assistant_message(state.get("history", [])).lower(),
         )
 
-        if (is_write_like_code_request(state["message"]) or looks_like_write_followup) and decision.intent != "code-question":
-            decision.intent = "code-question"
-            decision.use_cloud = False
-            decision.tool = None
-            decision.model = deps.chat_model
-            decision.planner_status = (
-                "write_followup_downgraded_to_code_question"
-                if looks_like_write_followup
-                else "write_downgraded_to_code_question"
+        if is_write_like_code_request(state["message"]) or looks_like_write_followup:
+            decision = _downgrade_to_code_question(
+                decision,
+                chat_model=deps.chat_model,
+                looks_like_write_followup=looks_like_write_followup,
             )
 
-        route_type = "tool" if getattr(decision, "tool", None) else ("cloud" if decision.use_cloud else "local")
+        route_type = _route_type_for_decision(decision)
 
-        writer({
-            "meta": {
-                "model": decision.model,
-                "intent": decision.intent,
-                "confidence": decision.confidence,
-                "route_type": route_type,
-                "needs_memory": decision.needs_memory,
-                "tool": decision.tool,
-                "planner_status": decision.planner_status,
-                "reasoning_summary": decision.reasoning_summary,
-            }
-        })
-        return {
-            "intent": decision.intent,
-            "confidence": decision.confidence,
-            "use_cloud": decision.use_cloud,
-            "model": decision.model,
-            "tool": decision.tool,
-            "planner_status": decision.planner_status,
-            "reasoning_summary": decision.reasoning_summary,
-            "needs_memory": decision.needs_memory,
-            "route_type": route_type,
-        }
+        writer({"meta": _decision_meta(decision, route_type)})
+        return _decision_state_update(decision, route_type)
 
     async def history_loader(state: AssistantState) -> dict[str, Any]:
         session_id = str(state.get("session_id", ""))
@@ -755,22 +823,9 @@ def build_assistant_graph(
             if not local_vision_ok:
                 # Cloud fallback: Anthropic vision API (multimodal message format)
                 response_model = deps.cloud_model
-                vision_cloud_messages = [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": image_mime,
-                                    "data": image_b64,
-                                },
-                            },
-                            {"type": "text", "text": vision_request.message},
-                        ],
-                    }
-                ]
+                vision_cloud_messages = _build_vision_cloud_messages(
+                    image_b64, image_mime, vision_request.message
+                )
                 try:
                     response_text = await _emit_response_chunks(
                         deps.stream_cloud(vision_request.system, vision_cloud_messages),
@@ -799,7 +854,7 @@ def build_assistant_graph(
             if getattr(tool_result, "ok", False):
                 response_model = deps.chat_model
                 # Weather fast-path: skip LLM for plain lookups.
-                if state["tool"] == "weather" and not is_weather_reasoning(state["message"]):
+                if _is_weather_fastpath(state["tool"], state["message"]):
                     response_text = format_weather_response(getattr(tool_result, "data", {}))
                     writer({"text": response_text})
                 else:

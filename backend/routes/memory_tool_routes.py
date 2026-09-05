@@ -17,7 +17,7 @@ from app_schemas import (
 
 def create_memory_tool_router(
     *,
-    memory_store,
+    get_memory_store,
     memory_consolidation_batch_size: int,
     error_response: Callable[[str, str, bool, int], JSONResponse],
     dispatch_tool: Callable[[str, dict], Awaitable],
@@ -39,7 +39,7 @@ def create_memory_tool_router(
         offset: int = Query(default=0, ge=0),
     ):
         user_id: str = http_request.state.user_id
-        return JSONResponse(memory_store.list_items(user_id, limit=limit, offset=offset))
+        return JSONResponse(get_memory_store().list_items(user_id, limit=limit, offset=offset))
 
     @router.get("/memory/episodic")
     async def list_episodic_memory(
@@ -49,13 +49,13 @@ def create_memory_tool_router(
         consolidated: bool | None = Query(default=None),
     ):
         user_id: str = http_request.state.user_id
-        return JSONResponse(memory_store.list_episodic(user_id, limit=limit, offset=offset, consolidated=consolidated))
+        return JSONResponse(get_memory_store().list_episodic(user_id, limit=limit, offset=offset, consolidated=consolidated))
 
     @router.post("/memory/consolidate")
     async def consolidate_memory(http_request: Request):
         user_id: str = http_request.state.user_id
         stats = await asyncio.to_thread(
-            memory_store.consolidate_pending,
+            get_memory_store().consolidate_pending,
             user_id,
             memory_consolidation_batch_size,
         )
@@ -64,14 +64,14 @@ def create_memory_tool_router(
     @router.delete("/memory/{memory_id}")
     async def delete_memory(memory_id: str, http_request: Request):
         user_id: str = http_request.state.user_id
-        if not memory_store.delete_item(user_id, memory_id):
+        if not get_memory_store().delete_item(user_id, memory_id):
             return error_response("Memory item not found", "MEMORY_NOT_FOUND", False, status_code=404)
         return JSONResponse({"ok": True, "id": memory_id})
 
     @router.delete("/memory")
     async def clear_memory(http_request: Request):
         user_id: str = http_request.state.user_id
-        counts = memory_store.clear_all(user_id)
+        counts = get_memory_store().clear_all(user_id)
         return JSONResponse({"ok": True, "cleared": counts})
 
     @router.post("/weather")
@@ -81,7 +81,7 @@ def create_memory_tool_router(
             {
                 "prompt": f"weather in {request.location}" if request.location else "",
                 "user_id": user_id,
-                "memory": memory_store,
+                "memory": get_memory_store(),
                 "location": request.location,
             }
         )
