@@ -90,11 +90,12 @@ services:
       # Beets DB mounted from host (read-only). Override BEETS_DB_PATH in
       # .env if the DB filename differs. Host directory set via BEETS_DB_DIR.
       - BEETS_DB_PATH=${BEETS_DB_PATH:-/beets/library.db}
-      # Runtime state DBs must be writable when /app is bind-mounted from host.
-      - MEMORY_DB_PATH=/tmp/hearth-memory.db
-      - CHROMA_PATH=/tmp/hearth-chroma
-      - GRAPH_CHECKPOINT_DB_PATH=/tmp/hearth-graph-checkpoints.sqlite
-      - AUTH_DB_PATH=/tmp/hearth-auth.db
+      # Runtime state DBs on the persistent hearth-data volume so users,
+      # sessions, memory, and conversation history survive container rebuilds.
+      - MEMORY_DB_PATH=/tmp/hearth/memory.db
+      - CHROMA_PATH=/tmp/hearth/chroma
+      - GRAPH_CHECKPOINT_DB_PATH=/tmp/hearth/graph-checkpoints.sqlite
+      - AUTH_DB_PATH=/tmp/hearth/auth.db
       - MUSIC_ROOT=/music
       - BEETSDIR=/beets
       - MPD_HOST=mpd
@@ -108,6 +109,7 @@ services:
       - ollama
       - mpd
     volumes:
+      - hearth-data:/tmp/hearth
       - ./backend:/app
       - ./frontend:/frontend
       # Music library — writable so beets import can create temp files during remux.
@@ -157,3 +159,4 @@ services:
 volumes:
   ollama:
   open-webui:
+  hearth-data:
