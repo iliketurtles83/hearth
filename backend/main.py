@@ -39,6 +39,7 @@ from embedding_router import (
     warmup_embedding_router,
 )
 from memory import MemoryStore
+from memory_scheduler import start_memory_scheduler
 from routing_config import ROUTING_CONFIG
 from graph import (
     build_assistant_graph,
@@ -540,6 +541,7 @@ async def _graph_lifespan(_app: FastAPI):
             get_embedding_router_error(),
         )
 
+    memory_scheduler_task = None
     try:
         async with create_assistant_graph(
             _make_graph_deps(embedding_router=embed_router),
@@ -557,12 +559,24 @@ async def _graph_lifespan(_app: FastAPI):
                     await chat_warmup_task
                 except Exception as exc:  # defensive; warmup already self-guards
                     log.warning("chat_warmup.await_failed | error=%s", exc if str(exc) else repr(exc))
+            # Start the interval "sleep" consolidation job (no-op when disabled).
+            memory_scheduler_task = start_memory_scheduler(get_memory_store)
+            if memory_scheduler_task is not None:
+                _app.state.memory_scheduler = memory_scheduler_task
+                log.info("memory_scheduler.started")
             yield
     finally:
         # If the graph build failed before we reached the await, don't leave the
         # warmup task orphaned (it would hold an open httpx client past shutdown).
         if chat_warmup_task is not None and not chat_warmup_task.done():
             chat_warmup_task.cancel()
+        # Stop the sleep scheduler and let it unwind cleanly.
+        if memory_scheduler_task is not None and not memory_scheduler_task.done():
+            memory_scheduler_task.cancel()
+            try:
+                await memory_scheduler_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 app = FastAPI(lifespan=_graph_lifespan)
 

@@ -2,6 +2,7 @@
 
 ### update beets
 - how to update when i have have made changes to music library?
+- currently i am going inside the docker container and then calling 'beet update' (or was there a special flag?)
 
 ### security
 - bring out system specific variables from code to .env
@@ -13,8 +14,6 @@
 ### Tool calls
 - write json for weather tool call???
 
-## UI
-- make it more modern and sleek, less cluttered, more intuitive.
 
 ### Task: UI top bar removal **DONE**
 - Folder: frontend/
@@ -28,6 +27,9 @@
 - no more borders for songs, chats or memories 
 - they have the same color as background.
 - when hovering over, highlight entire background of the item
+- remove the text 'queue' it is implied.
+- song row spacing
+- song artist and title on one line
 
 ### Task: sidebar menu improvements
 - no more total scroll bar
@@ -45,3 +47,7 @@
 ### music window
 - Folder: frontend/
 - artist - song on one line
+
+### settings menu
+- appears when clicking on username .
+- in settings we will have: theme (dark/light), display reasoning (on/off), manual beet update button, logout button, manual consolidation?

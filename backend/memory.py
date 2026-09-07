@@ -35,14 +35,29 @@ class MemoryCandidate:
     key: str
     value: str
     source: str
+    ttl_days: int | None = None
+
+
+@dataclass
+class MemoryTriple:
+    subject: str
+    predicate: str
+    obj: str
+    confidence: float = 1.0
+
+
+@dataclass
+class MemoryExtraction:
+    candidates: list[MemoryCandidate]
+    triples: list[MemoryTriple]
 
 
 # ── LLM-based memory extraction (Phase 12b) ──────────────────────────────────────
 # System prompt for memory extraction LLM. Instructs the model to extract stable
 # facts and preferences from episodic summaries, returning structured JSON with
 # confidence scores. Low-confidence extractions (< 0.7) are filtered downstream.
-MEMORY_EXTRACTOR_SYSTEM = """You are a memory extraction assistant specialized in identifying
-stable facts and user preferences from conversation summaries.
+MEMORY_EXTRACTOR_SYSTEM = """You are a memory extraction assistant that distills a conversation
+summary into durable semantic memory for a personal assistant.
 
 Extract only information that is:
 - Stable and generalizable (not ephemeral chat content)
@@ -51,12 +66,28 @@ Extract only information that is:
 
 Return ONLY valid JSON with no preamble or explanation. Format:
 {
-  "candidates": [
-    { "key": "string", "value": "string", "type": "fact|preference", "confidence": 0.0–1.0 }
+  "facts": [
+    { "key": "string", "value": "string", "confidence": 0.0-1.0, "ttl_days": null or integer }
+  ],
+  "preferences": [
+    { "key": "string", "value": "string", "confidence": 0.0-1.0 }
+  ],
+  "triples": [
+    { "subject": "type:slug", "predicate": "string", "object": "string", "confidence": 0.0-1.0 }
   ]
 }
 
-If nothing stable can be extracted, return { "candidates": [] }."""
+Rules:
+- "ttl_days" is null for permanent facts (identity, stable traits) and a small integer
+  (1-30) for time-bound facts (trips, deadlines, "this week").
+- Triple "subject" and "object" use semantic ids: "person:alice", "city:helsinki",
+  "project:hearth", "org:mozilla", or a plain phrase for values.
+- Use concise relation predicates like lives_in, works_on, favorite_thing, met, owns, wants.
+- Prefer triples for relationships between named entities; use facts/preferences for
+  flat key/value statements.
+- Only include items with confidence >= 0.7.
+
+If nothing stable can be extracted, return { "facts": [], "preferences": [], "triples": [] }."""
 
 
 @dataclass
@@ -309,6 +340,35 @@ class MemoryStore:
                     ON conversation_log(session_id, user_id, ts);
                 CREATE INDEX IF NOT EXISTS idx_convlog_user_ts
                     ON conversation_log(user_id, ts DESC);
+
+                CREATE TABLE IF NOT EXISTS entities (
+                    user_id    TEXT NOT NULL,
+                    id         TEXT NOT NULL,
+                    type       TEXT NOT NULL,
+                    attributes TEXT,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY (user_id, id)
+                );
+
+                CREATE TABLE IF NOT EXISTS relations (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id    TEXT NOT NULL,
+                    subject    TEXT NOT NULL,
+                    predicate  TEXT NOT NULL,
+                    object     TEXT NOT NULL,
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    source     TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL,
+                    expires_at REAL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_relations_user_spo
+                    ON relations(user_id, subject, predicate, object);
+                CREATE INDEX IF NOT EXISTS idx_relations_user_object
+                    ON relations(user_id, object);
+                CREATE INDEX IF NOT EXISTS idx_relations_user_predicate
+                    ON relations(user_id, predicate);
                 """
             )
             # Live-instance migration: add 'consolidated' column if it doesn't exist yet.
@@ -498,6 +558,29 @@ class MemoryStore:
             ).fetchone()
         return int(row["c"] if row is not None else 0)
 
+    def get_last_activity(self, user_id: str) -> float | None:
+        """Timestamp of the user's most recent logged turn, or None if unseen.
+
+        Used by the sleep scheduler's idle gate: a user is only consolidated
+        once they have been inactive for at least the idle threshold.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT MAX(ts) AS m FROM conversation_log WHERE user_id = ?",
+                (user_id,),
+            ).fetchone()
+        if row is None or row["m"] is None:
+            return None
+        return float(row["m"])
+
+    def list_users_with_pending(self) -> list[str]:
+        """Distinct user_ids that have at least one unconsolidated summary."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT user_id FROM summaries WHERE consolidated = 0 ORDER BY user_id"
+            ).fetchall()
+        return [str(r["user_id"]) for r in rows]
+
     def _is_sensitive(self, text: str) -> bool:
         t = text.lower()
         for p in self._SENSITIVE_SECRET_PATTERNS + self._SENSITIVE_PHONE_PATTERNS + self._SENSITIVE_ADDRESS_PATTERNS:
@@ -589,22 +672,15 @@ class MemoryStore:
             unique[(c.table, c.key, c.value)] = c
         return list(unique.values())
 
-    async def _llm_extract_candidates(self, text: str, source: str) -> list[MemoryCandidate]:
-        """Extract memory candidates using LLM-based reasoning (Phase 12b).
+    async def _llm_extract_memory(self, text: str, source: str) -> MemoryExtraction:
+        """Extract semantic memory (facts, preferences, triples) via Ollama /api/chat.
 
-        Calls OLLAMA_CHAT_MODEL via /api/chat with a system prompt, parses
-        JSON response, and filters by confidence >= 0.7.  Gracefully handles
-        parse failures and Ollama unreachability by returning empty list.
-
-        Args:
-            text: Episodic summary or conversation text to extract from.
-            source: Origin label for audit trail ("consolidation", "ingest", etc).
-
-        Returns:
-            List of MemoryCandidate objects meeting confidence threshold.
+        Runs a single structured extraction call and returns a MemoryExtraction.
+        Gracefully returns an empty MemoryExtraction on Ollama unreachability,
+        network error, or JSON parse failure so consolidation never crashes.
         """
         if not text or not text.strip():
-            return []
+            return MemoryExtraction(candidates=[], triples=[])
 
         # Truncate very long summaries to reduce token cost (last 1500 chars typically
         # contain the most recent, highest-value facts).
@@ -626,7 +702,7 @@ class MemoryStore:
             "stream": False,
             "format": "json",
             "options": {
-                "num_predict": 400,  # Budget for structured extraction output
+                "num_predict": 600,  # Budget for facts + preferences + triples
                 "temperature": 0.1,  # Low temp for deterministic extraction
             },
         }
@@ -643,63 +719,124 @@ class MemoryStore:
                 "memory.llm_extract | extraction_failed=ollama_unreachable error=%s",
                 str(e),
             )
-            return []
+            return MemoryExtraction(candidates=[], triples=[])
         except (httpx.TimeoutException, httpx.RequestError) as e:
             log.warning(
                 "memory.llm_extract | extraction_failed=network_error error=%s",
                 str(e),
             )
-            return []
+            return MemoryExtraction(candidates=[], triples=[])
         except Exception as e:
             log.error(
                 "memory.llm_extract | extraction_failed=unexpected error=%s",
                 str(e),
             )
-            return []
+            return MemoryExtraction(candidates=[], triples=[])
 
-        # Parse JSON response with graceful error handling
         try:
             parsed = json.loads(raw_response)
-            candidates_raw = parsed.get("candidates", [])
+            if not isinstance(parsed, dict):
+                raise ValueError("expected a JSON object")
         except (json.JSONDecodeError, ValueError) as e:
             log.warning(
                 "memory.llm_extract | extraction_failed=json_parse_error raw=%s error=%s",
                 raw_response[:200],
                 str(e),
             )
-            return []
+            return MemoryExtraction(candidates=[], triples=[])
 
-        # Convert JSON dicts to MemoryCandidate objects, filtering by confidence
-        candidates: list[MemoryCandidate] = []
-        confidence_threshold = 0.7
+        return self._parse_extraction(parsed, source)
 
-        for item in candidates_raw:
-            if not isinstance(item, dict):
-                continue
+    async def _llm_extract_candidates(self, text: str, source: str) -> list[MemoryCandidate]:
+        """Backwards-compatible key/value extractor; delegates to the unified pass."""
+        return (await self._llm_extract_memory(text, source)).candidates
 
+    def _candidate_from_dict(self, item: Any, table: str, source: str) -> MemoryCandidate | None:
+        if not isinstance(item, dict):
+            return None
+        try:
             confidence = float(item.get("confidence", 0.0))
-            if confidence < confidence_threshold:
-                continue  # Skip low-confidence extractions
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < 0.7:
+            return None
+        key = str(item.get("key", "")).strip()
+        value = str(item.get("value", "")).strip()
+        if not key or not value:
+            return None
+        ttl = item.get("ttl_days")
+        ttl_days: int | None = None
+        if isinstance(ttl, (int, float)) and not isinstance(ttl, bool) and ttl > 0:
+            ttl_days = int(ttl)
+        return MemoryCandidate(
+            table=table,
+            key=key[:48],
+            value=value[:240],
+            source=source,
+            ttl_days=ttl_days,
+        )
 
-            item_type = str(item.get("type", "fact")).lower()
-            table = "preferences" if item_type == "preference" else "facts"
-            key = str(item.get("key", "")).strip()
-            value = str(item.get("value", "")).strip()
+    def _triple_from_dict(self, item: Any) -> MemoryTriple | None:
+        if not isinstance(item, dict):
+            return None
+        try:
+            confidence = float(item.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence < 0.7:
+            return None
+        subject = str(item.get("subject", "")).strip()
+        predicate = str(item.get("predicate", "")).strip()
+        obj = str(item.get("object", "")).strip()
+        if not subject or not predicate or not obj:
+            return None
+        return MemoryTriple(
+            subject=subject[:64],
+            predicate=predicate[:64],
+            obj=obj[:120],
+            confidence=confidence,
+        )
 
-            if key and value:
-                candidates.append(MemoryCandidate(
-                    table=table,
-                    key=key[:48],  # Truncate keys
-                    value=value[:240],  # Truncate values
-                    source=source,
-                ))
+    def _parse_extraction(self, parsed: dict[str, Any], source: str) -> MemoryExtraction:
+        """Parse a unified extraction payload into a MemoryExtraction.
+
+        Tolerates the legacy {"candidates": [...]} shape so that existing
+        callers and tests using the old schema keep working: a "type" of
+        "preference" maps to the preferences table, everything else to facts.
+        """
+        has_new_schema = any(k in parsed for k in ("facts", "preferences", "triples"))
+        candidates: list[MemoryCandidate] = []
+        triples: list[MemoryTriple] = []
+
+        if not has_new_schema:
+            for item in parsed.get("candidates", []):
+                if not isinstance(item, dict):
+                    continue
+                item_type = str(item.get("type", "fact")).lower()
+                table = "preferences" if item_type == "preference" else "facts"
+                cand = self._candidate_from_dict(item, table, source)
+                if cand:
+                    candidates.append(cand)
+        else:
+            for item in parsed.get("facts", []) or []:
+                cand = self._candidate_from_dict(item, "facts", source)
+                if cand:
+                    candidates.append(cand)
+            for item in parsed.get("preferences", []) or []:
+                cand = self._candidate_from_dict(item, "preferences", source)
+                if cand:
+                    candidates.append(cand)
+            for item in parsed.get("triples", []) or []:
+                triple = self._triple_from_dict(item)
+                if triple:
+                    triples.append(triple)
 
         log.debug(
-            "memory.llm_extract | extracted=%d confidence_threshold=%.2f",
+            "memory.llm_extract | candidates=%d triples=%d",
             len(candidates),
-            confidence_threshold,
+            len(triples),
         )
-        return candidates
+        return MemoryExtraction(candidates=candidates, triples=triples)
 
     def _extract_candidates_llm_sync(self, text: str, source: str) -> list[MemoryCandidate]:
         """Synchronous wrapper for _llm_extract_candidates().
@@ -721,6 +858,20 @@ class MemoryStore:
         asyncio.set_event_loop(loop)
         try:
             return loop.run_until_complete(self._llm_extract_candidates(text, source))
+        finally:
+            loop.close()
+            asyncio.set_event_loop(None)
+
+    def _extract_memory_sync(self, text: str, source: str) -> MemoryExtraction:
+        """Synchronous wrapper for _llm_extract_memory().
+
+        Invoked from a worker thread (asyncio.to_thread) where no event loop is
+        running, so run the coroutine on a fresh loop owned by this thread.
+        """
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(self._llm_extract_memory(text, source))
         finally:
             loop.close()
             asyncio.set_event_loop(None)
@@ -1070,65 +1221,53 @@ class MemoryStore:
         ]
         return {"items": items, "total": int(total), "limit": limit, "offset": offset}
 
-    def consolidate_pending(self, user_id: str | None = None, limit: int = 50) -> dict[str, int]:
-        # Single-flight guard: background tasks may trigger consolidation on
-        # consecutive turns. Serialize passes so the same unconsolidated batch
-        # cannot be promoted twice concurrently.
+    def run_sleep_pass(self, user_id: str, limit: int = 50) -> dict[str, int]:
+        """Run a consolidated "sleep" pass for one user.
+
+        Promotes pending episodic summaries into semantic memory — facts,
+        preferences, and knowledge-graph triples — then prunes expired facts.
+        The blocking LLM extraction runs without holding the store lock; the
+        single-flight _consolidation_lock keeps concurrent passes from
+        double-processing the same summaries.
+        """
         if not self._consolidation_lock.acquire(blocking=False):
-            return {
-                "processed": 0,
-                "promoted": 0,
-                "blocked": 0,
-            }
+            return {"processed": 0, "promoted": 0, "blocked": 0, "triples": 0, "decayed": 0}
 
         now = time.time()
         try:
-            # Phase 1: read the pending summaries under the lock, then release it so
-            # the blocking LLM extraction does not stall every other memory operation.
+            # Phase 1: read pending summaries under the lock, then release it so the
+            # blocking LLM extraction does not stall other memory operations.
             with self._lock:
-                cur = self._conn.cursor()
-                if user_id:
-                    rows = cur.execute(
-                        """
-                        SELECT id, user_id, session_id, summary
-                        FROM summaries
-                        WHERE user_id = ? AND consolidated = 0
-                        ORDER BY created_at ASC
-                        LIMIT ?
-                        """,
-                        (user_id, limit),
-                    ).fetchall()
-                else:
-                    rows = cur.execute(
-                        """
-                        SELECT id, user_id, session_id, summary
-                        FROM summaries
-                        WHERE consolidated = 0
-                        ORDER BY created_at ASC
-                        LIMIT ?
-                        """,
-                        (limit,),
-                    ).fetchall()
+                rows = self._conn.execute(
+                    """
+                    SELECT id, user_id, session_id, summary
+                    FROM summaries
+                    WHERE user_id = ? AND consolidated = 0
+                    ORDER BY created_at ASC
+                    LIMIT ?
+                    """,
+                    (user_id, limit),
+                ).fetchall()
 
             # Phase 2: run the (blocking) LLM extraction for every summary WITHOUT
-            # holding the lock.  Build a flat work list of writes to apply afterwards.
-            extracted: list[tuple[int, str, list[MemoryCandidate]]] = []
+            # holding the lock.
+            extracted: list[tuple[int, str, str, MemoryExtraction]] = []
             for row in rows:
                 summary_id = int(row["id"])
                 summary_text = str(row["summary"] or "")
                 summary_user_id = str(row["user_id"])
-                # Phase 12b: Use LLM-based extraction instead of regex for richer candidates
-                candidates = self._extract_candidates_llm_sync(summary_text, source="consolidation")
-                extracted.append((summary_id, summary_user_id, candidates))
+                extraction = self._extract_memory_sync(summary_text, source="consolidation")
+                extracted.append((summary_id, summary_user_id, summary_text, extraction))
 
-            # Phase 3: apply all DB + Chroma writes under the lock (no LLM calls here).
+            # Phase 3: apply all DB + Chroma + graph writes under the lock (no LLM).
             processed = 0
             promoted = 0
             blocked = 0
+            triples_stored = 0
             with self._lock:
                 cur = self._conn.cursor()
-                for summary_id, summary_user_id, candidates in extracted:
-                    for c in candidates:
+                for summary_id, summary_user_id, summary_text, extraction in extracted:
+                    for c in extraction.candidates:
                         fact_text = f"{c.key}: {c.value}"
                         if self._is_sensitive(fact_text):
                             blocked += 1
@@ -1150,17 +1289,19 @@ class MemoryStore:
                             ).fetchone()
                             memory_id = f"preferences:{int(pref_row['id'])}"
                         else:
+                            expires_at = now + (c.ttl_days * 86400) if c.ttl_days else None
                             cur.execute(
                                 """
                                 INSERT INTO facts (user_id, key, value, source, created_at, expires_at, sensitive)
-                                VALUES (?, ?, ?, ?, ?, NULL, 0)
+                                VALUES (?, ?, ?, ?, ?, ?, 0)
                                 ON CONFLICT(user_id, key)
                                     DO UPDATE SET
                                         value = excluded.value,
                                         source = excluded.source,
-                                        created_at = excluded.created_at
+                                        created_at = excluded.created_at,
+                                        expires_at = excluded.expires_at
                                 """,
-                                (summary_user_id, c.key, c.value, c.source, now),
+                                (summary_user_id, c.key, c.value, c.source, now, expires_at),
                             )
                             fact_row = cur.execute(
                                 "SELECT id FROM facts WHERE user_id = ? AND key = ? LIMIT 1",
@@ -1184,18 +1325,84 @@ class MemoryStore:
                         )
                         promoted += 1
 
+                    for t in extraction.triples:
+                        if self._apply_triple(cur, summary_user_id, t, now):
+                            triples_stored += 1
+
                     cur.execute("UPDATE summaries SET consolidated = 1 WHERE id = ?", (summary_id,))
                     processed += 1
 
+                decayed = self._decay_user(cur, user_id, now)
                 self._conn.commit()
 
             return {
                 "processed": int(processed),
                 "promoted": int(promoted),
                 "blocked": int(blocked),
+                "triples": int(triples_stored),
+                "decayed": int(decayed),
             }
         finally:
             self._consolidation_lock.release()
+
+    def _apply_triple(self, cur: sqlite3.Cursor, user_id: str, t: MemoryTriple, now: float) -> bool:
+        """Upsert a knowledge-graph triple (plus its endpoint entities) for a user."""
+        for ent_id in (t.subject, t.obj):
+            if ":" in ent_id:
+                ent_type, _, slug = ent_id.partition(":")
+                if slug:
+                    cur.execute(
+                        "INSERT OR IGNORE INTO entities (user_id, id, type, attributes, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (user_id, ent_id, ent_type or "thing", json.dumps({"name": slug}), now),
+                    )
+        cur.execute(
+            """
+            INSERT INTO relations (user_id, subject, predicate, object, confidence, source, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, subject, predicate, object)
+                DO UPDATE SET confidence = excluded.confidence, updated_at = excluded.updated_at
+            """,
+            (user_id, t.subject, t.predicate, t.obj, t.confidence, "consolidation", now, now),
+        )
+        return True
+
+    def _decay_user(self, cur: sqlite3.Cursor, user_id: str, now: float) -> int:
+        """Prune facts whose expires_at has passed (and drop their vectors).
+
+        Returns the number of facts removed. Caller holds _lock and commits.
+        """
+        rows = cur.execute(
+            "SELECT id FROM facts WHERE user_id = ? AND expires_at IS NOT NULL AND expires_at < ?",
+            (user_id, now),
+        ).fetchall()
+        chroma_ids: list[str] = []
+        for r in rows:
+            row_id = int(r["id"])
+            cur.execute("DELETE FROM facts WHERE id = ? AND user_id = ?", (row_id, user_id))
+            chroma_ids.append(f"facts:{row_id}")
+        if chroma_ids:
+            try:
+                self._collection.delete(ids=chroma_ids)
+            except Exception:
+                pass
+        return len(chroma_ids)
+
+    def consolidate_pending(self, user_id: str | None = None, limit: int = 50) -> dict[str, int]:
+        """Backwards-compatible consolidation entrypoint.
+
+        Forwards to run_sleep_pass (which now also stores knowledge-graph
+        triples and prunes expired facts). With user_id=None it runs a pass for
+        every user that has pending summaries.
+        """
+        if user_id is not None:
+            return self.run_sleep_pass(user_id, limit)
+        total = {"processed": 0, "promoted": 0, "blocked": 0, "triples": 0, "decayed": 0}
+        for uid in self.list_users_with_pending():
+            result = self.run_sleep_pass(uid, limit)
+            for key in total:
+                total[key] += int(result.get(key, 0))
+        return total
 
     def delete_item(self, user_id: str, memory_id: str) -> bool:
         if ":" not in memory_id:
@@ -1234,10 +1441,14 @@ class MemoryStore:
                 "facts": cur.execute("SELECT COUNT(*) AS c FROM facts WHERE user_id = ?", (user_id,)).fetchone()["c"],
                 "preferences": cur.execute("SELECT COUNT(*) AS c FROM preferences WHERE user_id = ?", (user_id,)).fetchone()["c"],
                 "summaries": cur.execute("SELECT COUNT(*) AS c FROM summaries WHERE user_id = ?", (user_id,)).fetchone()["c"],
+                "entities": cur.execute("SELECT COUNT(*) AS c FROM entities WHERE user_id = ?", (user_id,)).fetchone()["c"],
+                "relations": cur.execute("SELECT COUNT(*) AS c FROM relations WHERE user_id = ?", (user_id,)).fetchone()["c"],
             }
             cur.execute("DELETE FROM facts WHERE user_id = ?", (user_id,))
             cur.execute("DELETE FROM preferences WHERE user_id = ?", (user_id,))
             cur.execute("DELETE FROM summaries WHERE user_id = ?", (user_id,))
+            cur.execute("DELETE FROM entities WHERE user_id = ?", (user_id,))
+            cur.execute("DELETE FROM relations WHERE user_id = ?", (user_id,))
             self._conn.commit()
 
         # Remove this user's vectors from Chroma (post-filter by metadata).
@@ -1290,6 +1501,56 @@ class MemoryStore:
 
         ranked.sort(key=lambda r: r["score"], reverse=True)
         return ranked[:top_n]
+
+    def _graph_recall(
+        self,
+        user_id: str,
+        terms: list[str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Knowledge-graph recall: match the user's relations against query terms.
+
+        Returns scored triple hits (source="graph", type="triple"). Scoped to
+        the user so relations never leak across accounts.
+        """
+        if not terms:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT subject, predicate, object, confidence FROM relations WHERE user_id = ?",
+                (user_id,),
+            ).fetchall()
+
+        hits: list[dict[str, Any]] = []
+        for r in rows:
+            subject = str(r["subject"])
+            predicate = str(r["predicate"])
+            obj = str(r["object"])
+            text = f"{subject} {predicate} {obj}".lower()
+            overlap = self._token_overlap(terms, text)
+            if overlap <= 0:
+                continue
+            try:
+                confidence = float(r["confidence"])
+            except (TypeError, ValueError):
+                confidence = 1.0
+            score = min(1.0, (overlap / float(len(terms))) * confidence)
+            hits.append(
+                {
+                    "id": f"relation:{subject}|{predicate}|{obj}",
+                    "table": "relations",
+                    "tier": "semantic",
+                    "key": predicate,
+                    "value": f"{subject} {predicate} {obj}",
+                    "text": f"{subject} {predicate} {obj}",
+                    "score": float(score),
+                    "source": "graph",
+                    "type": "triple",
+                }
+            )
+
+        hits.sort(key=lambda h: float(h["score"]), reverse=True)
+        return hits[:limit]
 
     def retrieve(
         self,
@@ -1351,8 +1612,10 @@ class MemoryStore:
         except Exception:
             chroma_hits = []
 
+        graph_hits = self._graph_recall(user_id, query_terms, limit)
+
         merged: dict[str, dict[str, Any]] = {}
-        for hit in sqlite_sem_hits + sqlite_epi_hits + chroma_hits:
+        for hit in sqlite_sem_hits + sqlite_epi_hits + chroma_hits + graph_hits:
             if float(hit.get("score", 0.0)) < self.min_relevance_score:
                 continue
 

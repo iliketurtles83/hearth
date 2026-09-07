@@ -1012,22 +1012,26 @@ def build_assistant_graph(
             if turn_count and turn_count % summary_trigger == 0:
                 _track_background_task(asyncio.create_task(_rolling_summary_task(summary_trigger)))
 
-        # 3) Threshold-based consolidation trigger.
-        unconsolidated = await asyncio.to_thread(
-            deps.memory_store.count_unconsolidated,
-            user_id,
-        )
-        consolidation_threshold = int(os.getenv("MEMORY_CONSOLIDATION_THRESHOLD", "3"))
-        if unconsolidated >= consolidation_threshold:
-            consolidation_batch = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
-            task = asyncio.create_task(
-                asyncio.to_thread(
-                    deps.memory_store.consolidate_pending,
-                    user_id,
-                    consolidation_batch,
-                )
+        # 3) Optional mid-conversation consolidation trigger.
+        # Disabled by default (threshold=0): the heavy LLM pass now runs in the
+        # interval "sleep" scheduler (memory_scheduler) instead of on the hot
+        # path. Set MEMORY_CONSOLIDATION_THRESHOLD>0 to restore the old behavior.
+        consolidation_threshold = int(os.getenv("MEMORY_CONSOLIDATION_THRESHOLD", "0"))
+        if consolidation_threshold > 0:
+            unconsolidated = await asyncio.to_thread(
+                deps.memory_store.count_unconsolidated,
+                user_id,
             )
-            _track_background_task(task)
+            if unconsolidated >= consolidation_threshold:
+                consolidation_batch = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
+                task = asyncio.create_task(
+                    asyncio.to_thread(
+                        deps.memory_store.consolidate_pending,
+                        user_id,
+                        consolidation_batch,
+                    )
+                )
+                _track_background_task(task)
 
         return {"memory_result": memory_payload}
 
