@@ -31,8 +31,11 @@ def store(tmp_path):
     )
 
 
-def _patch_ollama_chat(monkeypatch, mock_response):
+def _patch_chat_completions(monkeypatch, content: str):
+    """Mock an OpenAI-compatible /v1/chat/completions response with the given content."""
     from unittest.mock import AsyncMock, MagicMock
+
+    mock_response = {"choices": [{"message": {"content": content}}]}
 
     async def mock_post_fn(*args, **kwargs):
         resp = MagicMock()
@@ -48,14 +51,14 @@ def _patch_ollama_chat(monkeypatch, mock_response):
 
 
 def test_run_sleep_pass_stores_triples_and_graph_recall(store, monkeypatch):
-    _patch_ollama_chat(monkeypatch, {"message": {"content": json.dumps({
+    _patch_chat_completions(monkeypatch, json.dumps({
         "facts": [{"key": "location", "value": "Tallinn", "confidence": 0.9}],
         "preferences": [],
         "triples": [
             {"subject": "person:alice", "predicate": "lives_in", "object": "city:tallinn", "confidence": 0.9},
             {"subject": "person:alice", "predicate": "works_on", "object": "project:hearth", "confidence": 0.9},
         ],
-    })}})
+    }))
     store.log_turn("sess-1", "alice", "user", "hi")
     store.save_summary("alice", "sess-1", "User lives in Tallinn and works on hearth")
 
@@ -77,13 +80,13 @@ def test_run_sleep_pass_stores_triples_and_graph_recall(store, monkeypatch):
 
 
 def test_graph_recall_scoped_to_user(store, monkeypatch):
-    _patch_ollama_chat(monkeypatch, {"message": {"content": json.dumps({
+    _patch_chat_completions(monkeypatch, json.dumps({
         "facts": [],
         "preferences": [],
         "triples": [
             {"subject": "person:alice", "predicate": "lives_in", "object": "city:tallinn", "confidence": 0.9},
         ],
-    })}})
+    }))
     store.save_summary("alice", "sess-1", "User lives in Tallinn")
     store.run_sleep_pass("alice", limit=10)
 
@@ -92,11 +95,11 @@ def test_graph_recall_scoped_to_user(store, monkeypatch):
 
 
 def test_run_sleep_pass_sets_ttl_and_decays_expired(store, monkeypatch):
-    _patch_ollama_chat(monkeypatch, {"message": {"content": json.dumps({
+    _patch_chat_completions(monkeypatch, json.dumps({
         "facts": [{"key": "trip", "value": "in Paris this week", "confidence": 0.9, "ttl_days": 1}],
         "preferences": [],
         "triples": [],
-    })}})
+    }))
     store.save_summary("alice", "sess-1", "User is in Paris this week")
     stats = store.run_sleep_pass("alice", limit=10)
     assert stats["promoted"] >= 1
@@ -126,9 +129,9 @@ def test_run_sleep_pass_sets_ttl_and_decays_expired(store, monkeypatch):
 
 
 def test_run_sleep_pass_tolerates_legacy_candidates_schema(store, monkeypatch):
-    _patch_ollama_chat(monkeypatch, {"message": {"content": json.dumps({
+    _patch_chat_completions(monkeypatch, json.dumps({
         "candidates": [{"key": "name", "value": "Alice", "type": "fact", "confidence": 0.9}],
-    })}})
+    }))
     store.save_summary("alice", "sess-1", "My name is Alice")
     stats = store.run_sleep_pass("alice", limit=10)
     assert stats["processed"] == 1

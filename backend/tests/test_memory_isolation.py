@@ -313,7 +313,7 @@ def test_llm_extract_json_parse_failure(store, monkeypatch):
     # Mock endpoint /v1/chat/completions response with invalid JSON in message.content
     async def mock_post_fn(*args, **kwargs):
         resp = MagicMock()
-        resp.json = MagicMock(return_value={"message": {"content": "not valid json { [ }"}})
+        resp.json = MagicMock(return_value={"choices": [{"message": {"content": "not valid json { [ }"}}]})
         resp.raise_for_status = MagicMock()
         return resp
 
@@ -366,24 +366,26 @@ def test_consolidate_uses_llm_extraction(store, monkeypatch):
 
     # Mock endpoint /v1/chat/completions response with realistic extraction
     mock_response = {
-        "message": {
-            "content": json.dumps({
-                "candidates": [
-                    {
-                        "key": "name",
-                        "value": "Alice",
-                        "type": "fact",
-                        "confidence": 0.95,
-                    },
-                    {
-                        "key": "location",
-                        "value": "Tokyo",
-                        "type": "fact",
-                        "confidence": 0.88,
-                    },
-                ]
-            })
-        }
+        "choices": [{
+            "message": {
+                "content": json.dumps({
+                    "candidates": [
+                        {
+                            "key": "name",
+                            "value": "Alice",
+                            "type": "fact",
+                            "confidence": 0.95,
+                        },
+                        {
+                            "key": "location",
+                            "value": "Tokyo",
+                            "type": "fact",
+                            "confidence": 0.88,
+                        },
+                    ]
+                })
+            }
+        }]
     }
 
     async def mock_post_fn(*args, **kwargs):
