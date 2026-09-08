@@ -44,6 +44,10 @@ services:
     # Caddy (HTTPS). The backend is reachable inside the Docker network only.
     expose:
       - "8000"
+    # llama.cpp servers run on the host (ports 10000/10001); expose the
+    # host gateway so the container can reach them via host.docker.internal.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:

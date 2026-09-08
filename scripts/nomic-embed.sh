@@ -30,4 +30,5 @@ exec "${LLAMA_SERVER}" \
 	--ctx-size 512 \
 	--embedding \
 	--pooling mean \
+	--host 0.0.0.0 \
 	--port 10001

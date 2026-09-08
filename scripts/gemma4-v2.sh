@@ -33,4 +33,5 @@ exec "${LLAMA_SERVER}" \
 	--cache-type-v q8_0 \
 	--jinja \
 	--embedding \
+	--host 0.0.0.0 \
 	--port 10000
