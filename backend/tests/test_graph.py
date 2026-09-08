@@ -43,7 +43,7 @@ from embedding_router import (  # noqa: E402
 )
 
 
-TEST_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3:4b")
+TEST_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gemma-4")
 TEST_CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
 
 
@@ -319,7 +319,7 @@ async def test_code_question_uses_chat_model_when_router_selects_code_intent(mon
     async def _fake_embed_text(*_args, **_kwargs):
         return np.array([0.2, 0.1, 0.3], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+    monkeypatch.setattr(assistant_graph, "openai_embed_text", _fake_embed_text)
 
     graph = assistant_graph.build_assistant_graph(
         _deps_for_local_stream(["code via local chat"], embedding_router=_CodeEmbeddingRouter())
@@ -450,7 +450,7 @@ async def test_embedding_unambiguous_weather_skips_planner(monkeypatch):
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([1.0, 0.0], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+    monkeypatch.setattr(assistant_graph, "openai_embed_text", _fake_embed_text)
 
     graph = assistant_graph.build_assistant_graph(
         _deps_for_weather_stream(embedding_router=_FakeEmbedRouter())
@@ -493,7 +493,7 @@ async def test_embedding_ambiguous_uses_heuristic_fallback(monkeypatch):
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([0.1, 0.9], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+    monkeypatch.setattr(assistant_graph, "openai_embed_text", _fake_embed_text)
 
     graph = assistant_graph.build_assistant_graph(
         _deps_for_local_stream(["ok"], embedding_router=_FakeEmbedRouter())
@@ -535,7 +535,7 @@ async def test_embedding_ambiguous_does_not_call_planner_function(monkeypatch):
         return np.asarray([0.2, 0.8], dtype=np.float32)
 
     assert not hasattr(assistant_graph, "_call_planner")
-    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+    monkeypatch.setattr(assistant_graph, "openai_embed_text", _fake_embed_text)
 
     graph = assistant_graph.build_assistant_graph(
         _deps_for_local_stream(["ok"], embedding_router=_FakeEmbedRouter())
@@ -558,7 +558,7 @@ async def test_embedding_snapshot_mismatch_falls_back_to_legacy_router(monkeypat
     async def _fake_embed_text(*_args, **_kwargs):
         return np.asarray([0.1, 0.9], dtype=np.float32)
 
-    monkeypatch.setattr(assistant_graph, "ollama_embed_text", _fake_embed_text)
+    monkeypatch.setattr(assistant_graph, "openai_embed_text", _fake_embed_text)
 
     graph = assistant_graph.build_assistant_graph(
         _deps_for_local_stream(["ok"], embedding_router=_FakeEmbedRouter())

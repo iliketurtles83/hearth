@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Hearth is a local-first personal AI assistant: FastAPI backend serving both UI and API, Caddy HTTPS edge, LangGraph orchestration, local Ollama inference with optional Anthropic fallback. Deployed via Docker Compose.
+Hearth is a local-first personal AI assistant: FastAPI backend serving both UI and API, Caddy HTTPS edge, LangGraph orchestration, local OpenAI-compatible inference (llama.cpp/gemma-4) with optional Anthropic fallback. Deployed via Docker Compose.
 
 **Runtime**: Python 3.11 (Docker), 3.12/3.13 (local venv). Vanilla JS frontend.
 **Deployment**: `docker compose up -d --build` (backend port 8000 is internal-only; Caddy on 443/80)

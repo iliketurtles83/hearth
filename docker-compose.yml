@@ -1,44 +1,4 @@
 services:
-  ollama:
-    image: ollama/ollama
-    container_name: ollama
-    restart: unless-stopped
-    environment:
-      # Keep loaded models resident in VRAM beyond Ollama's 5m default so idle
-      # gaps don't force the ~80s gemma4:e4b reload on the next request.
-      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:-30m}
-    ports:
-      - "127.0.0.1:11434:11434"
-    volumes:
-      - ollama:/root/.ollama
-    healthcheck:
-      test: ["CMD", "ollama", "list"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
-  # open-webui is out of Phase 0b scope — it remains on :3000 (plain HTTP).
-  # open-webui:
-  #   image: ghcr.io/open-webui/open-webui:main
-  #   container_name: open-webui
-  #   restart: unless-stopped
-  #   ports:
-  #     - "3000:8080"
-  #   volumes:
-  #     - open-webui:/app/backend/data
-  #   environment:
-  #     - OLLAMA_BASE_URL=http://ollama:11434
-  #   depends_on:
-  #     - ollama
-
   # MPD — music playback daemon (Phase 8).
   # Audio output: PulseAudio socket mounted from the host (PipeWire-PA compatible).
   # Music files: ${MUSIC_PATH} (set in .env) mounted read-only at /music.
@@ -106,7 +66,6 @@ services:
       - TTS_KOKORO_LANG=${TTS_KOKORO_LANG:-en-us}
       - TTS_KOKORO_SPEED=${TTS_KOKORO_SPEED:-1.0}
     depends_on:
-      - ollama
       - mpd
     volumes:
       - hearth-data:/tmp/hearth
@@ -157,6 +116,5 @@ services:
       start_period: 15s
 
 volumes:
-  ollama:
   open-webui:
   hearth-data:

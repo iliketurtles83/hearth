@@ -144,18 +144,17 @@ SESSION_IDLE_TTL_SECONDS = int(os.getenv("CHAT_SESSION_IDLE_TTL_SECONDS", "1800"
 SESSION_MAX_ITEMS = int(os.getenv("CHAT_SESSION_MAX_ITEMS", "200"))
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
-OLLAMA_URL = ROUTING_CONFIG.ollama_url
-# Vision model defaults to CHAT_MODEL (gemma:e4b is multimodal)
-OLLAMA_VISION_MODEL: str = (
-    os.getenv("OLLAMA_VISION_MODEL")
+OPENAI_BASE_URL = ROUTING_CONFIG.openai_base_url
+# Vision model defaults to CHAT_MODEL (gemma-4 is multimodal)
+OPENAI_VISION_MODEL: str = (
+    os.getenv("OPENAI_VISION_MODEL")
     or CHAT_MODEL
 )
 # Startup chat-model warmup: pre-loads the (large) chat model into VRAM so the
-# first /chat doesn't pay the one-time model-load. Kept in sync with the
-# OLLAMA_KEEP_ALIVE the ollama service is started with.
+# first /chat doesn't pay the one-time model-load.
 CHAT_MODEL_WARMUP = os.getenv("CHAT_MODEL_WARMUP", "true").strip().lower() == "true"
 CHAT_MODEL_WARMUP_TIMEOUT_S = float(os.getenv("CHAT_MODEL_WARMUP_TIMEOUT_S", "180"))
-CHAT_MODEL_KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")
+CHAT_MODEL_KEEP_ALIVE = os.getenv("OPENAI_KEEP_ALIVE", "30m")
 MEMORY_CONSOLIDATION_BATCH_SIZE = int(os.getenv("MEMORY_CONSOLIDATION_BATCH_SIZE", "50"))
 _GENERIC_STREAM_ERROR_TEXT = "⚠ Something went wrong. Please try again."
 
@@ -350,8 +349,8 @@ def _validate_startup() -> None:
     _bootstrap_beets_library_if_empty()
 
     log.info(
-        "Startup OK | chat_model=%s | ollama=%s | cors_origins=%s | cookie_secure=%s",
-        CHAT_MODEL, OLLAMA_URL, _CORS_ORIGINS, SESSION_COOKIE_SECURE,
+        "Startup OK | chat_model=%s | openai_base_url=%s | cors_origins=%s | cookie_secure=%s",
+        CHAT_MODEL, OPENAI_BASE_URL, _CORS_ORIGINS, SESSION_COOKIE_SECURE,
     )
 
 _validate_startup()
@@ -509,8 +508,8 @@ async def _graph_lifespan(_app: FastAPI):
     chat_warmup_task = asyncio.create_task(warmup_chat_model())
     embed_router = None
     # Retry the router build with backoff: the backend can start before
-    # Ollama is fully ready (depends_on only waits for container start), and
-    # the first embed call also has to load the model into VRAM.
+    # the inference server is fully ready, and the first embed call also
+    # has to load the model into VRAM.
     max_attempts = max(1, int(os.getenv("ROUTER_EMBEDDING_RETRIES", "3")))
     retry_backoff = max(0.0, float(os.getenv("ROUTER_EMBEDDING_RETRY_BACKOFF_SECONDS", "2.0")))
     warm_ok = False
@@ -728,8 +727,8 @@ def _estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
-def _ollama_think_setting() -> bool | str:
-    raw = (os.getenv("OLLAMA_THINK", "true") or "").strip().lower()
+def _openai_think_setting() -> bool | str:
+    raw = (os.getenv("OPENAI_THINK", "true") or "").strip().lower()
     if raw in {"0", "false", "no", "off"}:
         return False
     if raw in {"low", "medium", "high", "max"}:
@@ -740,8 +739,8 @@ def _ollama_think_setting() -> bool | str:
 async def warmup_chat_model() -> bool:
     """Pre-load the chat model into VRAM so the first /chat is fast.
 
-    Mirrors warmup_embedding_router(): a single minimal /api/generate probe
-    with a generous timeout absorbs the cold model load at startup. Returns
+    Mirrors warmup_embedding_router(): a single minimal /v1/chat/completions
+    probe with a generous timeout absorbs the cold model load at startup. Returns
     True on success. On failure it logs a diagnosable error (never an empty
     ``error=``) and returns False; a warmup failure must never block startup.
     """
@@ -750,14 +749,13 @@ async def warmup_chat_model() -> bool:
         return False
     payload = {
         "model": CHAT_MODEL,
-        "prompt": "warmup",
+        "messages": [{"role": "user", "content": "warmup"}],
+        "max_tokens": 1,
         "stream": False,
-        "num_predict": 1,
-        "keep_alive": CHAT_MODEL_KEEP_ALIVE,
     }
     try:
         async with httpx.AsyncClient(timeout=CHAT_MODEL_WARMUP_TIMEOUT_S) as client:
-            resp = await client.post(f"{OLLAMA_URL}/api/generate", json=payload)
+            resp = await client.post(f"{OPENAI_BASE_URL}/chat/completions", json=payload)
             resp.raise_for_status()
         log.info("chat_warmup.ready | model=%s", CHAT_MODEL)
         return True
@@ -772,29 +770,41 @@ async def warmup_chat_model() -> bool:
 
 
 async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
-    think_mode = _ollama_think_setting()
+    think_mode = _openai_think_setting()
     async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", f"{OLLAMA_URL}/api/generate", json={
+        messages = [
+            {"role": "system", "content": request.system},
+            {"role": "user", "content": request.message},
+        ]
+        # Add thinking/reasoning if enabled (llama.cpp --thinking support)
+        if think_mode:
+            if think_mode is True:
+                think_mode = "high"
+            messages.append({"role": "user", "content": f"[START_THINKING]\n[END_THINKING]"})
+        async with client.stream("POST", f"{OPENAI_BASE_URL}/chat/completions", json={
             "model": model_name,
-            "prompt": request.message,
-            "system": request.system,
+            "messages": messages,
             "stream": True,
-            "think": think_mode,
+            "max_tokens": 4096,
         }) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
-                if line:
-                    data = json.loads(line)
-                    thinking = data.get("thinking") or data.get("message", {}).get("thinking", "")
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    # Handle thinking/reasoning content
+                    thinking = delta.get("reasoning_content", "") or delta.get("thinking", "")
                     if thinking:
                         yield {"thinking": thinking}
-
-                    text = data.get("response") or data.get("message", {}).get("content", "")
+                    text = delta.get("content", "")
                     if text:
                         yield {"text": text}
-
-                    if data.get("done"):
-                        break
 
 
 # ── Vision helpers ─────────────────────────────────────────────────────────────
@@ -823,35 +833,44 @@ async def stream_local_vision(
     request: ChatRequest,
     image_base64: str,
     image_mime: str,
-    model_name: str = OLLAMA_VISION_MODEL,
+    model_name: str = OPENAI_VISION_MODEL,
 ):
-    """Ollama /api/chat endpoint with image tokens (multimodal forward pass).
-
-    The system prompt is embedded into the user message content because
-    Ollama's /api/chat endpoint ignores the "system" role for most models.
-    """
+    """OpenAI-compatible /v1/chat/completions with image tokens (multimodal forward pass)."""
     system_content = request.system or CHAT_DEFAULT_SYSTEM_PROMPT
-    user_msg: dict = {
-        "role": "user",
-        "content": f"{system_content}\n\n{request.message}",
-        "images": [image_base64],
-    }
+    # Build user message content array with text + image
+    user_content: list[dict] = [
+        {"type": "text", "text": f"{system_content}\n\n{request.message}"},
+    ]
+    # llama.cpp supports OpenAI-style image content
+    user_content.append({
+        "type": "image_url",
+        "image_url": {"url": f"data:{image_mime};base64,{image_base64}"},
+    })
     payload = {
         "model": model_name,
-        "messages": [user_msg],
+        "messages": [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": user_content},
+        ],
         "stream": True,
+        "max_tokens": 4096,
     }
     async with httpx.AsyncClient(timeout=120) as client:
-        async with client.stream("POST", f"{OLLAMA_URL}/api/chat", json=payload) as resp:
+        async with client.stream("POST", f"{OPENAI_BASE_URL}/chat/completions", json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
-                if line:
-                    data = json.loads(line)
-                    chunk = data.get("message", {}).get("content", "")
+                if line.startswith("data: "):
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    chunk = delta.get("content", "")
                     if chunk:
                         yield chunk
-                    if data.get("done"):
-                        break
 
 async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[override]
     api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -908,7 +927,7 @@ def _make_graph_deps(*, embedding_router=None) -> AssistantGraphDependencies:
         tool_dispatch=_late_tool_dispatch,
         chat_model=CHAT_MODEL,
         cloud_model=CLOUD_MODEL,
-        vision_model=OLLAMA_VISION_MODEL,
+        vision_model=OPENAI_VISION_MODEL,
     )
 
 

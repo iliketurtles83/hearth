@@ -89,11 +89,11 @@ async def test_warmup_chat_model_success(monkeypatch: pytest.MonkeyPatch, caplog
 
     assert ok is True
     assert calls["n"] == 1
-    assert calls["url"] == f"{main.OLLAMA_URL}/api/generate"
+    assert calls["url"] == f"{main.OPENAI_BASE_URL}/chat/completions"
     payload = calls["payload"]
     assert payload["model"] == main.CHAT_MODEL
-    assert payload["keep_alive"] == main.CHAT_MODEL_KEEP_ALIVE
-    assert payload["num_predict"] == 1
+    assert payload["messages"] == [{"role": "user", "content": "warmup"}]
+    assert payload["max_tokens"] == 1
     assert payload["stream"] is False
     assert "chat_warmup.ready" in caplog.text
 

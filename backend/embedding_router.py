@@ -342,21 +342,23 @@ class EmbeddingIntentRouter:
         return self.classify_embedding(embedding)
 
 
-async def ollama_embed_text(
+async def openai_embed_text(
     text: str,
     *,
     base_url: str,
     model: str,
     timeout_seconds: float = 8.0,
 ) -> np.ndarray:
-    payload = {"model": model, "prompt": text}
+    payload = {"model": model, "input": text}
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
-        response = await client.post(f"{base_url.rstrip('/')}/api/embeddings", json=payload)
+        response = await client.post(f"{base_url}/embeddings", json=payload)
         response.raise_for_status()
         data = response.json()
-    vector = np.asarray(data.get("embedding", []), dtype=np.float32)
+    # OpenAI format: {"data": [{"embedding": [...]}]}
+    embedding_list = data.get("data", [{}])[0].get("embedding", [])
+    vector = np.asarray(embedding_list, dtype=np.float32)
     if vector.ndim != 1 or vector.size == 0:
-        raise ValueError("Invalid embedding payload from Ollama")
+        raise ValueError("Invalid embedding payload from OpenAI-compatible endpoint")
     return vector
 
 
@@ -372,15 +374,15 @@ async def build_embedding_router(
     tool_bank = tool_exemplars or DEFAULT_TOOL_EXEMPLARS
     dialogue_bank = dialogue_exemplars or DEFAULT_DIALOGUE_EXEMPLARS
 
-    ollama_url = (base_url or os.getenv("OLLAMA_URL", "http://ollama:11434")).rstrip("/")
+    embed_base_url = (base_url or os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
     embed_model = model or os.getenv("ROUTER_EMBED_MODEL", ROUTER_EMBED_MODEL)
 
     # Absorb the cold embed-model load on a single probe with a generous
     # timeout so the per-exemplar calls below don't trip `timeout_seconds`
-    # while Ollama is still loading the model into VRAM.
-    await ollama_embed_text(
+    # while the inference server is still loading the model into VRAM.
+    await openai_embed_text(
         "hearth embedding router warmup",
-        base_url=ollama_url,
+        base_url=embed_base_url,
         model=embed_model,
         timeout_seconds=warmup_timeout_seconds,
     )
@@ -393,9 +395,9 @@ async def build_embedding_router(
 
     rows: list[list[float]] = []
     for text in all_texts:
-        vec = await ollama_embed_text(
+        vec = await openai_embed_text(
             text,
-            base_url=ollama_url,
+            base_url=embed_base_url,
             model=embed_model,
             timeout_seconds=timeout_seconds,
         )

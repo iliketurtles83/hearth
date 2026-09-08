@@ -47,10 +47,21 @@ import main  # noqa: E402
 
 
 def _route_endpoint(path: str, method: str):
-    for route in main.app.routes:
-        if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
-            return route.endpoint
-    raise AssertionError(f"Route not found: {method} {path}")
+    """Find a route endpoint by path and method, recursing into included routers."""
+    def _search(routes):
+        for route in routes:
+            # _IncludedRouter wraps the APIRouter in original_router
+            if hasattr(route, 'original_router'):
+                result = _search(route.original_router.routes)
+                if result:
+                    return result
+            if getattr(route, "path", None) == path and method in getattr(route, "methods", set()):
+                return route.endpoint
+        return None
+    result = _search(main.app.routes)
+    if result is None:
+        raise AssertionError(f"Route not found: {method} {path}")
+    return result
 
 
 # The /transcribe handler lives in routes/voice_routes.py; reach it through the router.

@@ -20,12 +20,12 @@ from routing_config import ROUTING_CONFIG
 
 
 CHAT_MODEL: str = (
-    os.getenv("OLLAMA_CHAT_MODEL")
+    os.getenv("OPENAI_CHAT_MODEL")
     or os.getenv("MODEL_LOCAL")
     or "llama3.2"
 )
 VISION_MODEL: str = (
-    os.getenv("OLLAMA_VISION_MODEL")
+    os.getenv("OPENAI_VISION_MODEL")
     or CHAT_MODEL
 )
 LOCAL_MODEL = CHAT_MODEL

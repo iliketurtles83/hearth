@@ -45,14 +45,15 @@ from intents import (
 )
 from embedding_router import (
     EmbeddingRouterSnapshotMismatchError,
-    ollama_embed_text,
+    openai_embed_text,
 )
 from routing_config import ROUTING_CONFIG
 from tools.weather import format_weather_response, is_weather_reasoning
 
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
-OLLAMA_URL = ROUTING_CONFIG.ollama_url
+OPENAI_BASE_URL = ROUTING_CONFIG.openai_base_url
+OPENAI_EMBED_BASE_URL = ROUTING_CONFIG.openai_embed_base_url
 ROUTER_EMBEDDING_ENABLED = ROUTING_CONFIG.router_embedding_enabled
 ROUTER_EMBED_MODEL = ROUTING_CONFIG.router_embed_model
 ROUTER_EMBED_TIMEOUT_MS = ROUTING_CONFIG.router_embed_timeout_ms
@@ -583,9 +584,9 @@ def build_assistant_graph(
                 decision = _heuristic_fallback()
             else:
                 try:
-                    query_embedding = await ollama_embed_text(
+                    query_embedding = await openai_embed_text(
                         state["message"],
-                        base_url=OLLAMA_URL,
+                        base_url=OPENAI_EMBED_BASE_URL,
                         model=ROUTER_EMBED_MODEL,
                         timeout_seconds=ROUTER_EMBED_TIMEOUT_MS / 1000.0,
                     )
@@ -839,7 +840,7 @@ def build_assistant_graph(
                     response_text = (
                         "I can't process this image right now — the local vision model and "
                         "cloud fallback are both unavailable. "
-                        "Run `ollama pull gemma:e4b` to enable local image understanding."
+                        "Run `llama-server` with the vision-capable model to enable local image understanding."
                     )
                     writer({"text": response_text})
 

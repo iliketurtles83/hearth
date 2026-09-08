@@ -96,19 +96,21 @@ class MemoryCommand:
     query: str | None = None
 
 
-def _ollama_embed_sync(text: str, *, base_url: str, model: str) -> list[float] | None:
-    """Synchronous embedding call via Ollama /api/embeddings.
+def _openai_embed_sync(text: str, *, base_url: str, model: str) -> list[float] | None:
+    """Synchronous embedding call via OpenAI-compatible /v1/embeddings.
 
-    Returns None when Ollama is unreachable so callers can fall back
+    Returns None when the endpoint is unreachable so callers can fall back
     to deterministic hash-based embeddings.
     """
     try:
         payload = {"model": model, "input": text}
         with httpx.Client(timeout=5.0) as client:
-            resp = client.post(f"{base_url.rstrip('/')}/api/embeddings", json=payload)
+            resp = client.post(f"{base_url}/embeddings", json=payload)
             resp.raise_for_status()
             data = resp.json()
-        vector = np.asarray(data.get("embedding", []), dtype=np.float32)
+        # OpenAI format: {"data": [{"embedding": [...]}]}
+        embedding_list = data.get("data", [{}])[0].get("embedding", [])
+        vector = np.asarray(embedding_list, dtype=np.float32)
         if vector.ndim != 1 or vector.size == 0:
             return None
         return vector.tolist()
@@ -116,10 +118,10 @@ def _ollama_embed_sync(text: str, *, base_url: str, model: str) -> list[float] |
         return None
 
 
-class OllamaEmbeddingFunction(EmbeddingFunction):
-    """ChromaDB embedding function backed by local Ollama (nomic-embed-text).
+class OpenAIEmbeddingFunction(EmbeddingFunction):
+    """ChromaDB embedding function backed by local OpenAI-compatible endpoint (nomic-embed-text).
 
-    Embeddings are cached per instance.  If Ollama is unreachable the
+    Embeddings are cached per instance.  If the endpoint is unreachable the
     function falls back to a deterministic hash-based embedding so that
     ChromaDB operations never crash.
     """
@@ -130,7 +132,7 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         model: str | None = None,
         fallback_dim: int = 192,
     ) -> None:
-        self._base_url = (base_url or os.getenv("OLLAMA_URL", "http://ollama:11434")).rstrip("/")
+        self._base_url = (base_url or os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
         self._model = model or os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
         self._fallback_dim = fallback_dim
         self._cache: dict[str, list[float]] = {}
@@ -140,10 +142,10 @@ class OllamaEmbeddingFunction(EmbeddingFunction):
         if cached is not None:
             return cached
 
-        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+        openai_url = (os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
         embed_model = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
 
-        vec = _ollama_embed_sync(text, base_url=ollama_url, model=embed_model)
+        vec = _openai_embed_sync(text, base_url=openai_url, model=embed_model)
         if vec is not None:
             self._cache[text] = vec
             return vec
@@ -199,7 +201,7 @@ class MemoryStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_db()
 
-        self._embedder = OllamaEmbeddingFunction()
+        self._embedder = OpenAIEmbeddingFunction()
         self._chroma = chromadb.PersistentClient(path=self.chroma_path)
         self._collection = self._chroma.get_or_create_collection(
             name="conversation_memory",
@@ -215,10 +217,10 @@ class MemoryStore:
         collection will reject new embeddings.  Detect the mismatch
         and recreate the collection so the new embedder takes effect.
         """
-        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+        openai_url = (os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
         embed_model = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
         try:
-            vec = _ollama_embed_sync("probe", base_url=ollama_url, model=embed_model)
+            vec = _openai_embed_sync("probe", base_url=openai_url, model=embed_model)
             if vec is None:
                 return
             new_dim = len(vec)
@@ -673,10 +675,10 @@ class MemoryStore:
         return list(unique.values())
 
     async def _llm_extract_memory(self, text: str, source: str) -> MemoryExtraction:
-        """Extract semantic memory (facts, preferences, triples) via Ollama /api/chat.
+        """Extract semantic memory (facts, preferences, triples) via OpenAI-compatible /v1/chat/completions.
 
         Runs a single structured extraction call and returns a MemoryExtraction.
-        Gracefully returns an empty MemoryExtraction on Ollama unreachability,
+        Gracefully returns an empty MemoryExtraction on endpoint unreachability,
         network error, or JSON parse failure so consolidation never crashes.
         """
         if not text or not text.strip():
@@ -686,9 +688,9 @@ class MemoryStore:
         # contain the most recent, highest-value facts).
         text = text.strip()[-1500:] if len(text.strip()) > 1500 else text.strip()
 
-        ollama_url = os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/")
+        openai_url = (os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
         chat_model = (
-            os.getenv("OLLAMA_CHAT_MODEL")
+            os.getenv("OPENAI_CHAT_MODEL")
             or os.getenv("MODEL_LOCAL")
             or "llama3.2"
         )
@@ -700,23 +702,21 @@ class MemoryStore:
                 {"role": "user", "content": text},
             ],
             "stream": False,
-            "format": "json",
-            "options": {
-                "num_predict": 600,  # Budget for facts + preferences + triples
-                "temperature": 0.1,  # Low temp for deterministic extraction
-            },
+            "response_format": {"type": "json_object"},
+            "max_tokens": 2048,
+            "temperature": 0.1,
         }
 
         try:
-            timeout = 10.0  # Generous timeout; consolidation is non-blocking
+            timeout = 120.0  # gemma4:e4b needs 50-70s with full system prompt
             async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(f"{ollama_url}/api/chat", json=payload)
+                resp = await client.post(f"{openai_url}/chat/completions", json=payload)
                 resp.raise_for_status()
                 data = resp.json()
-                raw_response = data.get("message", {}).get("content", "{}")
+                raw_response = data.get("choices", [{}])[0].get("message", {}).get("content", "")
         except httpx.ConnectError as e:
             log.warning(
-                "memory.llm_extract | extraction_failed=ollama_unreachable error=%s",
+                "memory.llm_extract | extraction_failed=endpoint_unreachable error=%s",
                 str(e),
             )
             return MemoryExtraction(candidates=[], triples=[])

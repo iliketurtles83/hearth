@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 # ── Validation helper ─────────────────────────────────────────────────────────
 
-from main import _validate_image, OLLAMA_VISION_MODEL, CHAT_MODEL
+from main import _validate_image, OPENAI_VISION_MODEL, CHAT_MODEL
 
 
 def _make_b64(nbytes: int = 64) -> str:

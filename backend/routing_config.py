@@ -11,7 +11,8 @@ class RoutingConfig:
     Fields:
     - chat_token_budget: token budget used for history selection.
     - chat_max_turns: max conversational turns retained for prompt building.
-    - ollama_url: base URL for local model API calls.
+    - openai_base_url: base URL for local model API calls (OpenAI-compatible endpoint).
+    - openai_embed_base_url: base URL for embedding API calls (separate from chat if needed).
     - route_confidence_threshold: minimum confidence for cloud reasoning routes.
     - router_embedding_enabled: enables embedding-based intent routing.
     - router_embed_model: embedding model name for query/exemplar embeddings.
@@ -21,7 +22,8 @@ class RoutingConfig:
 
     chat_token_budget: int
     chat_max_turns: int
-    ollama_url: str
+    openai_base_url: str
+    openai_embed_base_url: str
     route_confidence_threshold: float
     router_embedding_enabled: bool
     router_embed_model: str
@@ -33,7 +35,8 @@ def load_routing_config() -> RoutingConfig:
     return RoutingConfig(
         chat_token_budget=int(os.getenv("CHAT_TOKEN_BUDGET", "1500")),
         chat_max_turns=int(os.getenv("CHAT_MAX_TURNS", "24")),
-        ollama_url=os.getenv("OLLAMA_URL", "http://ollama:11434").rstrip("/"),
+        openai_base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:10000/v1").rstrip("/"),
+        openai_embed_base_url=(os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/"),
         route_confidence_threshold=float(os.getenv("ROUTE_CONFIDENCE_THRESHOLD", "0.55")),
         router_embedding_enabled=os.getenv("ROUTER_EMBEDDING_ENABLED", "true").lower() == "true",
         router_embed_model=os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text"),

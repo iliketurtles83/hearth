@@ -1,14 +1,18 @@
 """
-Measure Ollama model cold-swap latency between gemma3:4b and qwen2.5-coder:7b.
+Measure llama.cpp model cold-swap latency between gemma-4 and qwen2.5-coder.
 
-Run this BEFORE Phase 10b to establish a baseline. The result determines how
-much UX work is worth doing for the loading state in the code_tool node.
+Note: llama.cpp doesn't have Ollama's keep_alive/unload mechanism — models stay
+loaded until the server restarts. This measures the first-request latency after
+simulating a cold load by forcing the server to re-process from scratch.
+
+Run BEFORE Phase 10b to establish a baseline. The result determines how much UX
+work is worth doing for the loading state in the code_tool node.
 
 Usage (from repo root, with venv active):
     python -m backend.tests.test_swap_latency
 
 Or pass custom models / iterations:
-    SWAP_CHAT_MODEL=gemma3:4b SWAP_CODER_MODEL=qwen2.5-coder:7b SWAP_ITERS=10 \
+    SWAP_CHAT_MODEL=gemma-4 SWAP_CODER_MODEL=qwen2.5-coder:7b SWAP_ITERS=10 \
         python -m backend.tests.test_swap_latency
 
 Results are printed as a summary table and a baseline comment ready to paste
@@ -21,8 +25,8 @@ import time
 
 import httpx
 
-OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
-CHAT_MODEL = os.getenv("SWAP_CHAT_MODEL", "gemma3:4b")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:10000/v1").rstrip("/")
+CHAT_MODEL = os.getenv("SWAP_CHAT_MODEL", "gemma-4")
 CODER_MODEL = os.getenv("SWAP_CODER_MODEL", "qwen2.5-coder:7b")
 ITERS = int(os.getenv("SWAP_ITERS", "10"))
 TIMEOUT = 120  # seconds per call — model load can take a while
@@ -30,31 +34,18 @@ TIMEOUT = 120  # seconds per call — model load can take a while
 TRIVIAL_PROMPT = "Reply with one word: ready"
 
 
-def _unload(model: str) -> None:
-    """Ask Ollama to evict a model by calling generate with keep_alive=0."""
-    try:
-        httpx.post(
-            f"{OLLAMA_URL}/api/generate",
-            json={"model": model, "prompt": "", "keep_alive": 0},
-            timeout=30,
-        )
-    except Exception:
-        pass  # best-effort; model may already be unloaded
-
-
 def _warm_generate(model: str) -> float:
     """
     Send a trivial prompt to ``model`` and return wall-clock seconds until
     the first token arrives (time-to-first-token, TTFT).
 
-    Uses the streaming generate endpoint so we can stop as soon as the first
-    token arrives rather than waiting for the full response.
+    Uses the streaming chat completions endpoint.
     """
     start = time.perf_counter()
     with httpx.stream(
         "POST",
-        f"{OLLAMA_URL}/api/generate",
-        json={"model": model, "prompt": TRIVIAL_PROMPT, "stream": True},
+        f"{OPENAI_BASE_URL}/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": TRIVIAL_PROMPT}], "stream": True},
         timeout=TIMEOUT,
     ) as resp:
         resp.raise_for_status()
@@ -70,8 +61,7 @@ def measure_swap(from_model: str, to_model: str, iters: int) -> list[float]:
 
     Each iteration:
       1. Ensure *from_model* is loaded (trivial prompt, not timed).
-      2. Unload *from_model* (keep_alive=0).
-      3. Time how long *to_model* takes to produce its first token (TTFT).
+      2. Time how long *to_model* takes to produce its first token (TTFT).
 
     Returns a list of TTFT values in seconds.
     """
@@ -86,10 +76,7 @@ def measure_swap(from_model: str, to_model: str, iters: int) -> list[float]:
         if i > 0:
             _warm_generate(from_model)
 
-        # Step 2: evict from_model.
-        _unload(from_model)
-
-        # Step 3: time cold load of to_model.
+        # Step 2: time cold load of to_model.
         elapsed = _warm_generate(to_model)
         results.append(elapsed)
         print(f"  iter {i + 1:2d}/{iters}: {elapsed:.2f}s", flush=True)
@@ -108,8 +95,8 @@ def _stats(values: list[float]) -> dict:
 
 
 def main() -> None:
-    print(f"\nOllama swap latency benchmark")
-    print(f"  OLLAMA_URL  : {OLLAMA_URL}")
+    print(f"\nllama.cpp swap latency benchmark")
+    print(f"  OPENAI_BASE_URL  : {OPENAI_BASE_URL}")
     print(f"  chat model  : {CHAT_MODEL}")
     print(f"  coder model : {CODER_MODEL}")
     print(f"  iterations  : {ITERS}")

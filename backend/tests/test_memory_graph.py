@@ -18,9 +18,9 @@ from memory import MemoryStore  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def mock_ollama_embed_sync(monkeypatch):
-    """Keep the embedder deterministic (no Ollama) and uniform-dimensioned."""
-    monkeypatch.setattr("memory._ollama_embed_sync", lambda *a, **kw: [0.0] * 768)
+def mock_openai_embed_sync(monkeypatch):
+    """Keep the embedder deterministic (no endpoint) and uniform-dimensioned."""
+    monkeypatch.setattr("memory._openai_embed_sync", lambda *a, **kw: [0.0] * 768)
 
 
 @pytest.fixture

@@ -5,14 +5,14 @@ and that no data leaks across users.
 """
 import pytest
 
-from memory import MemoryStore, _ollama_embed_sync
+from memory import MemoryStore, _openai_embed_sync
 
 
 @pytest.fixture(autouse=True)
-def mock_ollama_embed_sync(monkeypatch):
-    """Prevent OllamaEmbeddingFunction from hitting Ollama during init."""
+def mock_openai_embed_sync(monkeypatch):
+    """Prevent OpenAIEmbeddingFunction from hitting the endpoint during init."""
     monkeypatch.setattr(
-        "memory._ollama_embed_sync",
+        "memory._openai_embed_sync",
         lambda *a, **kw: [0.0] * 768,
     )
 
@@ -150,16 +150,20 @@ def test_consolidate_pending_promotes_summary_facts(store):
     import json
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    # Mock Ollama response with extracted facts
+    # Mock OpenAI-compatible /v1/chat/completions response with extracted facts
     mock_response = {
-        "message": {
-            "content": json.dumps({
-                "candidates": [
-                    {"key": "name", "value": "Alice", "type": "fact", "confidence": 0.95},
-                    {"key": "location", "value": "Tallinn", "type": "fact", "confidence": 0.90},
-                ]
-            })
-        }
+        "choices": [{
+            "message": {
+                "content": json.dumps({
+                    "facts": [
+                        {"key": "name", "value": "Alice", "confidence": 0.95},
+                        {"key": "location", "value": "Tallinn", "confidence": 0.90},
+                    ],
+                    "preferences": [],
+                    "triples": [],
+                })
+            }
+        }]
     }
 
     async def mock_post_fn(*args, **kwargs):
@@ -248,38 +252,29 @@ def test_llm_extract_filters_by_confidence(store, monkeypatch):
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    # Mock Ollama /api/chat response with mixed confidence scores
+    # Mock OpenAI-compatible /v1/chat/completions response with mixed confidence scores
     mock_response = {
-        "message": {
-            "content": json.dumps({
-                "candidates": [
-                    {
-                        "key": "favorite_language",
-                        "value": "Python",
-                        "type": "preference",
-                        "confidence": 0.95,  # High confidence → included
-                    },
-                    {
-                        "key": "workspace_language",
-                        "value": "JavaScript",
-                        "type": "preference",
-                        "confidence": 0.6,  # Low confidence → filtered out
-                    },
-                    {
-                        "key": "location",
-                        "value": "Helsinki",
-                        "type": "fact",
-                        "confidence": 0.85,  # High confidence → included
-                    },
-                    {
-                        "key": "maybe_interest",
-                        "value": "machine learning",
-                        "type": "fact",
-                        "confidence": 0.65,  # Below threshold → filtered out
-                    },
-                ]
-            })
-        }
+        "choices": [{
+            "message": {
+                "content": json.dumps({
+                    "facts": [
+                        {
+                            "key": "location",
+                            "value": "Helsinki",
+                            "confidence": 0.85,
+                        },
+                    ],
+                    "preferences": [
+                        {
+                            "key": "favorite_language",
+                            "value": "Python",
+                            "confidence": 0.95,
+                        },
+                    ],
+                    "triples": [],
+                })
+            }
+        }]
     }
 
     async def mock_post_fn(*args, **kwargs):
@@ -315,7 +310,7 @@ def test_llm_extract_json_parse_failure(store, monkeypatch):
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    # Mock Ollama /api/chat response with invalid JSON in message.content
+    # Mock endpoint /v1/chat/completions response with invalid JSON in message.content
     async def mock_post_fn(*args, **kwargs):
         resp = MagicMock()
         resp.json = MagicMock(return_value={"message": {"content": "not valid json { [ }"}})
@@ -338,15 +333,15 @@ def test_llm_extract_json_parse_failure(store, monkeypatch):
     assert candidates == []
 
 
-def test_llm_extract_ollama_unreachable(store, monkeypatch):
+def test_llm_extract_endpoint_unreachable(store, monkeypatch):
     """LLM extraction must gracefully handle Ollama unreachability (Phase 12b)."""
     import asyncio
     from unittest.mock import patch, AsyncMock, MagicMock
     import httpx
 
-    # Mock Ollama connection error
+    # Mock endpoint connection error
     async def mock_post_fn(*args, **kwargs):
-        raise httpx.ConnectError("Failed to connect to Ollama")
+        raise httpx.ConnectError("Failed to connect to endpoint")
 
     async_client_mock = MagicMock()
     async_client_mock.post = mock_post_fn
@@ -354,7 +349,7 @@ def test_llm_extract_ollama_unreachable(store, monkeypatch):
     async_client_mock.__aexit__ = AsyncMock(return_value=None)
 
     with patch("httpx.AsyncClient", return_value=async_client_mock):
-        # Call extraction when Ollama is unreachable
+        # Call extraction when endpoint is unreachable
         candidates = asyncio.run(store._llm_extract_candidates(
             "User: Some test content",
             source="test"
@@ -369,7 +364,7 @@ def test_consolidate_uses_llm_extraction(store, monkeypatch):
     import json
     from unittest.mock import patch, AsyncMock, MagicMock
 
-    # Mock Ollama /api/chat response with realistic extraction
+    # Mock endpoint /v1/chat/completions response with realistic extraction
     mock_response = {
         "message": {
             "content": json.dumps({
