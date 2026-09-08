@@ -5,7 +5,9 @@ __pycache__
 *.pyc
 .venv/
 .vscode
-.github
+# Track the CI workflow but keep local .github helpers (e.g. copilot-instructions.md) out of the repo.
+.github/*
+!.github/workflows/
 *.onnx
 *.mp3
 *.bin

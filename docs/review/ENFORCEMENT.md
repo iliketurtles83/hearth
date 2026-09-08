@@ -2,6 +2,14 @@
 
 This document explains how to enforce the review controls introduced in this repository.
 
+> **Current status.** Only the `backend-review-gates` workflow
+> (`.github/workflows/backend-review-gates.yml`) is in place, and its required
+> checks are the focused regression tests + gitleaks (`pip-audit` and `bandit`
+> are advisory, non-blocking). Items described below that are **not yet added**:
+> the `changed-files-fast-tests` job, `.github/CODEOWNERS`, and
+> `.github/pull_request_template.md`. `.gitignore` un-ignores `.github/workflows/`
+> only, so those files need their own ignore exceptions before they can be committed.
+
 ## 1. Enable Required Reviews (GitHub Branch Protection)
 
 For the protected branch (usually `main`):

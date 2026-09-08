@@ -278,6 +278,7 @@ Open UI:
 This repository includes baseline review controls for security and correctness:
 
 - Local baseline script: `scripts/review_baseline.sh`
+- CI workflow: `.github/workflows/backend-review-gates.yml`
 - Review checklist: `docs/review/SECURITY_CORRECTNESS_CHECKLIST.md`
 - Enforcement guide: `docs/review/ENFORCEMENT.md`
 
@@ -287,6 +288,25 @@ Run local checks before opening a PR:
 bash scripts/review_changed_tests.sh --base origin/main
 bash scripts/review_baseline.sh
 ```
+
+### CI (GitHub Actions)
+
+The `backend-review-gates` workflow runs on every pull request and on push to
+`main`. It mirrors `scripts/review_baseline.sh`:
+
+- **Required (blocking):** the focused regression suite
+  (`test_auth`, `test_router`, `test_graph`, `test_memory_isolation`,
+  `test_weather`) and a **gitleaks** secret scan.
+- **Advisory (non-blocking, `continue-on-error`):** `pip-audit` dependency
+  vulnerability audit and `bandit` static security scan. These run for signal
+  but never hard-block a merge, since they only run locally when installed and
+  a fresh vulnerability database can introduce time-dependent findings.
+
+> **Enforcing the gate.** The workflow running is not the same as it blocking.
+> To make required checks gate merges: repository **Settings → Branches →
+> `main` → Require status checks to pass before merging**, then add
+> `backend-review-gates`. Until that is set, PRs will show the check result but
+> can still be merged while it is red.
 
 Optional local iteration mode (does not affect CI):
 
@@ -298,7 +318,10 @@ Known-failures deselection list is stored at `docs/review/KNOWN_FAILURES.txt`.
 
 Notes:
 
-- CI always runs secret scanning via gitleaks.
+- CI runs secret scanning via gitleaks as a **required** check; `pip-audit` and
+  `bandit` run as advisory, non-blocking steps.
+- The known-failures list (`docs/review/KNOWN_FAILURES.txt`) is local-only — CI
+  does not apply it.
 - Local secret scanning runs automatically when `gitleaks` is installed.
 
 ## Wake Word Models
