@@ -63,6 +63,7 @@ from app_schemas import (
     TTSRequest,
     CodeRequest as BaseCodeRequest,
     SessionSelectRequest,
+    SessionRenameRequest,
 )
 import tts
 

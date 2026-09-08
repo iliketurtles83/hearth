@@ -73,6 +73,7 @@ _list_sessions_ep = _route_endpoint("/chat/sessions", "GET")
 _get_messages_ep = _route_endpoint("/chat/session/messages", "GET")
 _select_session_ep = _route_endpoint("/chat/session/select", "POST")
 _delete_session_ep = _route_endpoint("/chat/sessions/{session_id}", "DELETE")
+_rename_session_ep = _route_endpoint("/chat/sessions/{session_id}", "PATCH")
 _reset_session_ep = _route_endpoint("/chat/session", "DELETE")
 _get_state_ep = _route_endpoint("/graph/state/{session_id}", "GET")
 _health_ep = _route_endpoint("/health", "GET")
@@ -95,10 +96,12 @@ async def _read_sse_events(streaming_response) -> list[str]:
 def clear_session_store():
     main.memory_store._conn.execute("DELETE FROM conversation_log")
     main.memory_store._conn.execute("DELETE FROM summaries")
+    main.memory_store._conn.execute("DELETE FROM session_titles")
     main.memory_store._conn.commit()
     yield
     main.memory_store._conn.execute("DELETE FROM conversation_log")
     main.memory_store._conn.execute("DELETE FROM summaries")
+    main.memory_store._conn.execute("DELETE FROM session_titles")
     main.memory_store._conn.commit()
 
 
@@ -173,6 +176,73 @@ async def test_delete_chat_session_clears_checkpoint_thread_for_owned_session(mo
     assert payload["ok"] is True
     assert payload["session_id"] == session_id
     assert cleared == [session_id]
+
+
+@pytest.mark.asyncio
+async def test_rename_chat_session_sets_title():
+    session_id = "sess-rename"
+    main.memory_store.log_turn(session_id, "alice", "user", "hello world")
+
+    response = await _rename_session_ep(
+        session_id, main.SessionRenameRequest(title="My Chat"), _request("alice")
+    )
+    payload = _json_body(response)
+
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert payload["title"] == "My Chat"
+
+    sessions = main.memory_store.list_sessions("alice")
+    assert len(sessions) == 1
+    assert sessions[0]["title"] == "My Chat"
+
+
+@pytest.mark.asyncio
+async def test_rename_chat_session_denies_other_users_session():
+    main.memory_store.log_turn("sess-alice", "alice", "user", "secret")
+
+    response = await _rename_session_ep(
+        "sess-alice", main.SessionRenameRequest(title="hack"), _request("bob")
+    )
+
+    assert response.status_code == 404
+    assert _json_body(response)["code"] == "SESSION_NOT_FOUND"
+    # Owner's title must remain untouched (empty = fall back to preview).
+    assert main.memory_store.list_sessions("alice")[0]["title"] == ""
+
+
+@pytest.mark.asyncio
+async def test_rename_chat_session_empty_title_clears():
+    session_id = "sess-rename-clear"
+    main.memory_store.log_turn(session_id, "alice", "user", "first message")
+    main.memory_store.set_session_title(session_id, "alice", "Custom")
+
+    response = await _rename_session_ep(
+        session_id, main.SessionRenameRequest(title="   "), _request("alice")
+    )
+    payload = _json_body(response)
+
+    assert payload["title"] == ""
+    sessions = main.memory_store.list_sessions("alice")
+    assert sessions[0]["title"] == ""
+    # Preview is still available as the display fallback.
+    assert sessions[0]["preview"] == "first message"
+
+
+@pytest.mark.asyncio
+async def test_delete_chat_session_clears_title():
+    session_id = "sess-delete-title"
+    main.memory_store.log_turn(session_id, "alice", "user", "hi")
+    main.memory_store.set_session_title(session_id, "alice", "Kept?")
+
+    await _delete_session_ep(session_id, _request("alice", session_id))
+
+    assert main.memory_store.list_sessions("alice") == []
+    row = main.memory_store._conn.execute(
+        "SELECT title FROM session_titles WHERE session_id = ? AND user_id = ?",
+        (session_id, "alice"),
+    ).fetchone()
+    assert row is None
 
 
 @pytest.mark.asyncio

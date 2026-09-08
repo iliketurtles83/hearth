@@ -100,7 +100,7 @@ body {
 #sidebar-main {
   flex: 1;
   min-height: 0;
-  overflow-y: auto;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   gap: 0.6rem;
@@ -153,6 +153,23 @@ body {
   border: none;
   border-radius: var(--radius);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+#sidebar-main > .panel {
+  min-height: 0;
+}
+
+#sidebar-main > .panel:not(.is-collapsed) {
+  flex: 1 1 0;
+}
+
+#sidebar-main > .panel.is-collapsed {
+  flex: 0 0 auto;
+}
+
+#sidebar-main .panel-body {
+  flex: 1 1 0;
+  min-height: 0;
 }
 
 .panel-header {
@@ -244,7 +261,8 @@ body {
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
-  max-height: 33dvh;
+  flex: 1 1 0;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -289,8 +307,66 @@ body {
   text-overflow: ellipsis;
 }
 
-.session-list-item .session-delete-btn {
+.session-kebab-btn {
   flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  border-radius: 6px;
+  min-width: 24px;
+  height: 24px;
+  padding: 0;
+  font-size: 1.05rem;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.5;
+  transition: opacity 0.15s ease, color 0.15s ease, background 0.15s ease;
+}
+
+.session-list-item:hover .session-kebab-btn,
+.session-list-item.active .session-kebab-btn,
+.session-kebab-btn:hover {
+  opacity: 1;
+  color: var(--text);
+}
+
+.session-kebab-btn:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.session-menu {
+  position: fixed;
+  z-index: 1100;
+  min-width: 148px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  padding: 0.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+}
+
+.session-menu-item {
+  border: none;
+  background: transparent;
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 0.82rem;
+  font-family: var(--font-ui);
+  text-align: left;
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+}
+
+.session-menu-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.session-menu-item.danger:hover {
+  color: #fa5252;
+  background: rgba(250, 82, 82, 0.1);
 }
 
 .list-item-meta {
@@ -328,6 +404,7 @@ body {
 }
 
 #now-playing-bar {
+  flex: 0 0 auto;
   padding: 0.45rem 0.55rem;
   font-size: 0.84rem;
   border-radius: 8px;
@@ -368,6 +445,7 @@ body {
 }
 
 #music-volume-row {
+  flex: 0 0 auto;
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
@@ -391,14 +469,6 @@ body {
   color: var(--text);
   min-width: 2.6rem;
   text-align: right;
-}
-
-.queue-header {
-  font-size: 0.72rem;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  margin-bottom: 0.2rem;
 }
 
 #music-panel .panel-btn {
@@ -429,25 +499,6 @@ body {
   font-weight: 600;
   letter-spacing: 0.03em;
   color: var(--text);
-}
-
-#shell-topbar {
-  position: absolute;
-  top: 0.5rem;
-  left: 0.5rem;
-  z-index: 40;
-  display: inline-flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-#shell-brand {
-  font-family: var(--font-chat);
-  font-size: 1.05rem;
-  font-weight: 600;
-  letter-spacing: 0.03em;
-  color: var(--text);
-  line-height: 1;
 }
 
 #tts-controls {
@@ -880,6 +931,10 @@ body.hide-reasoning .reasoning-block {
 #voice-status.transcribing { display: inline-block; background: rgba(64, 192, 87, 0.15); color: var(--model-local); }
 
 #sidebar-toggle-btn {
+  position: absolute;
+  top: 0.6rem;
+  left: 0.6rem;
+  z-index: 40;
   display: inline-flex;
   background: var(--surface-raised);
   border: none;
@@ -910,20 +965,6 @@ body.hide-reasoning .reasoning-block {
 }
 
 @media (min-width: 901px) {
-  #app-shell {
-    position: static;
-  }
-
-  #shell-topbar {
-    top: 0.6rem;
-    left: 0.6rem;
-    z-index: 40;
-  }
-
-  body:not(.sidebar-collapsed) #shell-brand {
-    display: none;
-  }
-
   body.sidebar-collapsed #sidebar {
     display: none;
   }

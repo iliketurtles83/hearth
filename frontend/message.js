@@ -11,6 +11,8 @@
   const memoryClearBtn = document.getElementById('memory-clear-btn');
   const memoryPanel = document.getElementById('memory-panel');
   const memoryCollapseBtn = document.getElementById('memory-collapse-btn');
+  const sessionsPanel = document.getElementById('sessions-panel');
+  const sessionsCollapseBtn = document.getElementById('sessions-collapse-btn');
   const musicPanel = document.getElementById('music-panel');
   const musicCollapseBtn = document.getElementById('music-collapse-btn');
   const musicCollapsedNowPlayingEl = document.getElementById('music-collapsed-now-playing');
@@ -29,6 +31,9 @@
   let _currentAbortController = null;
   const _REASONING_PREF_KEY = 'ui.showReasoning';
   let _showReasoning = true;
+  let _sessionMenuEl = null;
+  let _sessionMenuSid = null;
+  let _sessionMenuTitle = '';
 
   // Phase 14: pending image attachment state
   let pendingImage = null; // { base64: string, mime: string, dataUrl: string } | null
@@ -224,10 +229,17 @@
     panelEl.classList.toggle('is-collapsed', collapsed);
     collapseBtnEl.textContent = collapsed ? '▸' : '▾';
     collapseBtnEl.setAttribute('aria-expanded', String(!collapsed));
-    collapseBtnEl.title = `${collapsed ? 'Expand' : 'Collapse'} ${panelEl.id === 'music-panel' ? 'music' : 'memory'} section`;
+    const label = (panelEl.querySelector('h2')?.textContent || 'section').trim().toLowerCase();
+    collapseBtnEl.title = `${collapsed ? 'Expand' : 'Collapse'} ${label} section`;
   }
 
   function _bindCollapsiblePanels() {
+    sessionsCollapseBtn?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const collapsed = !sessionsPanel?.classList.contains('is-collapsed');
+      setPanelCollapsed(sessionsPanel, sessionsCollapseBtn, collapsed);
+    });
+
     memoryCollapseBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
       const collapsed = !memoryPanel?.classList.contains('is-collapsed');
@@ -271,6 +283,17 @@
 
   window.addEventListener('resize', () => {
     if (!isMobileLayout()) closeSidebar();
+  });
+
+  document.addEventListener('click', (e) => {
+    if (!_sessionMenuEl || _sessionMenuEl.style.display === 'none') return;
+    if (_sessionMenuEl.contains(e.target)) return;
+    if (e.target.closest && e.target.closest('.session-kebab-btn')) return;
+    closeSessionMenu();
+  });
+
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeSessionMenu();
   });
 
   function _setSidebarSection(section) {
@@ -475,6 +498,7 @@
 
   function renderSessions(sessions, activeId) {
     if (!sessionListEl) return;
+    closeSessionMenu();
     sessionListEl.innerHTML = '';
     if (!sessions.length) {
       const div = document.createElement('div');
@@ -485,18 +509,24 @@
     }
 
     for (const session of sessions) {
+      const displayTitle = (session.title || session.preview || 'New session').slice(0, 80);
       const item = document.createElement('div');
       item.className = 'list-item session-list-item' + (session.session_id === activeId ? ' active' : '');
       item.innerHTML = `
         <div class="session-row">
-          <div class="list-item-title session-title">${_esc((session.preview || 'New session').slice(0, 80))}</div>
-          <button class="memory-delete-btn session-delete-btn" data-sid="${session.session_id}" title="Delete session">&times;</button>
+          <div class="list-item-title session-title">${_esc(displayTitle)}</div>
+          <button class="session-kebab-btn" data-sid="${session.session_id}" title="Session options" aria-label="Session options" aria-haspopup="menu">&#8942;</button>
         </div>
       `;
       item.addEventListener('click', () => selectSession(session.session_id));
-      item.querySelector('.session-delete-btn').addEventListener('click', async (e) => {
+      const kebab = item.querySelector('.session-kebab-btn');
+      kebab.addEventListener('click', (e) => {
         e.stopPropagation();
-        await deleteSession(session.session_id);
+        if (isSessionMenuOpenFor(session.session_id)) {
+          closeSessionMenu();
+        } else {
+          openSessionMenu(kebab, session);
+        }
       });
       sessionListEl.appendChild(item);
     }
@@ -751,6 +781,80 @@
       }
     } catch {
       // non-fatal
+    }
+  }
+
+  function _ensureSessionMenu() {
+    if (_sessionMenuEl) return _sessionMenuEl;
+    const el = document.createElement('div');
+    el.className = 'session-menu';
+    el.setAttribute('role', 'menu');
+    el.style.display = 'none';
+    el.innerHTML =
+      '<button type="button" class="session-menu-item" data-action="rename" role="menuitem">Rename</button>' +
+      '<button type="button" class="session-menu-item danger" data-action="delete" role="menuitem">Delete</button>';
+    el.querySelector('[data-action="rename"]').addEventListener('click', () => {
+      const sid = _sessionMenuSid;
+      const prev = _sessionMenuTitle;
+      closeSessionMenu();
+      if (sid) renameSession(sid, prev);
+    });
+    el.querySelector('[data-action="delete"]').addEventListener('click', () => {
+      const sid = _sessionMenuSid;
+      closeSessionMenu();
+      if (sid) deleteSession(sid);
+    });
+    document.body.appendChild(el);
+    _sessionMenuEl = el;
+    return el;
+  }
+
+  function isSessionMenuOpenFor(sid) {
+    return !!_sessionMenuEl && _sessionMenuEl.style.display !== 'none' && _sessionMenuSid === sid;
+  }
+
+  function openSessionMenu(kebabBtn, session) {
+    const menu = _ensureSessionMenu();
+    _sessionMenuSid = session.session_id;
+    _sessionMenuTitle = session.title || '';
+    menu.style.display = 'block';
+    const rect = kebabBtn.getBoundingClientRect();
+    const margin = 4;
+    menu.style.left = 'auto';
+    menu.style.right = (window.innerWidth - rect.right) + 'px';
+    menu.style.top = (rect.bottom + margin) + 'px';
+    const mrect = menu.getBoundingClientRect();
+    if (mrect.left < margin) {
+      menu.style.right = 'auto';
+      menu.style.left = Math.max(margin, rect.left - mrect.width + kebabBtn.offsetWidth) + 'px';
+    }
+    const mrect2 = menu.getBoundingClientRect();
+    if (mrect2.bottom > window.innerHeight - margin) {
+      menu.style.top = (rect.top - mrect2.height - margin) + 'px';
+    }
+  }
+
+  function closeSessionMenu() {
+    if (_sessionMenuEl) _sessionMenuEl.style.display = 'none';
+    _sessionMenuSid = null;
+    _sessionMenuTitle = '';
+  }
+
+  async function renameSession(sessionId, currentTitle) {
+    const entered = prompt('Rename session:', currentTitle || '');
+    if (entered === null) return;
+    const title = entered.trim();
+    try {
+      const resp = await (window.apiFetch || fetch)(`/chat/sessions/${encodeURIComponent(sessionId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ title }),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      await refreshSessions();
+    } catch (err) {
+      appendMessage('assistant', `⚠ Unable to rename session: ${err.message}`);
     }
   }
 

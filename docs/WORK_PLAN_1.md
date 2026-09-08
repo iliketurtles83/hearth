@@ -5,27 +5,25 @@ Legend: `[x]` done · `[ ]` to do · `[~]` in progress/partial · `[P]` parked/d
 
 ## Frontend / UI
 
-### [ ] Top bar removal  (re-opened — was marked done, is not)
-- Remove `#shell-topbar` (`index.html:45-55`) and its CSS (`style.css:434-442`).
-- Move the hamburger into the left-panel branding row (`#sidebar-branding`, `index.html:58-65`), beside "Hearth".
-- Drop the duplicate `#shell-brand` "Hearth" label (`index.html:54`).
+### [x] Top bar removal
+- Removed `#shell-topbar` wrapper + duplicate `#shell-brand` "Hearth" label; `#sidebar-toggle-btn` is now pinned top-left of `#app-shell` (z-index 40), independent of the sidebar so it survives collapse.
 - Mic is already top-right, independent of the bar — done.
 
-### [~] Sidebar visual improvements
+### [x] Sidebar visual improvements
 - `[x]` borders removed (`style.css:251-257`) · `[x]` items share background (`style.css:255`)
 - `[x]` hover highlights whole item (`style.css:259-261`) · `[x]` artist + title on one line (`message.js:688`) · `[x]` tighter song row spacing (`style.css:355-358`)
-- `[ ]` remove the "Queue" header text (`index.html:99`, `style.css:396-402`)
+- `[x]` remove the "Queue" header text (`index.html:96`, `style.css:396-402`)
 
-### [~] Sidebar menu improvements
-- `[x]` sidebar uses total height · `[x]` collapse/expand on music + memory (`message.js:230-242`)
-- `[ ]` remove the overall scroll bar; size each section independently (`style.css:100-108`) — a per-list cap exists (`style.css:247-248`) but the overall scroll remains
-- `[ ]` add collapse to the Sessions/chats panel (only a "New" button today, `index.html:70`)
+### [x] Sidebar menu improvements
+- `[x]` sidebar uses total height · `[x]` collapse/expand on music + memory + sessions (`message.js:_bindCollapsiblePanels`)
+- `[x]` remove the overall scroll bar; size each section independently (`#sidebar-main { overflow: hidden }`; expanded panels `flex: 1 1 0`, collapsed `flex: 0 0 auto`, each `.list` scrolls internally)
+- `[x]` add collapse to the Sessions/chats panel (`#sessions-collapse-btn`, "New" stays visible when collapsed)
 
-### [ ] Per-chat settings
-- `[ ]` vertical three-dot (kebab) menu to the right of each chat title (`message.js:490-495`)
-- `[ ]` small settings popover opened from the kebab
-- `[ ]` move delete into the menu (today it is an inline `×`)
-- `[ ]` add rename (does not exist anywhere)
+### [x] Per-chat settings
+- `[x]` vertical three-dot (kebab) menu to the right of each chat title (`message.js` renderSessions)
+- `[x]` small settings popover opened from the kebab (`.session-menu`, fixed-position, closes on outside-click / Escape)
+- `[x]` move delete into the menu (was an inline `×`)
+- `[x]` add rename — `PATCH /chat/sessions/{id}` (`session_routes.py`) backed by a `session_titles` table in `memory.py`; `list_sessions` surfaces `title`, UI falls back to first-message preview
 
 ### [x] Music window
 - artist – song on one line (`message.js:651-653`, `style.css:343-348`) — done.

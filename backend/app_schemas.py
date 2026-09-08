@@ -24,6 +24,10 @@ class SessionSelectRequest(BaseModel):
     session_id: str
 
 
+class SessionRenameRequest(BaseModel):
+    title: str
+
+
 class WeatherRequest(BaseModel):
     location: str | None = None
 

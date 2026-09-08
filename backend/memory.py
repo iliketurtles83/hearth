@@ -371,6 +371,16 @@ class MemoryStore:
                     ON relations(user_id, object);
                 CREATE INDEX IF NOT EXISTS idx_relations_user_predicate
                     ON relations(user_id, predicate);
+
+                CREATE TABLE IF NOT EXISTS session_titles (
+                    user_id    TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    title      TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY (user_id, session_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_session_titles_user
+                    ON session_titles(user_id);
                 """
             )
             # Live-instance migration: add 'consolidated' column if it doesn't exist yet.
@@ -455,6 +465,7 @@ class MemoryStore:
                     MIN(c1.ts) AS created_at,
                     MAX(c1.ts) AS updated_at,
                     COUNT(*) AS message_count,
+                    MAX(st.title) AS title,
                     (
                         SELECT c2.content
                         FROM conversation_log c2
@@ -465,6 +476,8 @@ class MemoryStore:
                         LIMIT 1
                     ) AS preview
                 FROM conversation_log c1
+                LEFT JOIN session_titles st
+                    ON st.session_id = c1.session_id AND st.user_id = c1.user_id
                 WHERE c1.user_id = ?
                 GROUP BY c1.session_id
                 ORDER BY updated_at DESC
@@ -477,6 +490,7 @@ class MemoryStore:
                 "created_at": float(r["created_at"]),
                 "updated_at": float(r["updated_at"]),
                 "message_count": int(r["message_count"]),
+                "title": str(r["title"]) if r["title"] is not None else "",
                 "preview": str(r["preview"] or "")[:120],
             }
             for r in rows
@@ -492,10 +506,36 @@ class MemoryStore:
                 "DELETE FROM summaries WHERE session_id = ? AND user_id = ?",
                 (session_id, user_id),
             )
+            self._conn.execute(
+                "DELETE FROM session_titles WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
             self._conn.commit()
 
     def reset_session(self, session_id: str, user_id: str) -> None:
         self.delete_session(session_id, user_id)
+
+    def set_session_title(self, session_id: str, user_id: str, title: str) -> None:
+        now = time.time()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO session_titles (user_id, session_id, title, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, session_id)
+                DO UPDATE SET title = excluded.title, updated_at = excluded.updated_at
+                """,
+                (user_id, session_id, title, now),
+            )
+            self._conn.commit()
+
+    def clear_session_title(self, session_id: str, user_id: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM session_titles WHERE session_id = ? AND user_id = ?",
+                (session_id, user_id),
+            )
+            self._conn.commit()
 
     def session_exists(self, session_id: str) -> bool:
         with self._lock:

@@ -3,7 +3,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
-from app_schemas import SessionSelectRequest
+from app_schemas import SessionRenameRequest, SessionSelectRequest
 
 
 def create_session_router(services) -> APIRouter:
@@ -103,6 +103,25 @@ def create_session_router(services) -> APIRouter:
         if next_session_id:
             set_session_cookie(response, next_session_id)
         return response
+
+    @router.patch("/chat/sessions/{session_id}")
+    async def rename_chat_session(
+        session_id: str,
+        payload: SessionRenameRequest,
+        http_request: Request,
+    ):
+        user_id: str = http_request.state.user_id
+
+        if not get_memory_store().session_exists_for_user(session_id, user_id):
+            return error_response("Session not found", "SESSION_NOT_FOUND", False, status_code=404)
+
+        title = (payload.title or "").strip()
+        if title:
+            get_memory_store().set_session_title(session_id, user_id, title)
+        else:
+            get_memory_store().clear_session_title(session_id, user_id)
+
+        return JSONResponse({"ok": True, "session_id": session_id, "title": title})
 
     @router.delete("/chat/session")
     async def reset_chat_session(http_request: Request):
