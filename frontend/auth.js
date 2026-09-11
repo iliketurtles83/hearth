@@ -221,4 +221,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   // Expose apiFetch globally so non-module scripts (message.js, voice.js) can use it.
   window.apiFetch = apiFetch;
+  // Expose logout for the settings menu in message.js (non-module script).
+  window.hearthLogout = logout;
 });

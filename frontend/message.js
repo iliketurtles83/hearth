@@ -6,7 +6,6 @@
   const stopBtn = document.getElementById('stop-btn');
   const sessionListEl = document.getElementById('session-list');
   const sessionNewBtn = document.getElementById('session-new-btn');
-  const sidebarSectionChatsBtn = document.getElementById('sidebar-section-chats');
   const memoryListEl = document.getElementById('memory-list');
   const memoryClearBtn = document.getElementById('memory-clear-btn');
   const memoryPanel = document.getElementById('memory-panel');
@@ -21,6 +20,7 @@
   const ttsEnableBtn = document.getElementById('tts-enable-btn');
   const ttsStopBtn = document.getElementById('tts-stop-btn');
   const reasoningToggleBtn = document.getElementById('reasoning-toggle-btn');
+  const authUsernameBtn = document.getElementById('auth-username');
 
   window.appUi = { messagesEl, messagesInner, input, sendBtn };
   let currentSessionId = null;
@@ -30,10 +30,18 @@
   let currentQueuePos = null;
   let _currentAbortController = null;
   const _REASONING_PREF_KEY = 'ui.showReasoning';
+  const _THEME_PREF_KEY = 'ui.theme';
   let _showReasoning = true;
+  let _theme = 'dark';
   let _sessionMenuEl = null;
   let _sessionMenuSid = null;
   let _sessionMenuTitle = '';
+  let _settingsMenuEl = null;
+  let _themeMenuItem = null;
+  let _reasoningMenuItem = null;
+  let _beetsMenuItem = null;
+  let _consolidateMenuItem = null;
+  let _settingsActionBusy = false;
 
   // Phase 14: pending image attachment state
   let pendingImage = null; // { base64: string, mime: string, dataUrl: string } | null
@@ -102,6 +110,9 @@
         ? 'Hide reasoning summaries'
         : 'Show reasoning summaries';
     }
+    if (_reasoningMenuItem) {
+      _reasoningMenuItem.textContent = `Reasoning: ${_showReasoning ? 'On' : 'Off'}`;
+    }
   }
 
   function _loadReasoningPref() {
@@ -129,6 +140,28 @@
     _setReasoningVisible(!_showReasoning);
     _saveReasoningPref();
   });
+
+  function _applyTheme(theme) {
+    _theme = theme === 'light' ? 'light' : 'dark';
+    document.documentElement.dataset.theme = _theme;
+    if (_themeMenuItem) {
+      _themeMenuItem.textContent = `Theme: ${_theme === 'dark' ? 'Dark' : 'Light'}`;
+    }
+  }
+
+  function _loadThemePref() {
+    // The inline head script already applied the stored theme before first
+    // paint; adopt that value so the menu label matches what is on screen.
+    _applyTheme(document.documentElement.dataset.theme === 'light' ? 'light' : 'dark');
+  }
+
+  function _saveThemePref() {
+    try {
+      window.localStorage.setItem(_THEME_PREF_KEY, _theme);
+    } catch {
+      // best effort
+    }
+  }
 
   // eslint-disable-next-line no-unused-vars
   function setTtsStatus(_text) { /* text removed; mic colour conveys state */ }
@@ -292,15 +325,18 @@
     closeSessionMenu();
   });
 
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') closeSessionMenu();
+  document.addEventListener('click', (e) => {
+    if (!_settingsMenuEl || _settingsMenuEl.style.display === 'none') return;
+    if (_settingsMenuEl.contains(e.target)) return;
+    if (authUsernameBtn?.contains(e.target)) return;
+    closeSettingsMenu();
   });
 
-  function _setSidebarSection(section) {
-    const inChats = section === 'chats';
-    sidebarSectionChatsBtn?.classList.toggle('active', inChats);
-    sidebarSectionChatsBtn?.setAttribute('aria-pressed', String(inChats));
-  }
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    closeSessionMenu();
+    closeSettingsMenu();
+  });
 
   input.addEventListener('input', () => {
     input.style.height = 'auto';
@@ -317,9 +353,6 @@
   sendBtn.addEventListener('click', send);
   sessionNewBtn?.addEventListener('click', startNewChat);
   memoryClearBtn?.addEventListener('click', clearAllMemory);
-  sidebarSectionChatsBtn?.addEventListener('click', () => {
-    _setSidebarSection('chats');
-  });
 
   function setLocked(locked) {
     sendBtn.disabled = locked;
@@ -840,6 +873,132 @@
     _sessionMenuTitle = '';
   }
 
+  // ── Settings menu (opened from the username in the sidebar) ─────────────────
+
+  function _ensureSettingsMenu() {
+    if (_settingsMenuEl) return _settingsMenuEl;
+    const el = document.createElement('div');
+    el.className = 'settings-menu';
+    el.setAttribute('role', 'menu');
+    el.style.display = 'none';
+    el.innerHTML =
+      '<button type="button" class="settings-menu-item" data-action="theme" role="menuitem">Theme: Dark</button>' +
+      '<button type="button" class="settings-menu-item" data-action="reasoning" role="menuitem">Reasoning: On</button>' +
+      '<div class="settings-menu-sep" role="separator"></div>' +
+      '<button type="button" class="settings-menu-item" data-action="beets" role="menuitem">Update music library</button>' +
+      '<button type="button" class="settings-menu-item" data-action="consolidate" role="menuitem">Consolidate memory</button>' +
+      '<div class="settings-menu-sep" role="separator"></div>' +
+      '<button type="button" class="settings-menu-item danger" data-action="logout" role="menuitem">Sign out</button>';
+    _themeMenuItem = el.querySelector('[data-action="theme"]');
+    _reasoningMenuItem = el.querySelector('[data-action="reasoning"]');
+    _beetsMenuItem = el.querySelector('[data-action="beets"]');
+    _consolidateMenuItem = el.querySelector('[data-action="consolidate"]');
+    _themeMenuItem.addEventListener('click', () => {
+      _applyTheme(_theme === 'dark' ? 'light' : 'dark');
+      _saveThemePref();
+    });
+    _reasoningMenuItem.addEventListener('click', () => {
+      _setReasoningVisible(!_showReasoning);
+      _saveReasoningPref();
+    });
+    _beetsMenuItem.addEventListener('click', () => { void updateMusicLibrary(); });
+    _consolidateMenuItem.addEventListener('click', () => { void consolidateMemoryNow(); });
+    el.querySelector('[data-action="logout"]').addEventListener('click', () => {
+      closeSettingsMenu();
+      if (typeof window.hearthLogout === 'function') {
+        window.hearthLogout();
+      }
+    });
+    document.body.appendChild(el);
+    _settingsMenuEl = el;
+    return el;
+  }
+
+  function openSettingsMenu(trigger) {
+    const menu = _ensureSettingsMenu();
+    _themeMenuItem.textContent = `Theme: ${_theme === 'dark' ? 'Dark' : 'Light'}`;
+    _reasoningMenuItem.textContent = `Reasoning: ${_showReasoning ? 'On' : 'Off'}`;
+    menu.style.display = 'block';
+    const rect = trigger.getBoundingClientRect();
+    const margin = 4;
+    menu.style.left = 'auto';
+    menu.style.right = (window.innerWidth - rect.right) + 'px';
+    menu.style.top = (rect.bottom + margin) + 'px';
+    const mrect = menu.getBoundingClientRect();
+    if (mrect.left < margin) {
+      menu.style.right = 'auto';
+      menu.style.left = Math.max(margin, rect.left - mrect.width) + 'px';
+    }
+    const mrect2 = menu.getBoundingClientRect();
+    if (mrect2.bottom > window.innerHeight - margin) {
+      menu.style.top = (rect.top - mrect2.height - margin) + 'px';
+    }
+    authUsernameBtn?.setAttribute('aria-expanded', 'true');
+  }
+
+  function closeSettingsMenu() {
+    if (_settingsMenuEl) _settingsMenuEl.style.display = 'none';
+    authUsernameBtn?.setAttribute('aria-expanded', 'false');
+  }
+
+  authUsernameBtn?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (_settingsMenuEl && _settingsMenuEl.style.display !== 'none') {
+      closeSettingsMenu();
+    } else {
+      openSettingsMenu(authUsernameBtn);
+    }
+  });
+
+  function _setSettingsActionsBusy(busy) {
+    _settingsActionBusy = busy;
+    if (_beetsMenuItem) _beetsMenuItem.disabled = busy;
+    if (_consolidateMenuItem) _consolidateMenuItem.disabled = busy;
+  }
+
+  async function updateMusicLibrary() {
+    if (_settingsActionBusy) return;
+    _setSettingsActionsBusy(true);
+    if (_beetsMenuItem) _beetsMenuItem.textContent = 'Updating music…';
+    try {
+      const resp = await (window.apiFetch || fetch)('/music/beets/update', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      let data = null;
+      try { data = await resp.json(); } catch { /* best effort */ }
+      if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+      appendMessage('assistant', 'Music library updated.');
+    } catch (err) {
+      appendMessage('assistant', `⚠ Unable to update music library: ${err.message}`);
+    } finally {
+      _setSettingsActionsBusy(false);
+      if (_beetsMenuItem) _beetsMenuItem.textContent = 'Update music library';
+    }
+  }
+
+  async function consolidateMemoryNow() {
+    if (_settingsActionBusy) return;
+    _setSettingsActionsBusy(true);
+    if (_consolidateMenuItem) _consolidateMenuItem.textContent = 'Consolidating…';
+    try {
+      const resp = await (window.apiFetch || fetch)('/memory/consolidate', {
+        method: 'POST',
+        credentials: 'same-origin',
+      });
+      let data = null;
+      try { data = await resp.json(); } catch { /* best effort */ }
+      if (!resp.ok) throw new Error(data?.error || `HTTP ${resp.status}`);
+      await refreshMemory();
+      appendMessage('assistant', 'Memory consolidated.');
+    } catch (err) {
+      appendMessage('assistant', `⚠ Unable to consolidate memory: ${err.message}`);
+    } finally {
+      _setSettingsActionsBusy(false);
+      if (_consolidateMenuItem) _consolidateMenuItem.textContent = 'Consolidate memory';
+    }
+  }
+
   async function renameSession(sessionId, currentTitle) {
     const entered = prompt('Rename session:', currentTitle || '');
     if (entered === null) return;
@@ -1125,7 +1284,7 @@
   async function bootstrap() {
     _bindCollapsiblePanels();
     _loadReasoningPref();
-    _setSidebarSection('chats');
+    _loadThemePref();
     await Promise.all([refreshSessions(), refreshMemory()]);
     await loadCurrentSessionMessages();
     refreshNowPlaying();
