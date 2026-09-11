@@ -227,13 +227,27 @@ def _should_inject_memory(decision_intent: str, memory_hits: list[dict[str, Any]
     if decision_intent == "memory-needed":
         return True
 
+    # Even for non-memory intents, inject if the query is about the user
+    # and we have relevant memory hits. This catches cases where the
+    # embedding router escalated to heuristic (which often classifies
+    # user-queries as "quick-local" instead of "memory-needed").
     terms = [t for t in re.findall(r"[a-z0-9]+", user_message.lower()) if len(t) > 2][:10]
     if not terms:
         return False
 
-    top_text = " ".join(str(h.get("text", "")).lower() for h in memory_hits[:3])
+    # Check if any memory hit has a meaningful score (>= 0.3)
+    # and if the query terms overlap with the memory content.
+    top_text = " ".join(str(h.get("text", "")).lower() for h in memory_hits[:5])
     overlap = sum(1 for t in terms if t in top_text)
-    return overlap >= 2
+    if overlap >= 2:
+        return True
+
+    # Also inject if the top hit has a high score, indicating strong semantic relevance.
+    top_score = float(memory_hits[0].get("score", 0.0))
+    if top_score >= 0.3:
+        return True
+
+    return False
 
 
 def _tool_summary_prompt(user_message: str, tool_data: dict[str, Any]) -> str:
@@ -620,6 +634,12 @@ def build_assistant_graph(
                         decision.planner_status = "embedding_ambiguous_fallback"
                         if not decision.reasoning_summary:
                             decision.reasoning_summary = reasoning_summary
+                        # Heuristic sets intent but not needs_memory.
+                        # If the heuristic classified as memory-needed,
+                        # inject memory even though the embedding router
+                        # was ambiguous about the tool classification.
+                        if decision.intent == "memory-needed":
+                            decision.needs_memory = True
                     else:
                         decision = _decision_from_embedding(
                             embed_result.tool.label,

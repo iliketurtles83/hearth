@@ -6,6 +6,7 @@ import sys
 import tempfile
 import types
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -756,3 +757,69 @@ async def test_consolidate_memory_endpoint_runs_for_current_user():
 
     assert payload["ok"] is True
     assert payload["stats"]["processed"] >= 1
+
+
+@pytest.mark.asyncio
+async def test_beets_update_endpoint_runs_update_and_import(tmp_path, monkeypatch):
+    music_root = tmp_path / "music"
+    music_root.mkdir()
+    db = tmp_path / "library.db"
+    monkeypatch.setenv("BEETS_DB_PATH", str(db))
+    monkeypatch.setenv("MUSIC_ROOT", str(music_root))
+
+    fake_result = MagicMock()
+    fake_result.returncode = 0
+    fake_result.stdout = "15 items updated\n"
+    fake_result.stderr = ""
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/beet"),
+        patch("subprocess.run", return_value=fake_result) as mock_run,
+    ):
+        beets_update = _route_endpoint("/music/beets/update", "POST")
+        response = await beets_update()
+
+    payload = _json_body(response)
+    assert response.status_code == 200
+    assert payload["ok"] is True
+    assert mock_run.call_count == 2
+    first_cmd = mock_run.call_args_list[0][0][0]
+    second_cmd = mock_run.call_args_list[1][0][0]
+    assert first_cmd[:3] == ["/usr/bin/beet", "-l", str(db)]
+    assert first_cmd[3:] == ["update", str(music_root)]
+    assert second_cmd[3:] == ["import", "-A", str(music_root)]
+
+
+@pytest.mark.asyncio
+async def test_beets_update_endpoint_reports_config_error(tmp_path, monkeypatch):
+    monkeypatch.delenv("MUSIC_ROOT", raising=False)
+
+    beets_update = _route_endpoint("/music/beets/update", "POST")
+    response = await beets_update()
+
+    assert response.status_code == 409
+    payload = _json_body(response)
+    assert payload["ok"] is False
+    assert payload["code"] == "BEETS_MUSIC_ROOT_MISSING"
+
+
+@pytest.mark.asyncio
+async def test_beets_update_endpoint_reports_failure(tmp_path, monkeypatch):
+    music_root = tmp_path / "music"
+    music_root.mkdir()
+    monkeypatch.setenv("BEETS_DB_PATH", str(tmp_path / "library.db"))
+    monkeypatch.setenv("MUSIC_ROOT", str(music_root))
+
+    err = __import__("subprocess").CalledProcessError(1, ["beet"], stderr="update failed")
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/beet"),
+        patch("subprocess.run", side_effect=err),
+    ):
+        beets_update = _route_endpoint("/music/beets/update", "POST")
+        response = await beets_update()
+
+    assert response.status_code == 503
+    payload = _json_body(response)
+    assert payload["ok"] is False
+    assert payload["code"] == "BEETS_UPDATE_FAILED"

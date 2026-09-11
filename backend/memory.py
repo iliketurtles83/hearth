@@ -243,29 +243,29 @@ class MemoryStore:
         try:
             existing = self._chroma.get_collection(name="conversation_memory")
             count = existing.__len__()
-            if count > 0:
-                # Probe with old embedder dimension (192).
-                old_vec = np.zeros(192, dtype=np.float32)
-                for token in re.findall(r"[a-z0-9]+", "probe"):
-                    digest = hashlib.sha256(token.encode("utf-8")).digest()
-                    idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % 192
-                    old_vec[idx] += 1.0
-                norm = float(np.linalg.norm(old_vec))
-                if norm > 0:
-                    old_vec /= norm
-                old_dim = len(old_vec)
 
-                if new_dim != old_dim:
-                    log.info(
-                        "memory.collection_recreate | reason=embedding_dimension_mismatch "
-                        "old_dim=%d new_dim=%d count=%d",
-                        old_dim, new_dim, count,
-                    )
-                    self._chroma.delete_collection(name="conversation_memory")
-                    self._collection = self._chroma.get_or_create_collection(
-                        name="conversation_memory",
-                        embedding_function=self._embedder,
-                    )
+            # Probe with old embedder dimension (192).
+            old_vec = np.zeros(192, dtype=np.float32)
+            for token in re.findall(r"[a-z0-9]+", "probe"):
+                digest = hashlib.sha256(token.encode("utf-8")).digest()
+                idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % 192
+                old_vec[idx] += 1.0
+            norm = float(np.linalg.norm(old_vec))
+            if norm > 0:
+                old_vec /= norm
+            old_dim = len(old_vec)
+
+            if new_dim != old_dim:
+                log.info(
+                    "memory.collection_recreate | reason=embedding_dimension_mismatch "
+                    "old_dim=%d new_dim=%d count=%d",
+                    old_dim, new_dim, count,
+                )
+                self._chroma.delete_collection(name="conversation_memory")
+                self._collection = self._chroma.get_or_create_collection(
+                    name="conversation_memory",
+                    embedding_function=self._embedder,
+                )
         except Exception:
             pass
 
@@ -695,6 +695,7 @@ class MemoryStore:
         fact_rules = [
             (r"\bmy name is ([^.!?]{1,80})", "name"),
             (r"\bi live in ([^.!?]{1,80})", "location"),
+            (r"\bmy location is ([^.!?]{1,80})", "location"),
             (r"\bi lived in ([^.!?]{1,140})", "location_history"),
             (r"\bi work on ([^.!?]{1,120})", "work_context"),
         ]
@@ -705,8 +706,46 @@ class MemoryStore:
 
         # Explicit memory hint for high-value facts.
         if "remember" in lower and len(m) <= 320 and ":" in m:
-            key, value = m.split(":", 1)
-            out.append(MemoryCandidate(table="facts", key=key.strip().lower()[:48], value=value.strip()[:240], source=source))
+            key_part, value = m.split(":", 1)
+            raw_key = key_part.strip().lower()[:48]
+            # If key is just "remember"/"remembered"/"note", extract the real key from the value.
+            # e.g. "Remember: my location is Stockholm" -> key="location", value="Stockholm"
+            # e.g. "Remember: my favorite food is ramen" -> key="favorite_food", value="ramen"
+            if raw_key in ("remember", "remembered", "note", "remember that"):
+                # Try to extract from the value using the same patterns.
+                value = value.strip()
+                for pattern, key in [
+                    (r"\bmy name is ([^.!?]{1,80})", "name"),
+                    (r"\bi live in ([^.!?]{1,80})", "location"),
+                    (r"\bmy location is ([^.!?]{1,80})", "location"),
+                    (r"\bmy favorite ([a-z ]{2,30}) is ([^.!?]{1,80})", None),
+                    (r"\bi prefer ([^.!?]{1,80})", None),
+                ]:
+                    match = re.search(pattern, value, re.IGNORECASE)
+                    if match:
+                        if match.lastindex == 2:
+                            left = re.sub(r"\s+", "_", match.group(1).strip().lower())
+                            raw_key = f"favorite_{left}"
+                            value = match.group(2).strip()
+                        else:
+                            raw_key = key
+                            value = match.group(1).strip()
+                        break
+                else:
+                    # Fallback: use the whole value as a note.
+                    raw_key = "note"
+            else:
+                # Normalize common key patterns.
+                raw_key = re.sub(r"^(remember|remembered|note|remember that)\s*", "", raw_key)
+                raw_key = re.sub(r"^my\s+", "", raw_key)
+                raw_key = raw_key.strip()
+                if raw_key in ("location", "location is", "where i live"):
+                    raw_key = "location"
+                elif raw_key in ("favorite food", "favorite food is"):
+                    raw_key = "favorite_food"
+                elif raw_key in ("name", "name is"):
+                    raw_key = "name"
+            out.append(MemoryCandidate(table="facts", key=raw_key, value=value.strip()[:240], source=source))
 
         # Deduplicate by table/key/value.
         unique: dict[tuple[str, str, str], MemoryCandidate] = {}
@@ -1637,6 +1676,13 @@ class MemoryStore:
             for idx, doc, dist, meta in zip(ids, docs, distances, metadatas):
                 score = 1.0 / (1.0 + float(dist))
                 table = str(idx).split(":", 1)[0] if ":" in str(idx) else "facts"
+                # Use the current SQLite value for text (not the stale ChromaDB document)
+                # so the system prompt always reflects the latest stored fact/preference.
+                sqlite_item = next(
+                    (item for item in semantic_items if item["id"] == idx),
+                    None,
+                )
+                text = sqlite_item.get("value", "") if sqlite_item else doc
                 chroma_hits.append(
                     {
                         "id": idx,
@@ -1644,7 +1690,7 @@ class MemoryStore:
                         "tier": "semantic",
                         "key": str(meta.get("key", "")),
                         "value": str(meta.get("value", "")),
-                        "text": doc,
+                        "text": text,
                         "score": score,
                         "source": "chroma",
                     }

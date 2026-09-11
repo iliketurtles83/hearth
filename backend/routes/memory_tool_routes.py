@@ -22,6 +22,7 @@ def create_memory_tool_router(
     error_response: Callable[[str, str, bool, int], JSONResponse],
     dispatch_tool: Callable[[str, dict], Awaitable],
     run_weather: Callable[[dict], Awaitable],
+    run_beets_update: Callable[[], dict],
 ) -> APIRouter:
     router = APIRouter()
 
@@ -143,5 +144,13 @@ def create_memory_tool_router(
     @router.get("/music/queue")
     async def music_queue_view():
         return await _music_run({"action": "queue_view", "prompt": ""})
+
+    @router.post("/music/beets/update")
+    async def music_beets_update():
+        result = await asyncio.to_thread(run_beets_update)
+        if result.get("ok"):
+            return JSONResponse(result)
+        status = 409 if result.get("code") in ("BEETS_MUSIC_ROOT_MISSING", "BEETS_NOT_FOUND") else 503
+        return JSONResponse(result, status_code=status)
 
     return router

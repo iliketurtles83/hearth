@@ -331,6 +331,67 @@ def _bootstrap_beets_library_if_empty() -> None:
         log.warning("beets.bootstrap_failed | db=%s error=%s", beets_db, tail)
 
 
+def run_beets_update() -> dict:
+    """Manually sync the Beets library with MUSIC_ROOT (settings-menu action).
+
+    Runs ``beet update`` (re-index moved/renamed files; never autotags) and
+    then ``beet import -A`` (add new files without autotagging, matching the
+    bootstrap import flags).  Returns a JSON-ready dict.
+    """
+    beets_db = os.getenv(
+        "BEETS_DB_PATH",
+        os.path.join(os.path.expanduser("~"), ".config", "beets", "library.db"),
+    )
+    music_root = os.getenv("MUSIC_ROOT", "").strip()
+    if not music_root or not os.path.isdir(music_root):
+        return {
+            "ok": False,
+            "code": "BEETS_MUSIC_ROOT_MISSING",
+            "error": "MUSIC_ROOT is not set or does not exist.",
+        }
+
+    beet_bin = shutil.which("beet")
+    if not beet_bin:
+        return {
+            "ok": False,
+            "code": "BEETS_NOT_FOUND",
+            "error": "beet not found in PATH.",
+        }
+
+    commands = [
+        [beet_bin, "-l", beets_db, "update", music_root],
+        [beet_bin, "-l", beets_db, "import", "-A", music_root],
+    ]
+    log.info("beets.update_start | db=%s music_root=%s", beets_db, music_root)
+    last_line = ""
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            log.warning("beets.update_timeout | cmd=%s", " ".join(cmd))
+            return {
+                "ok": False,
+                "code": "BEETS_UPDATE_TIMEOUT",
+                "error": "beet update timed out.",
+            }
+        except subprocess.CalledProcessError as exc:
+            stderr = (exc.stderr or "").strip().splitlines()
+            tail = stderr[-1] if stderr else str(exc)
+            log.warning("beets.update_failed | cmd=%s error=%s", " ".join(cmd), tail)
+            return {
+                "ok": False,
+                "code": "BEETS_UPDATE_FAILED",
+                "error": tail,
+            }
+        out = (proc.stdout or "").strip().splitlines()
+        if out:
+            last_line = out[-1]
+            log.info("beets.update_step_done | cmd=%s tail=%s", " ".join(cmd), last_line)
+
+    log.info("beets.update_done | db=%s", beets_db)
+    return {"ok": True, "summary": last_line}
+
+
 def _validate_startup() -> None:
     _models_dir = os.path.join(os.path.dirname(__file__), "models")
     required_models = _required_wake_models()
@@ -690,6 +751,7 @@ app.include_router(
         error_response=_error_response,
         dispatch_tool=tools.dispatch,
         run_weather=_run_weather_tool,
+        run_beets_update=run_beets_update,
     )
 )
 

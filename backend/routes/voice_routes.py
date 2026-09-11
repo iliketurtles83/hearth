@@ -14,6 +14,10 @@ def create_voice_router(services) -> APIRouter:
     wakeword_threshold = services.wakeword_threshold
     max_transcribe_bytes = services.max_transcribe_bytes
     error_response = services.error_response
+    # Optional per-frame score logging for diagnosing wake-word detection. The
+    # app logs at INFO by default, so the usual debug line is invisible; set
+    # WAKE_SCORE_LOG=1 to see every frame's score at INFO (off by default).
+    score_log_enabled = os.environ.get("WAKE_SCORE_LOG", "").strip().lower() in ("1", "true", "yes", "on")
     # NOTE: get_whisper_model is accessed via `services.` at call time (not bound to
     # a local) so tests can monkeypatch main.services.get_whisper_model.
 
@@ -39,7 +43,10 @@ def create_voice_router(services) -> APIRouter:
                 if not isinstance(prediction, dict):
                     prediction = {}
                 score = float(prediction.get("computer_v2", 0.0) or 0.0)
-                log.debug("Wake score: %.3f (threshold: %.3f)", score, wakeword_threshold)
+                if score_log_enabled:
+                    log.info("Wake score: %.3f (threshold: %.3f)", score, wakeword_threshold)
+                else:
+                    log.debug("Wake score: %.3f (threshold: %.3f)", score, wakeword_threshold)
                 if score > wakeword_threshold:
                     log.info("Wake word detected — score: %.3f", score)
                     await ws.send_json({"event": "wake", "score": round(float(score), 3)})

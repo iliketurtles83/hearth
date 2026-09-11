@@ -5,6 +5,8 @@ Covers:
   - _beets_db_has_items: returns False for missing/empty DB, True when populated
   - _bootstrap_beets_library_if_empty: skips when DB populated, MUSIC_ROOT missing,
     directory missing, or `beet` not in PATH; runs import when conditions are met
+  - run_beets_update: config/PATH error shapes, update+import command sequence,
+    failure and timeout handling
 """
 from __future__ import annotations
 
@@ -91,7 +93,7 @@ def _load_helpers():
         "import os, sqlite3, shutil, subprocess, logging",
         "log = logging.getLogger('beets_startup_test')",
     ]
-    targets = {"_beets_db_has_items", "_bootstrap_beets_library_if_empty"}
+    targets = {"_beets_db_has_items", "_bootstrap_beets_library_if_empty", "run_beets_update"}
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -112,10 +114,14 @@ def _load_helpers():
 
     ns: dict = {}
     exec(compile("\n".join(extracted), str(src), "exec"), ns)  # noqa: S102
-    return ns["_beets_db_has_items"], ns["_bootstrap_beets_library_if_empty"]
+    return (
+        ns["_beets_db_has_items"],
+        ns["_bootstrap_beets_library_if_empty"],
+        ns["run_beets_update"],
+    )
 
 
-_beets_db_has_items, _bootstrap_beets_library_if_empty = _load_helpers()
+_beets_db_has_items, _bootstrap_beets_library_if_empty, run_beets_update = _load_helpers()
 
 # Clear stubs that were only needed for loading main.py helpers.
 # This prevents them from shadowing real packages during test collection.
@@ -241,3 +247,95 @@ def test_bootstrap_logs_warning_on_import_failure(tmp_path, monkeypatch):
         # Should not raise — errors are caught and logged.
         _bootstrap_beets_library_if_empty()
         assert mock_warn.called
+
+
+# ── run_beets_update ──────────────────────────────────────────────────────────
+
+def test_beets_update_fails_when_music_root_missing(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEETS_DB_PATH", str(tmp_path / "library.db"))
+    monkeypatch.delenv("MUSIC_ROOT", raising=False)
+
+    result = run_beets_update()
+
+    assert result["ok"] is False
+    assert result["code"] == "BEETS_MUSIC_ROOT_MISSING"
+
+
+def test_beets_update_fails_when_music_root_not_a_directory(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEETS_DB_PATH", str(tmp_path / "library.db"))
+    monkeypatch.setenv("MUSIC_ROOT", str(tmp_path / "nonexistent"))
+
+    result = run_beets_update()
+
+    assert result["ok"] is False
+    assert result["code"] == "BEETS_MUSIC_ROOT_MISSING"
+
+
+def test_beets_update_fails_when_beet_not_in_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEETS_DB_PATH", str(tmp_path / "library.db"))
+    monkeypatch.setenv("MUSIC_ROOT", str(tmp_path))
+
+    with patch("shutil.which", return_value=None):
+        result = run_beets_update()
+
+    assert result["ok"] is False
+    assert result["code"] == "BEETS_NOT_FOUND"
+
+
+def test_beets_update_runs_update_then_import_no_autotag(tmp_path, monkeypatch):
+    db = tmp_path / "library.db"
+    monkeypatch.setenv("BEETS_DB_PATH", str(db))
+    monkeypatch.setenv("MUSIC_ROOT", str(tmp_path))
+
+    fake_result = MagicMock()
+    fake_result.returncode = 0
+    fake_result.stdout = "15 items updated\n"
+    fake_result.stderr = ""
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/beet"),
+        patch("subprocess.run", return_value=fake_result) as mock_run,
+    ):
+        result = run_beets_update()
+
+    assert result["ok"] is True
+    assert mock_run.call_count == 2
+    first_cmd = mock_run.call_args_list[0][0][0]
+    second_cmd = mock_run.call_args_list[1][0][0]
+    assert first_cmd[:3] == ["/usr/bin/beet", "-l", str(db)]
+    assert first_cmd[3:] == ["update", str(tmp_path)]
+    assert second_cmd[:3] == ["/usr/bin/beet", "-l", str(db)]
+    assert second_cmd[3:] == ["import", "-A", str(tmp_path)]
+
+
+def test_beets_update_reports_failure_stderr_tail(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEETS_DB_PATH", str(tmp_path / "library.db"))
+    monkeypatch.setenv("MUSIC_ROOT", str(tmp_path))
+
+    err = __import__("subprocess").CalledProcessError(1, ["beet"], stderr="line one\nupdate failed")
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/beet"),
+        patch("subprocess.run", side_effect=err),
+    ):
+        result = run_beets_update()
+
+    assert result["ok"] is False
+    assert result["code"] == "BEETS_UPDATE_FAILED"
+    assert result["error"] == "update failed"
+
+
+def test_beets_update_reports_timeout(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEETS_DB_PATH", str(tmp_path / "library.db"))
+    monkeypatch.setenv("MUSIC_ROOT", str(tmp_path))
+
+    timeout_err = __import__("subprocess").TimeoutExpired(cmd=["beet"], timeout=1800)
+
+    with (
+        patch("shutil.which", return_value="/usr/bin/beet"),
+        patch("subprocess.run", side_effect=timeout_err),
+    ):
+        result = run_beets_update()
+
+    assert result["ok"] is False
+    assert result["code"] == "BEETS_UPDATE_TIMEOUT"
