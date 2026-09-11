@@ -269,3 +269,31 @@ def test_pick_model_for_decision_precedence():
         )
         == CHAT
     )
+
+
+# ── _should_inject_memory & needs_memory ─────────────────────────────────────
+
+def test_should_inject_memory_with_needs_memory_flag():
+    hits = [{"text": "user likes jazz", "score": 0.1}]
+    # needs_memory=True unconditionally injects if hits exist
+    assert assistant_graph._should_inject_memory(
+        "quick-local", hits, "tell me something", needs_memory=True
+    ) is True
+    # If no hits, returns False
+    assert assistant_graph._should_inject_memory(
+        "quick-local", [], "tell me something", needs_memory=True
+    ) is False
+    # If needs_memory=False and no overlap/low score, returns False
+    assert assistant_graph._should_inject_memory(
+        "quick-local", hits, "tell me something", needs_memory=False
+    ) is False
+
+
+def test_classify_intent_sets_needs_memory():
+    from intents import classify_intent
+    mem_decision = classify_intent("remember that my favorite color is blue")
+    assert mem_decision.intent == "memory-needed"
+    assert mem_decision.needs_memory is True
+
+    fact_decision = classify_intent("what is 2 + 2")
+    assert fact_decision.needs_memory is False

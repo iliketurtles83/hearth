@@ -27,6 +27,7 @@ echo "Starting nomic-embed-text on port 10001"
 exec "${LLAMA_SERVER}" \
 	-m "${MODEL_DIR}/${EMBED_MODEL}" \
 	--alias nomic-embed-text \
+	--n-gpu-layers 0 \
 	--ctx-size 512 \
 	--embedding \
 	--pooling mean \

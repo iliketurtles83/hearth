@@ -94,6 +94,7 @@ from typing import Any
 
 import musicpd
 
+from music_fastpath import parse_music_command
 import tools as _registry
 from tools.base import ToolResult
 
@@ -600,7 +601,7 @@ def _sync_play_pos(pos: int) -> None:
 
 
 def _sync_control(action: str) -> None:
-    """Execute a control command: pause / resume / next / stop."""
+    """Execute a control command: pause / resume / next / stop / shuffle."""
     def _fn(c: musicpd.MPDClient) -> None:
         if action == "pause":
             c.pause(1)
@@ -610,6 +611,12 @@ def _sync_control(action: str) -> None:
             c.next()
         elif action == "stop":
             c.stop()
+        elif action == "shuffle":
+            status = c.status()
+            length = int(status.get("playlistlength", 0))
+            if length == 0:
+                raise ValueError("The queue is empty.")
+            c.shuffle()
         else:
             raise ValueError(f"Unknown control action: {action!r}")
     _with_mpd(_fn)
@@ -723,6 +730,7 @@ _CONTROL_MAP: dict[str, str] = {
     "unpause": "resume",
     "next": "next",
     "skip": "next",
+    "shuffle": "shuffle",
 }
 
 
@@ -795,7 +803,7 @@ def _resolve_genre_query(query: str) -> str | None:
 def _extract_search_query(prompt: str) -> str:
     """Strip common command prefixes and return a bare search string."""
     cleaned = re.sub(
-        r"^(play(back)?|queue|put\s+on|start\s+playing|add\s+to\s+queue)\s+",
+        r"^(play(?:back)?|start\s+playing|queue|add\s+to\s+(?:the\s+)?queue|put\s+on|shuffle)\s+",
         "",
         prompt.strip(),
         flags=re.IGNORECASE,
@@ -895,17 +903,19 @@ async def run(params: dict[str, Any]) -> ToolResult:
 
     # ── Infer action from prompt when not explicit ─────────────────────────────
     if action is None:
-        p = prompt.lower()
-        if any(kw in p for kw in ("now playing", "what's playing", "what is playing")):
-            action = "now_playing"
-        elif re.search(r"\b(what'?s|what is)\s+(in\s+)?(the\s+)?(queue|playlist)\b", p):
-            action = "queue_view"
-        elif any(kw in p for kw in ("pause", "stop", "resume", "unpause", "continue")):
-            action = "control"
-        elif re.search(r"\b(next|skip)\s*(track|song)?\b", p):
-            action = "control"
+        parsed = parse_music_command(prompt, allow_vague=True)
+        if parsed:
+            action = parsed.get("action")
+            control = control or parsed.get("control")
+            query = query or parsed.get("query")
+            year_range = year_range or parsed.get("year_range")
+            artist_filter = artist_filter or parsed.get("artist_filter")
+            artist_param = artist_param or parsed.get("artist")
+            if "volume" in parsed:
+                params["volume"] = parsed["volume"]
         else:
             action = "play"
+            query = query or _extract_search_query(prompt)
 
     # ── Now playing ───────────────────────────────────────────────────────────
     if action == "now_playing":

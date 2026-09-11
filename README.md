@@ -1,518 +1,424 @@
-# Hearth - Local AI Assistant
+# Hearth — Local-First Personal AI Assistant
 
-Local-first personal AI assistant with streaming chat, wake-word voice input, hybrid memory (SQLite + ChromaDB), LangGraph-based stateful routing, code generation, and model routing between local Ollama and optional Anthropic fallback. HTTPS is served on the LAN via a Caddy reverse proxy so all clients — including Android and iOS — can access secure-context browser APIs (microphone, AudioWorklet, etc.).
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-009688.svg)](https://fastapi.tiangolo.com)
+[![LangGraph](https://img.shields.io/badge/LangGraph-orchestrated-orange.svg)](https://github.com/langchain-ai/langgraph)
+[![Docker Compose](https://img.shields.io/badge/docker--compose-v2+-2496ED.svg)](https://docs.docker.com/compose/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## Stack
+**Hearth** is a private, local-first personal AI assistant built for home environments. It pairs local OpenAI-compatible inference (such as `llama.cpp` or Ollama) with stateful LangGraph orchestration, hybrid vector/relational memory, streaming voice input/output, multimodal vision, and local music management over MPD and Beets.
 
-- FastAPI backend (single origin — serves both UI and API)
-- Caddy reverse proxy (HTTPS termination on the LAN edge)
-- Ollama for local inference (gemma3:4b for chat, qwen2.5-coder:7b for code)
-- Anthropic API as optional cloud fallback
-- LangGraph stateful graph with SqliteSaver checkpointing
-- openWakeWord for wake detection
-- faster-whisper for transcription
-- Piper / Kokoro TTS (pluggable via `TTS_ENGINE` env var)
-- SQLite + ChromaDB hybrid memory layer
-- Static frontend served by FastAPI
-- Docker Compose deployment
+All traffic is served securely on your local network via an integrated Caddy reverse proxy with `mkcert` TLS termination, enabling secure-context browser APIs (`navigator.mediaDevices`, AudioWorklet) across desktop browsers, Android, and iOS devices without third-party certificate authority dependencies.
+
+---
+
+## Table of Contents
+
+- [Key Features](#key-features)
+- [Architecture](#architecture)
+- [Project Layout](#project-layout)
+- [Prerequisites](#prerequisites)
+- [Quick Start](#quick-start)
+  - [1. Clone & Configure](#1-clone--configure)
+  - [2. Generate LAN HTTPS Certificates](#2-generate-lan-https-certificates)
+  - [3. Download Runtime Models](#3-download-runtime-models)
+  - [4. Start the Application](#4-start-the-application)
+  - [5. Trust the CA on Client Devices](#5-trust-the-ca-on-client-devices)
+- [Core Capabilities](#core-capabilities)
+  - [Streaming Chat & Checkpointed Sessions](#streaming-chat--checkpointed-sessions)
+  - [Voice & Audio Pipeline](#voice--audio-pipeline)
+  - [Multimodal Vision](#multimodal-vision)
+  - [Hybrid Memory Layer](#hybrid-memory-layer)
+  - [Local Music & MPD Integration](#local-music--mpd-integration)
+  - [Code Understanding](#code-understanding)
+- [Configuration Reference](#configuration-reference)
+- [API Overview](#api-overview)
+- [Local Development & Testing](#local-development--testing)
+  - [Running Without Docker](#running-without-docker)
+  - [Running the Test Suites](#running-the-test-suites)
+  - [Security & Quality Baseline Gates](#security--quality-baseline-gates)
+- [Troubleshooting](#troubleshooting)
+- [Acknowledgements](#acknowledgements)
+
+---
+
+## Key Features
+
+- 🔒 **Local-First & Private**: Runs entirely on your own hardware. Your prompts, memories, audio recordings, and images never leave your LAN unless you explicitly trigger optional cloud fallback (e.g. Anthropic Claude).
+- 🛡️ **Zero-Friction LAN HTTPS**: Integrated Caddy edge proxy terminates TLS on port 443 using local `mkcert` certificates, ensuring microphone and media device APIs work flawlessly on mobile and desktop.
+- 🎙️ **Complete Voice Pipeline**: Wake-word activation via [openWakeWord](https://github.com/dscripka/openWakeWord) ("Computer"), speech-to-text via [faster-whisper](https://github.com/guillaumekln/faster-whisper), and pluggable low-latency TTS ([Piper](https://github.com/rhasspy/piper) or [Kokoro](https://github.com/hexgrad/kokoro)) with automatic response compression and barge-in handling.
+- 👁️ **Multimodal Vision**: Attach images to chat prompts with automatic payload validation and direct routing to local or cloud vision models.
+- 🧠 **Hybrid Persistent Memory**: Combines SQLite (structured facts, user preferences, episodic session summaries) with ChromaDB vector embeddings for semantic recall and background "sleep" consolidation.
+- 🧭 **Dual-Classifier Intent Routing**: Blends embedding-based intent routing (`nomic-embed-text`) with deterministic regex patterns to route between fast-paths, tools, local models, and cloud fallback.
+- 🎵 **Local Music Automation**: Built-in [Beets](https://beets.io/) library metadata indexing and [MPD](https://www.musicpd.org/) playback control. Supports deterministic fast-path actions, genre/artist radio, queue management, volume adjustments, and queue shuffling.
+- 💻 **Code Questioning**: Dedicated `/code` endpoint and graph intent for code review, explanation, and architectural questions.
+- 🎨 **Responsive Web Interface**: Single-origin vanilla JS UI with light/dark theme toggle, real-time audio visualizers, session management, and settings menus.
+
+---
 
 ## Architecture
 
+```text
+ Client Devices (Desktop / iOS / Android)
+   │
+   │  HTTPS :443 (LAN Edge, TLS terminated by Caddy via mkcert)
+   ▼
+┌─────────────────────────────────────────────────────────────┐
+│ Caddy Reverse Proxy                                         │
+└──────────────────────────────┬──────────────────────────────┘
+                               │ HTTP (Internal Docker network)
+                               ▼
+┌─────────────────────────────────────────────────────────────┐
+│ FastAPI Backend (:8000, internal-only)                      │
+│                                                             │
+│ ┌─────────────────────────────────────────────────────────┐ │
+│ │ Pre-Graph Fastpaths                                     │ │
+│ │  ├── Auth Middleware (scrypt tokens, cookie-scoped)     │ │
+│ │  ├── Deterministic Music Fastpath (play/ctrl/shuffle)   │ │
+│ │  └── Image Validation (multimodal gate)                 │ │
+│ └────────────────────────────┬────────────────────────────┘ │
+│                              │                              │
+│ ┌────────────────────────────▼────────────────────────────┐ │
+│ │ LangGraph Stateful Graph (SqliteSaver Checkpointing)    │ │
+│ │                                                         │ │
+│ │  [History Loader] ──► [Intent Classifier]               │ │
+│ │                             │                           │ │
+│ │  [Tool Router]    ◄── [Memory Retrieval]                │ │
+│ │        │                                                │ │
+│ │  [Responder]      ──► [Memory Writer] ──► END           │ │
+│ └───────┬─────────────────────────────────────────────────┘ │
+│         │                                                   │
+│ ┌───────▼─────────────────────────────────────────────────┐ │
+│ │ Tools & Subsystems                                      │ │
+│ │  ├── Weather Tool (Open-Meteo geocoding & forecast)     │ │
+│ │  ├── Music Tool (Beets SQLite index + MPD client)       │ │
+│ │  ├── Hybrid Memory (SQLite relational + ChromaDB)       │ │
+│ │  └── Audio/TTS (openWakeWord, Whisper, Piper/Kokoro)    │ │
+│ └─────────────────────────────────────────────────────────┘ │
+└──────────────────────────────┬──────────────────────────────┘
+                               │
+               ┌───────────────┴───────────────┐
+               ▼                               ▼
+  Local Inference Server              Optional Cloud Fallback
+  (llama.cpp / vLLM / Ollama)         (Anthropic Claude API)
 ```
-Browser / LAN client
-  └── https://<LAN-IP>          ← Caddy (TLS, port 443)
-        └── http://backend:8000 ← FastAPI (internal Docker network only)
-              ├── GET  /        static frontend
-              ├── POST /chat    streaming chat (SSE)
-              ├── POST /transcribe
-              ├── WS   /ws/wake
-              └── GET  /health
-```
 
-- Caddy terminates TLS on the LAN. All internal Docker traffic is plain HTTP.
-- FastAPI is the **single origin** — it serves both the UI and all API endpoints.
-- The backend port (`8000`) is not published to the host. Only Caddy is reachable from the network (ports 443 and 80).
-- `open-webui` remains separately accessible on port `3000` (plain HTTP, out of scope for Phase 0b).
-
-Main backend endpoints:
-
-- `POST /chat` (SSE streaming)
-- `POST /transcribe`
-- `WS /ws/wake`
-- `GET /health`
-- `GET /memory`
-- `DELETE /memory/{id}`
-- `DELETE /memory`
-- `GET /chat/sessions`
-- `POST /chat/session/new`
-- `POST /chat/session/select`
-- `GET /chat/session/messages`
-- `DELETE /chat/session` (reset current session messages)
-- `DELETE /chat/sessions/{session_id}` (delete a specific session)
-- `GET /graph/state/{session_id}` — inspect LangGraph checkpoint state
-- `POST /tts` — synthesize speech (returns `audio/wav`)
-- `GET /persona` — get current persona settings
-- `POST /persona` — update persona tone/style prefs
-- `POST /auth/register` / `POST /auth/login` / `POST /auth/logout`
-- `GET /auth/me`
-
-Chat sessions are bounded and ephemeral: each authenticated user has their own in-memory session list, recent context is capped by turn/token budget, and older session history is compacted into a rolling summary for continuity.
-
-Code tool endpoint:
-- `POST /code` — stream code generation/editing via graph `code_tool` node
-
-Music endpoints (Phase 8):
-- `POST /music/search` — search the Beets library DB (title / artist / album)
-- `POST /music/play` — play a specific track or artist-radio
-- `POST /music/queue` — append tracks to MPD queue
-- `POST /music/control` — controls: `pause`, `resume`, `next`, `stop`, `play_pos`, `set_volume`
-- `GET /music/now_playing` — current track + playback state + queue position + volume
-- `GET /music/queue` — queued tracks
+---
 
 ## Project Layout
 
 ```text
 .
-├── docker-compose.yml
+├── docker-compose.yml          # Container stack orchestration (mpd, backend, caddy)
+├── config.yaml                 # Beets configuration
 ├── caddy/
-│   ├── Caddyfile             # Caddy reverse-proxy config
-│   └── certs/                # mkcert-generated cert + key (gitignored)
-│       ├── cert.pem
-│       └── key.pem
+│   ├── Caddyfile               # Caddy proxy rules
+│   └── certs/                  # Generated mkcert TLS certificates (gitignored)
 ├── backend/
-│   ├── main.py
-│   ├── router.py
-│   ├── memory.py
-│   ├── graph.py              # LangGraph graph definition + checkpointing
-│   ├── auth.py
-│   ├── requirements.txt
-│   ├── models/
-│   ├── tools/                # weather, music, code_indexer tool modules
-│   ├── tts/                  # pluggable TTS engines (Piper, Kokoro)
-│   ├── tests/
-│   └── Dockerfile
+│   ├── main.py                 # FastAPI application factory, lifespan, middleware
+│   ├── load_env.py             # Environment bootstrap (dotenv loader)
+│   ├── graph.py                # LangGraph state machine & node executors
+│   ├── intents.py              # Heuristic intent classifier & shared model constants
+│   ├── embedding_router.py     # Embedding-based exemplar classifier (tool + dialogue)
+│   ├── routing_config.py       # Intent router dataclass & threshold settings
+│   ├── music_fastpath.py       # Deterministic music parsing & response formatter
+│   ├── memory.py               # SQLite + ChromaDB hybrid storage & consolidation
+│   ├── memory_scheduler.py     # Background sleep-consolidation daemon
+│   ├── auth.py                 # Scrypt token authentication & SQLite store
+│   ├── app_schemas.py          # Pydantic request/response schemas
+│   ├── hearth_prompt.txt       # Persona system prompt
+│   ├── routes/                 # Factory route modules (chat, voice, auth, etc.)
+│   ├── tools/                  # Dispatchable tools (music, weather, base)
+│   ├── tts/                    # Pluggable TTS engines (Piper, Kokoro)
+│   ├── models/                 # ONNX/Whisper model binaries (gitignored)
+│   └── tests/                  # Pytest test suite (380+ tests)
 ├── frontend/
-│   ├── index.html
-│   ├── message.js
-│   ├── voice.js
-│   ├── persona.js
-│   ├── auth.js
-│   ├── style.css
-│   └── audio-processor.js
-└── scripts/
-  ├── download-models.sh
-  └── download-tts-models.sh
+│   ├── index.html              # Single-page web UI
+│   ├── message.js              # Streaming chat, markdown rendering, settings menu
+│   ├── voice.js                # Wake-word socket & audio recorder handling
+│   ├── auth.js                 # Authentication client logic
+│   ├── theme.js                # Early theme initialization (avoids flash)
+│   ├── audio-processor.js      # AudioWorklet processor for PCM capture
+│   └── style.css               # Responsive styling (light & dark modes)
+├── mpd/
+│   └── mpd.conf                # Music Player Daemon configuration
+├── scripts/
+│   ├── download-models.sh      # Downloads wake-word ONNX models
+│   ├── download-tts-models.sh  # Downloads Kokoro TTS model assets
+│   ├── download-whisper-model.sh # Downloads faster-whisper base model
+│   ├── review_baseline.sh      # Full verification gate (tests, audit, bandit)
+│   └── review_changed_tests.sh # Targeted git-diff test runner
+└── docs/                       # Architectural specs, review gates, checklists
 ```
+
+---
 
 ## Prerequisites
 
-- Docker + Docker Compose
-- NVIDIA GPU + drivers (optional but recommended for local model speed)
-- Linux host on LAN
-- [mkcert](https://github.com/FiloSottile/mkcert) for LAN-trusted certificates (see HTTPS Setup below)
+- **Docker** and **Docker Compose v2+**
+- **mkcert** ([installation guide](https://github.com/FiloSottile/mkcert))
+- An OpenAI-compatible local inference server (e.g. [llama.cpp server](https://github.com/ggerganov/llama.cpp), [vLLM](https://github.com/vllm-project/vllm), or [Ollama](https://ollama.com/))
+- *(Optional)* NVIDIA GPU with CUDA Container Toolkit for accelerated local inference
 
-## HTTPS Setup (Phase 0b)
+---
 
-Caddy terminates HTTPS using a certificate generated by **mkcert**. This gives every LAN device a browser-trusted certificate after a one-time CA installation — no certificate errors, and `navigator.mediaDevices` works on Android and iOS.
+## Quick Start
 
-### 1 — Install mkcert on the host (once)
-
-```bash
-# Debian / Ubuntu
-sudo apt install mkcert libnss3-tools
-
-# macOS
-brew install mkcert
-
-# Or download the binary from https://github.com/FiloSottile/mkcert/releases
-```
-
-### 2 — Install the local CA (once per host user)
+### 1. Clone & Configure
 
 ```bash
-mkcert -install
+git clone https://github.com/your-username/hearth.git
+cd hearth
+cp .env.example .env
 ```
 
-### 3 — Generate certificates for your LAN IP (or hostname)
-
-Replace `192.168.1.42` with your host's actual LAN IP. Add extra names separated by spaces if needed (e.g. a local hostname like `assistant.lan`).
-
-```bash
-mkdir -p caddy/certs
-mkcert -cert-file caddy/certs/cert.pem -key-file caddy/certs/key.pem \
-    192.168.1.42 localhost 127.0.0.1
-```
-
-The `caddy/certs/` directory is gitignored — never commit certificates or private keys.
-
-### 4 — Trust the CA on client devices (once per device)
-
-After step 2, mkcert stores the CA certificate at the path printed by:
-
-```bash
-mkcert -CAROOT
-```
-
-Copy `rootCA.pem` from that directory to each client device and install it:
-
-- **Android**: Settings → Security → Install certificate → CA certificate
-- **iOS / iPadOS**: AirDrop or email the `.pem`, open it, go to Settings → Profile Downloaded → Install, then Settings → General → About → Certificate Trust Settings → enable it
-- **Other Linux browsers**: `mkcert -install` on that machine, or import via the browser's certificate manager
-
-## Environment Variables
-
-Create `.env` in the repo root. Example:
+Edit `.env` to configure your model names, LAN IP, and music paths:
 
 ```bash
 # Model routing
-ANTHROPIC_API_KEY=your_key_here
-OLLAMA_CHAT_MODEL=gemma4:e4b
-ROUTER_EMBED_MODEL=nomic-embed-text
-ROUTER_EMBED_TIMEOUT_MS=10000
-OLLAMA_CODER_MODEL=qwen2.5-coder:14b
+OPENAI_CHAT_MODEL=gemma-4
+OPENAI_BASE_URL=http://localhost:10000/v1
 MODEL_CLOUD=claude-sonnet-4-20250514
+ANTHROPIC_API_KEY=your_anthropic_api_key_if_desired
 
-# Chat / coder model split (Phase 4b)
-# OLLAMA_CHAT_MODEL overrides MODEL_LOCAL for general chat.
-# OLLAMA_CODER_MODEL selects a code-specialized model for code intents.
-# If unset, both fall back through the chain: OLLAMA_CHAT_MODEL → MODEL_LOCAL → llama3.2
-#OLLAMA_CHAT_MODEL=llama3.2
-#OLLAMA_CODER_MODEL=qwen2.5-coder:7b
-
-# Inner-monologue planner (Phase 4b)
-# Set ROUTER_PLANNER_ENABLED=false to revert to heuristic-only routing.
-ROUTER_PLANNER_ENABLED=true
-ROUTER_PLANNER_TIMEOUT_MS=4000
-ROUTER_PLANNER_MAX_TOKENS=200
-ROUTER_PLANNER_TEMPERATURE=0.0
-
-# Weather tool (Phase 6) — Open-Meteo, no API key required
-# WEATHER_UNITS: celsius | fahrenheit
-WEATHER_UNITS=celsius
-# WEATHER_TIMEOUT_MS: HTTP timeout for geocoding + forecast requests
-WEATHER_TIMEOUT_MS=5000
-
-# Optional cloud fallback
-ANTHROPIC_API_KEY=
-
-# Session settings
-CHAT_SESSION_COOKIE=assistant_session
-CHAT_SESSION_IDLE_TTL_SECONDS=1800
-CHAT_SESSION_MAX_ITEMS=200
-CHAT_TOKEN_BUDGET=1500
-CHAT_MAX_TURNS=24
-
-# Ollama backend URL (inside Docker network)
-OLLAMA_URL=http://ollama:11434
-
-# Memory tuning
-MEMORY_TOP_N=5
-MEMORY_MIN_RELEVANCE_SCORE=0.28
-# MEMORY_DB_PATH=/app/memory.db
-# CHROMA_PATH=/app/chroma
-#
-# Music / MPD (Phase 8)
-# BEETS_DB_PATH=~/.config/beets/library.db   # path to the Beets library.db
-# BEETS_DB_DIR=~/.config/beets               # host dir mounted at /beets in container
-# MUSIC_PATH=buffer/audio                 # host music dir (mounted at /music)
-# MUSIC_ROOT=/music                                   # container-side mount point (matches mpd.conf)
-# MPD_HOST=mpd
-# MPD_PORT=6600
-# MPD_TIMEOUT=5
-# MUSIC_SEARCH_LIMIT=20
-# MUSIC_ARTIST_RADIO_N=10
-# MUSIC_PLAYLIST_MIN_N=12
-# MUSIC_PLAYLIST_MAX_N=24
-# PULSE_SERVER=/run/user/1000/pulse/native
-# PUID=1000
-# PGID=1000
-#
-# TTS / Kokoro (Phase 9)
-# TTS_ENGINE=kokoro
-# TTS_KOKORO_MODEL=/app/models/tts/kokoro-v1.0.int8.onnx
-# TTS_KOKORO_VOICES=/app/models/tts/voices-v1.0.bin
-# TTS_KOKORO_VOICE=af_heart
-# TTS_KOKORO_LANG=en-us
-# TTS_KOKORO_SPEED=1.0
-
-# HTTPS / CORS policy (Phase 0b)
-# Set CORS_ORIGINS to the exact Caddy origin once HTTPS is in use.
-# Multiple origins: comma-separated (e.g. https://192.168.1.42,https://assistant.lan)
-# Default '*' keeps Phase 1 permissive behaviour for plain-HTTP local dev.
-CORS_ORIGINS=https://192.168.1.42
-
-# Set to 'true' when Caddy is the browser-facing edge (i.e. HTTPS is in use).
-# Tells the browser to send the session cookie only over HTTPS connections.
+# Network & TLS
+CORS_ORIGINS=https://192.168.1.50,https://localhost
 SESSION_COOKIE_SECURE=true
+
+# Music Paths
+MUSIC_PATH=/path/to/your/music
+BEETS_DB_DIR=/path/to/your/beets
 ```
 
-Notes:
+### 2. Generate LAN HTTPS Certificates
 
-- If `ANTHROPIC_API_KEY` is empty, cloud fallback is disabled and local responses continue.
-- Memory DB and Chroma data are stored under `backend/` by default.
-- Replace `192.168.1.42` with your actual LAN IP in `CORS_ORIGINS`.
+Use `mkcert` to issue a local certificate covering `localhost`, `127.0.0.1`, and your host's LAN IP (e.g. `192.168.1.50`):
 
-## Run With Docker
+```bash
+# Install local CA on the host
+mkcert -install
 
-Complete the HTTPS Setup steps above first (mkcert install, cert generation, `.env` configuration), then:
+# Generate certificates into caddy/certs/
+mkdir -p caddy/certs
+mkcert -cert-file caddy/certs/cert.pem -key-file caddy/certs/key.pem \
+    localhost 127.0.0.1 192.168.1.50
+```
+
+### 3. Download Runtime Models
+
+Fetch the wake-word, whisper transcription, and TTS model files:
+
+```bash
+bash scripts/download-models.sh
+bash scripts/download-tts-models.sh
+bash scripts/download-whisper-model.sh
+```
+
+### 4. Start the Application
+
+Start the Docker Compose stack:
 
 ```bash
 docker compose up -d --build
 ```
 
-Check health through Caddy:
+Verify that all containers are healthy:
 
 ```bash
-curl -s https://<your-lan-ip>/health
+docker compose ps
+curl -sk https://localhost/health
 ```
 
-Open UI:
+### 5. Trust the CA on Client Devices
 
-- `https://<your-lan-ip>` from any device on the LAN (after CA trust installation)
-- `https://localhost` from the host machine
+To enable microphone access on mobile browsers, install the root CA generated by `mkcert`:
 
-> **Microphone and voice** require a secure context. On Android and iOS, install the mkcert CA certificate first (see HTTPS Setup above). Once trusted, `navigator.mediaDevices` will be available and wake-word voice input will work.
+1. Locate the CA file on your host:
+   ```bash
+   mkcert -CAROOT
+   ```
+2. Transfer `rootCA.pem` to your phone or client device:
+   - **iOS**: AirDrop or email `rootCA.pem` → Profile Downloaded → Install → Settings → General → About → Certificate Trust Settings → Enable Full Trust.
+   - **Android**: Settings → Security & Privacy → More Security Settings → Install from device storage → CA certificate.
+3. Open `https://<YOUR-LAN-IP>` in your mobile browser.
 
-## Review and Security Gates
+---
 
-This repository includes baseline review controls for security and correctness:
+## Core Capabilities
 
-- Local baseline script: `scripts/review_baseline.sh`
-- CI workflow: `.github/workflows/backend-review-gates.yml`
-- Review checklist: `docs/review/SECURITY_CORRECTNESS_CHECKLIST.md`
-- Enforcement guide: `docs/review/ENFORCEMENT.md`
+### Streaming Chat & Checkpointed Sessions
 
-Run local checks before opening a PR:
+Hearth orchestrates interactions through a LangGraph state machine:
+- **Conversation Continuity**: Every session is saved with `SqliteSaver` checkpointing, allowing users to switch or resume conversations without state loss.
+- **Budget-Aware History**: Multi-turn history is dynamically budgeted against token constraints (`CHAT_TOKEN_BUDGET`), while older turns are automatically compacted into rolling session summaries.
+- **Inner-Monologue & Reasoning**: When supported by the underlying model (such as via `OPENAI_THINK=true`), thinking tokens stream directly to the frontend and can be toggled in the UI.
 
-```bash
-bash scripts/review_changed_tests.sh --base origin/main
-bash scripts/review_baseline.sh
-```
+### Voice & Audio Pipeline
 
-### CI (GitHub Actions)
+Voice interaction runs over low-latency WebSockets and SSE:
+- **Wake Word Detection**: Client streams audio through an `AudioWorklet` over `WS /ws/wake`. Detected using local ONNX wake-word models.
+- **Speech-to-Text**: High-speed transcription via `faster-whisper`.
+- **Speech Synthesis**: Synthesizes speech with Piper or Kokoro TTS. Spoken responses are intelligently compressed into conversational summaries so the assistant speaks concisely while full markdown is rendered on screen.
+- **Barge-In**: Speaking while audio is playing immediately interrupts playback.
 
-The `backend-review-gates` workflow runs on every pull request and on push to
-`main`. It mirrors `scripts/review_baseline.sh`:
+### Multimodal Vision
 
-- **Required (blocking):** the focused regression suite
-  (`test_auth`, `test_router`, `test_graph`, `test_memory_isolation`,
-  `test_weather`) and a **gitleaks** secret scan.
-- **Advisory (non-blocking, `continue-on-error`):** `pip-audit` dependency
-  vulnerability audit and `bandit` static security scan. These run for signal
-  but never hard-block a merge, since they only run locally when installed and
-  a fresh vulnerability database can introduce time-dependent findings.
+Attach images directly in the chat interface:
+- **Structural Intent**: When an image is attached, the request is validated and automatically routed to the vision model (bypassing text-only fastpaths).
+- **Format Validation**: Ensures valid MIME types (`image/png`, `image/jpeg`, `image/webp`) and payload size boundaries.
 
-> **Enforcing the gate.** The workflow running is not the same as it blocking.
-> To make required checks gate merges: repository **Settings → Branches →
-> `main` → Require status checks to pass before merging**, then add
-> `backend-review-gates`. Until that is set, PRs will show the check result but
-> can still be merged while it is red.
+### Hybrid Memory Layer
 
-Optional local iteration mode (does not affect CI):
+Hearth maintains long-term memory using a dual-storage strategy:
+- **Relational Storage (SQLite)**: Tracks discrete facts, user preferences, and conversation turns.
+- **Vector Retrieval (ChromaDB)**: Embeds facts and summaries into a collection (`conversation_memory`) for semantic search.
+- **Periodic "Sleep" Consolidation**: When the user is idle, a background daemon distills episodic turns into generalized facts and clears expired entries without stalling active chats.
+- **In-Chat Controls**: Use natural commands like `"remember that I drink green tea"` or `"forget my location"`. Sensitive data (tokens, passwords) is automatically blocked.
 
-```bash
-bash scripts/review_changed_tests.sh --base origin/main --allow-known-failures
-```
+### Local Music & MPD Integration
 
-Known-failures deselection list is stored at `docs/review/KNOWN_FAILURES.txt`.
+Listen to your personal music collection through MPD and Beets:
+- **Deterministic Fast-Path**: Natural phrases bypass the LLM entirely for instant execution:
+  - *"Play Bohemian Rhapsody"*
+  - *"Queue some jazz"*
+  - *"Shuffle my playlist"*
+  - *"Set volume to 60"*
+  - *"What's playing?"*
+- **Beets Integration**: Queries your existing Beets database for artist, album, and genre queries.
+- **Library Updates**: Update your library from the web UI settings menu or via `POST /music/beets/update`.
 
-Notes:
+### Code Understanding
 
-- CI runs secret scanning via gitleaks as a **required** check; `pip-audit` and
-  `bandit` run as advisory, non-blocking steps.
-- The known-failures list (`docs/review/KNOWN_FAILURES.txt`) is local-only — CI
-  does not apply it.
-- Local secret scanning runs automatically when `gitleaks` is installed.
+- **Question Mode**: Hearth routes explanation requests (*"how does this algorithm work?"*, *"explain this error"*) through a code-optimized prompt.
+- **Safe Guardrails**: Code execution and filesystem writes are strictly disallowed; requests are kept as safe, conversational programming explanations.
 
-## Wake Word Models
+---
 
-Required ONNX model files in `backend/models/`:
+## Configuration Reference
 
-- `computer_v2.onnx`
-- `melspectrogram.onnx`
-- `embedding_model.onnx`
+Key variables configured in `.env`:
 
-If missing, run:
+| Category | Variable | Default | Description |
+| :--- | :--- | :--- | :--- |
+| **Inference** | `OPENAI_BASE_URL` | `http://localhost:10000/v1` | URL of the OpenAI-compatible inference server |
+| | `OPENAI_CHAT_MODEL` | `gemma-4` | Model name for conversational chat |
+| | `OPENAI_VISION_MODEL` | *(same as chat)* | Model name for vision requests |
+| | `MODEL_CLOUD` | `claude-sonnet-4-20250514` | Optional Anthropic model for cloud fallback |
+| | `ANTHROPIC_API_KEY` | `""` | API key for Anthropic fallback (optional) |
+| | `CHAT_MODEL_WARMUP` | `true` | Pre-load chat model into VRAM on startup |
+| **Router** | `ROUTER_EMBED_MODEL` | `nomic-embed-text` | Model used for embedding router exemplar classification |
+| | `ROUTER_EMBEDDING_ENABLED` | `true` | Enable embedding-based intent classifier |
+| | `ROUTE_CONFIDENCE_THRESHOLD` | `0.70` | Confidence required before cloud fallback escalation |
+| **Memory** | `MEMORY_TOP_N` | `5` | Maximum memory hits injected into context |
+| | `MEMORY_SLEEP_ENABLED` | `true` | Run background memory consolidation while idle |
+| | `MEMORY_SLEEP_INTERVAL_SECONDS` | `900` | Consolidation loop heartbeat interval |
+| **Audio & TTS** | `TTS_ENGINE` | `piper` | Active TTS engine (`piper` or `kokoro`) |
+| | `PULSE_SOCKET` | `/run/user/1000/pulse/native` | Host PulseAudio/PipeWire socket for MPD audio |
+| **Music** | `MUSIC_PATH` | `/path/to/music` | Host directory containing audio files |
+| | `BEETS_DB_DIR` | `/path/to/beets` | Host directory containing Beets `library.db` |
+| | `MPD_HOST` | `mpd` | Hostname of MPD daemon |
+| **Network & Auth** | `CORS_ORIGINS` | `*` | Allowed CORS origins (set to exact LAN HTTPS address in prod) |
+| | `SESSION_COOKIE_SECURE` | `false` | Send cookies only over HTTPS (`true` when Caddy terminates TLS) |
 
-```bash
-bash scripts/download-models.sh
-```
+---
 
-## TTS Models
+## API Overview
 
-Phase 9 voice output requires separate Kokoro model assets. Download them into
-`backend/models/tts/` before expecting `/tts` or voice responses to work:
+| Method | Path | Description |
+| :--- | :--- | :--- |
+| `POST` | `/chat` | SSE streaming chat endpoint (supports text, voice source, and images) |
+| `POST` | `/code` | Intent-biased code question endpoint |
+| `POST` | `/transcribe` | Transcribes multipart audio via faster-whisper |
+| `POST` | `/tts` | Synthesizes speech to `audio/wav` via Piper/Kokoro |
+| `WS` | `/ws/wake` | WebSocket stream for continuous wake-word detection |
+| `GET` | `/health` | Application healthcheck |
+| `GET` | `/memory` | List stored facts, preferences, and summaries |
+| `DELETE`| `/memory/{id}` | Delete a specific memory item |
+| `POST` | `/memory/consolidate` | Manually trigger episodic memory consolidation |
+| `GET` | `/chat/sessions` | List active sessions for authenticated user |
+| `POST` | `/chat/session/new` | Create a new chat session |
+| `POST` | `/chat/session/select` | Switch the active session |
+| `DELETE`| `/chat/sessions/{id}` | Delete a specific chat session |
+| `GET` | `/music/now_playing` | Inspect current track, state, and volume |
+| `GET` | `/music/queue` | View current MPD playback queue |
+| `POST` | `/music/control` | Control MPD playback (`pause`, `resume`, `next`, `shuffle`, `set_volume`) |
+| `POST` | `/music/beets/update` | Rescan and import new tracks into Beets library |
+| `POST` | `/auth/register` | Register a new user account |
+| `POST` | `/auth/login` | Authenticate and obtain session token |
+| `POST` | `/auth/logout` | Invalidate current session token |
+| `GET` | `/auth/me` | Return authenticated user details |
 
-```bash
-bash scripts/download-tts-models.sh
-```
+---
 
-The default Docker setup expects these exact files:
+## Local Development & Testing
 
-- `backend/models/tts/kokoro-v1.0.int8.onnx`
-- `backend/models/tts/voices-v1.0.bin`
+### Running Without Docker
 
-If you prefer a different Kokoro model variant, set `TTS_KOKORO_MODEL` in `.env`
-to the matching file path. The compose defaults point at the int8 model to keep
-download size and memory usage lower.
-
-## Code Question Mode
-
-Hearth uses an internal code-question flow only:
-1. Main chat keeps code-question intent for explain and how-does requests.
-2. The /code endpoint is a local intent-bias path that forces code-question routing.
-3. There is no external coding-agent runtime dependency or adapter URL.
-
-- The backend includes a local music tool that uses [Beets](https://beets.io/) as
-  the music library and MPD for playback.
-- **New-user setup** — no Strawberry required:
-  1. Point `MUSIC_PATH` in `.env` at your music folder (e.g. `/path/to/audio`).
-  2. Set `BEETS_DB_DIR` to the directory where Beets should keep `library.db`
-  (default: `~/.config/beets`). Keep `BEETS_DB_PATH` as `/beets/library.db`
-  for Docker, or set it to a different in-container filename if needed.
-  3. Start the stack (`docker compose up -d`). On first boot the backend detects
-     an empty library and runs `beet import -A /music` automatically — it reads
-     existing file tags with no MusicBrainz lookups and no files are moved.
-  4. Subsequent startups skip the import because the DB is already populated.
-  5. A manual way to trigger the import is from inside the running container:
-  `docker compose exec backend sh -c 'cd /beets && beet import -A /music'`
-    
-- `MUSIC_ROOT` (container path, default `/music`) must match the `music_directory`
-  in `mpd/mpd.conf` so the backend can strip the prefix and produce MPD-relative paths.
-- `BEETS_DB_DIR` is the host directory bind-mounted into the backend container.
-  `BEETS_DB_PATH` is the runtime file path read by the backend process.
-- If your host uses PipeWire/PulseAudio, mount the socket and set `PULSE_SERVER`
-  (e.g. `/run/user/1000/pulse/native`) so MPD can output audio from the container.
-
-Frontend behaviour:
-
-- The UI exposes a now-playing bar and queue that poll `GET /music/now_playing`
-  and `GET /music/queue`. Playback controls call `POST /music/control`.
-- Queue click-to-play uses `play_pos`, and the music panel volume dial uses
-  `set_volume` with values clamped to 0-100.
-
-## Local Development (Without Docker)
+To run the FastAPI server directly on the host machine:
 
 ```bash
 cd backend
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+
+# Use custom paths to avoid writing state into source control:
+mkdir -p /tmp/hearth-local
+CHROMA_PATH=/tmp/hearth-local/chroma \
+MEMORY_DB_PATH=/tmp/hearth-local/memory.db \
+GRAPH_CHECKPOINT_DB_PATH=/tmp/hearth-local/graph-checkpoints.sqlite \
+AUTH_DB_PATH=/tmp/hearth-local/auth.db \
+uvicorn main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-Then open `https://localhost` (via Caddy) or `http://localhost:8000` directly for backend-only dev. Note that microphone access requires a secure context — use the Caddy HTTPS path even for local dev if you need voice features.
+### Running the Test Suites
 
-## Testing
-
-- Run the backend test suite inside the backend container:
+Run the full pytest suite (380+ tests):
 
 ```bash
-docker compose exec -T backend pytest -q
-```
-
-- If you hit import errors like `ModuleNotFoundError: No module named 'tools.music'`, run tests from the application root so `tools` is discoverable:
-
-```bash
+# In Docker:
 docker compose exec -T backend sh -c 'cd /app && PYTHONPATH=/app python -m pytest -q'
+
+# Locally from repository root:
+cd backend && python -m pytest -q
 ```
 
-- Current verified result (backend test run): see `docs/review/KNOWN_FAILURES.txt` for any deselected tests.
+### Security & Quality Baseline Gates
 
-- Coverage includes:
-  - `test_chat_sessions.py` — `/chat` SSE framing and `[DONE]` termination
-  - `test_chat_voice_metadata.py` — source normalization and voice metadata helpers
-  - `test_tts_endpoint.py` — `/tts` status-code and payload mapping
-  - `test_code_tool.py` — code tool node, workspace-root enforcement, confirmation gating
-  - `test_graph.py` — LangGraph node wiring and checkpoint resume
-  - `test_persona.py` — persona rendering and fact-drift safety
-  - `test_chroma_isolation.py` and `test_memory_isolation.py` — ChromaDB collection isolation
-  - `test_responder_modality.py` — voice/chat modality split
+Hearth includes automated local validation scripts that mirror the GitHub Actions CI pipeline:
 
-## Session Management (Phase 5)
+```bash
+# Run tests for files modified relative to origin/main:
+bash scripts/review_changed_tests.sh
 
-Session state is in-memory and cookie-scoped.
+# Run the complete review gate (tests, pip-audit, gitleaks, bandit):
+bash scripts/review_baseline.sh
+```
 
-- New session: `POST /chat/session/new`
-- Switch session: `POST /chat/session/select`
-- List sessions: `GET /chat/sessions`
-- Get current session messages: `GET /chat/session/messages`
-- Reset current session messages: `DELETE /chat/session`
-- Delete one session: `DELETE /chat/sessions/{session_id}`
-
-Behavior:
-
-- Deleting the active session automatically creates a new session cookie.
-- Sessions expire by idle TTL and may be evicted by max-capacity settings.
-
-## Memory Layer (Phase 5)
-
-Memory uses SQLite for structured storage and Chroma for semantic recall.
-
-Tables:
-
-- `facts`
-- `preferences`
-- `summaries`
-
-Commands recognized in chat:
-
-- `save this`
-- `remember this`
-- `remember <text>`
-- `do not remember this`
-- `forget <query>`
-
-Safety behavior:
-
-- Sensitive values (tokens/passwords/phone-like/address-like patterns) are blocked.
-- Some location-history style entries require confirmation unless explicit save is requested.
+---
 
 ## Troubleshooting
 
-- `/health` fails:
-  - Check Caddy logs: `docker compose logs -f caddy`
-  - Check backend logs: `docker compose logs -f backend`
-- Certificate errors in the browser:
-  - Ensure the mkcert CA is installed on the client device (see HTTPS Setup)
-  - Confirm `caddy/certs/cert.pem` and `caddy/certs/key.pem` exist and cover your LAN IP
-  - Regenerate certs with the correct IP if needed: `mkcert -cert-file caddy/certs/cert.pem ...`
-- `navigator.mediaDevices` is `undefined` on mobile:
-  - The browser requires a secure context. Install the mkcert CA on the device and access via `https://`
-- Wake word not triggering:
-  - Confirm model files exist in `backend/models/`
-  - Verify mic permissions in browser
-- Cloud responses not used:
-  - Ensure `ANTHROPIC_API_KEY` is set
-  - Check route telemetry logs from backend
-- Session list empty after restart:
-  - Expected. Session store is currently in-process memory only.
+- **Microphone / Voice Not Working on Mobile**:
+  - Web browsers require a *Secure Context* to access `navigator.mediaDevices`. Ensure you are connecting via `https://` and have installed the `mkcert` root CA on your mobile device (see [Trust the CA](#5-trust-the-ca-on-client-devices)).
+- **Container Healthcheck Fails on Startup**:
+  - The startup chat-model warmup (`CHAT_MODEL_WARMUP=true`) can take 60–90 seconds while weights load into VRAM. The Compose healthcheck has a 120s `start_period` for this reason. Check logs with `docker compose logs -f backend`.
+- **No Sound from MPD**:
+  - Ensure your host user's PulseAudio socket is reachable and `PULSE_SOCKET` is correctly set in `.env` (typically `/run/user/1000/pulse/native`). Verify permissions with `ls -la $PULSE_SOCKET`.
+- **Missing Models Warning on Boot**:
+  - Run `bash scripts/download-models.sh`, `bash scripts/download-tts-models.sh`, and `bash scripts/download-whisper-model.sh` to download the required assets.
 
-## Current Status
+---
 
-- Phase 0b (HTTPS edge via Caddy): complete
-- Phases 1–8 (core chat, wake-word, memory, weather, and music): complete
-- Phase 9 (TTS voice output, `/tts`, Piper + Kokoro engines, frontend playback, barge-in): complete
-- Phase 10a (LangGraph migration, graph skeleton, SqliteSaver checkpointing, `/graph/state`): complete
-- Phase 10b (code tool node, ReAct loop, tree-sitter indexer, ChromaDB `code_context`, `/code` endpoints): complete
-- Phase 10c (responder/modality split, voice compression, fact-drift tests): complete
-- Phase 10d (ChromaDB cleanup, `conversation_memory` collection, auto-migration, isolation tests): complete
-- Phase 11 (persona renderer, tone probe, persona prefs, UI controls, fact-drift enforcement): partially complete
-- Phases 12–14: not started
+## Acknowledgements
 
-## Security Notes
+Hearth builds on top of an incredible ecosystem of open-source projects:
 
-- Do not commit `.env`
-- Keep API keys in environment variables only
-- Frontend uses relative API paths and is served by backend static mount
-- File/path safety constraints are enforced in backend features as implemented
-
-## Shoutouts
-
-- [Ollama](https://ollama.com/) for making local LLM hosting accessible and performant.
-- [Caddy](https://caddyserver.com/) for seamless HTTPS on the LAN.
-- [faster-whisper](https://github.com/guillaumekln/faster-whisper) for efficient speech-to-text processing.
-- [sqlite3](https://www.sqlite.org/index.html) and [ChromaDB](https://www.trychroma.com/) for a powerful hybrid memory solution.
-- [openmeteo](https://open-meteo.com/) for free weather data with a simple API.
-- [beets](https://beets.io/) for local music library management (tag-based, offline-first).
-
+- [FastAPI](https://fastapi.tiangolo.com/) for high-performance async APIs.
+- [LangChain & LangGraph](https://github.com/langchain-ai/langgraph) for robust state machine execution and checkpointing.
+- [Caddy Server](https://caddyserver.com/) for automatic, zero-config reverse proxying.
+- [openWakeWord](https://github.com/dscripka/openWakeWord) for efficient on-device wake-word detection.
+- [faster-whisper](https://github.com/guillaumekln/faster-whisper) for ultra-fast local transcription.
+- [Piper](https://github.com/rhasspy/piper) & [Kokoro](https://github.com/hexgrad/kokoro) for neural text-to-speech.
+- [ChromaDB](https://www.trychroma.com/) & [SQLite](https://www.sqlite.org/) for hybrid vector and relational memory.
+- [Beets](https://beets.io/) & [Music Player Daemon (MPD)](https://www.musicpd.org/) for local audio management.

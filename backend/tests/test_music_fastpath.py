@@ -51,3 +51,51 @@ def test_format_play_multi_track_genre_response():
         {"action": "play", "query": "heavy metal"},
     )
     assert msg == "Now playing: 2 Heavy Metal tracks."
+
+
+def test_parse_shuffle_control_commands():
+    for text in ("shuffle", "shuffle music", "shuffle the music", "shuffle my playlist", "shuffle the queue", "shuffle tracks"):
+        cmd = parse_music_command(text)
+        assert cmd is not None, f"Failed for {text}"
+        assert cmd["action"] == "control"
+        assert cmd["control"] == "shuffle"
+
+
+def test_parse_shuffle_entity_command():
+    cmd = parse_music_command("shuffle Radiohead")
+    assert cmd is not None
+    assert cmd["action"] == "play"
+    assert cmd["query"] == "radiohead"
+
+
+def test_parse_start_playing_prefix():
+    cmd = parse_music_command("start playing Bohemian Rhapsody")
+    assert cmd is not None
+    assert cmd["action"] == "play"
+    assert cmd["query"] == "bohemian rhapsody"
+
+
+def test_parse_add_to_the_queue():
+    cmd = parse_music_command("add to the queue Creep by Radiohead")
+    assert cmd is not None
+    assert cmd["action"] == "queue"
+    assert cmd["query"] == "creep"
+    assert cmd["artist_filter"] == "radiohead"
+
+
+def test_format_shuffle_response():
+    msg = format_music_response(
+        ToolResult(ok=True, data={"action": "shuffle", "ok": True}),
+        {"action": "control", "control": "shuffle"},
+    )
+    assert msg == "Queue shuffled."
+
+
+def test_allow_vague_flag():
+    # allow_vague=False returns None for fastpath
+    assert parse_music_command("play something chill", allow_vague=False) is None
+    # allow_vague=True returns parsed params for tools/music
+    parsed = parse_music_command("play something chill", allow_vague=True)
+    assert parsed is not None
+    assert parsed["action"] == "play"
+    assert parsed["query"] == "something chill"

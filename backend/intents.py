@@ -331,6 +331,7 @@ def classify_intent(prompt: str) -> RouteDecision:
         use_cloud=use_cloud,
         model=model,
         tool=tool,
+        needs_memory=(intent == "memory-needed"),
         planner_status="heuristic",
     )
 

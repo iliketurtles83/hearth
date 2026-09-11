@@ -772,3 +772,51 @@ async def test_song_id_not_found():
         result = await music.run({"action": "play", "song_id": 9999, "prompt": ""})
     assert not result.ok
     assert not result.retryable
+
+
+def test_sync_control_shuffle_empty_queue():
+    client = MagicMock()
+    client.status.return_value = {"playlistlength": "0"}
+    with patch.object(music, "_mpd_connect", return_value=client):
+        with pytest.raises(ValueError, match="The queue is empty."):
+            music._sync_control("shuffle")
+
+
+def test_sync_control_shuffle_non_empty_queue():
+    client = MagicMock()
+    client.status.return_value = {"playlistlength": "5"}
+    with patch.object(music, "_mpd_connect", return_value=client):
+        music._sync_control("shuffle")
+    client.shuffle.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_run_shuffle_prompt_infers_control():
+    with patch.object(music, "_sync_control") as mock_ctrl:
+        result = await music.run({"prompt": "shuffle my playlist"})
+    assert result.ok
+    assert result.data["action"] == "shuffle"
+    mock_ctrl.assert_called_once_with("shuffle")
+
+
+@pytest.mark.asyncio
+async def test_run_shuffle_prompt_empty_queue_error():
+    client = MagicMock()
+    client.status.return_value = {"playlistlength": "0"}
+    with patch.object(music, "_mpd_connect", return_value=client):
+        result = await music.run({"prompt": "shuffle the queue"})
+    assert not result.ok
+    assert result.error == "The queue is empty."
+    assert not result.retryable
+
+
+@pytest.mark.asyncio
+async def test_run_add_to_the_queue_prompt_infers_queue_action():
+    with (
+        patch.object(music, "_sync_search_by_title_artist", return_value=[{"title": "Creep", "artist": "Radiohead", "url": "/music/creep.mp3", "score": 1.0}]),
+        patch.object(music, "_sync_queue") as mock_q,
+    ):
+        result = await music.run({"prompt": "add to the queue Creep by Radiohead"})
+    assert result.ok
+    assert result.data["action"] == "queue"
+    mock_q.assert_called_once_with("/music/creep.mp3")

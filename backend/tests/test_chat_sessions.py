@@ -576,7 +576,7 @@ async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypat
 
 
 @pytest.mark.asyncio
-async def test_chat_vague_music_prompt_uses_music_fastpath(monkeypatch):
+async def test_chat_vague_music_prompt_bypasses_music_fastpath(monkeypatch):
     music_dispatch_calls: list[tuple[str, dict]] = []
 
     async def _unexpected_music_dispatch(tool_name: str, params: dict):
@@ -625,6 +625,71 @@ async def test_chat_vague_music_prompt_uses_music_fastpath(monkeypatch):
     assert json.loads(events[0])["model"] == main.CHAT_MODEL
     assert any(json.loads(event).get("text") == "handled by graph" for event in events if event != "[DONE]")
     assert events[-1] == "[DONE]"
+
+
+@pytest.mark.asyncio
+async def test_chat_image_attachment_with_music_keyword_bypasses_music_fastpath(monkeypatch):
+    import base64
+    valid_b64 = base64.b64encode(b"\xff" * 64).decode()
+    music_dispatch_calls: list[tuple[str, dict]] = []
+
+    async def _unexpected_music_dispatch(tool_name: str, params: dict):
+        music_dispatch_calls.append((tool_name, params))
+        raise AssertionError("deterministic music fastpath should not run when image is attached")
+
+    class _FakeGraph:
+        async def astream(self, state, config=None, stream_mode=None):
+            assert state.get("image_base64") == valid_b64
+            yield {
+                "meta": {
+                    "model": "vision-model",
+                    "intent": "vision",
+                    "confidence": 1.0,
+                    "route_type": "vision",
+                    "needs_memory": False,
+                    "tool": None,
+                    "planner_status": "deterministic",
+                    "reasoning_summary": "",
+                }
+            }
+            yield {"text": "image described"}
+
+    monkeypatch.setattr(main.tools, "dispatch", _unexpected_music_dispatch)
+    monkeypatch.setattr(main.app.state, "assistant_graph", _FakeGraph(), raising=False)
+    monkeypatch.setattr(main.memory_store, "retrieve", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        main.memory_store,
+        "ingest_user_message",
+        lambda *_args, **_kwargs: {
+            "status": "none",
+            "saved": [],
+            "blocked": [],
+            "needs_confirmation": [],
+            "deleted": 0,
+            "explicit": False,
+        },
+    )
+
+    response = await _chat_ep(
+        main.ChatRequest(message="pause", source="text", image_base64=valid_b64, image_mime="image/png"),
+        _request("alice"),
+    )
+    events = await _read_sse_events(response)
+
+    assert music_dispatch_calls == []
+    assert json.loads(events[0])["intent"] == "vision"
+    assert any(json.loads(event).get("text") == "image described" for event in events if event != "[DONE]")
+
+
+@pytest.mark.asyncio
+async def test_chat_invalid_image_with_music_keyword_returns_422():
+    response = await _chat_ep(
+        main.ChatRequest(message="pause", source="text", image_base64="not-a-valid-b64!", image_mime="image/png"),
+        _request("alice"),
+    )
+    assert response.status_code == 422
+    data = json.loads(response.body.decode())
+    assert data["code"] == "INVALID_IMAGE"
 
 
 @pytest.mark.asyncio

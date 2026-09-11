@@ -28,23 +28,23 @@ Legend: `[x]` done · `[ ]` to do · `[~]` in progress/partial · `[P]` parked/d
 ### [x] Music window
 - artist – song on one line (`message.js:651-653`, `style.css:343-348`) — done.
 
-### [ ] Settings menu (from username)
-- `[ ]` clicking `#auth-username` (`index.html:120`) opens a settings menu
-- `[ ]` theme toggle dark/light (only a dark `:root` exists today, `style.css:3-18`)
-- `[ ]` display reasoning on/off — exists as sidebar `#reasoning-toggle-btn`; surface it here too
-- `[ ]` manual beets update button — does not exist
-- `[ ]` logout — exists as sidebar `#logout-btn`; surface it here too
-- `[ ]` manual consolidation trigger — does not exist (only a read-only status label)
+### [x] Settings menu (from username)
+- `[x]` clicking `#auth-username` opens a settings menu — username is now a button; fixed-position `.settings-menu` popover (same pattern as the session kebab menu: closes on outside-click / Escape), `message.js` `_ensureSettingsMenu`/`openSettingsMenu`/`closeSettingsMenu`
+- `[x]` theme toggle dark/light — `:root[data-theme="light"]` palette added (`style.css`); `frontend/theme.js` applies the stored theme in `<head>` before first paint (inline script not allowed by CSP `script-src 'self'`); persisted in `localStorage['ui.theme']`
+- `[x]` display reasoning on/off — menu item shares state with sidebar `#reasoning-toggle-btn` via `_setReasoningVisible` (both labels stay in sync)
+- `[x]` manual beets update button — new `POST /music/beets/update` (`memory_tool_routes.py`) → `run_beets_update()` in `main.py`: runs `beet -l <db> update <root>` then `beet -l <db> import -A <root>` (same no-autotag flags as the bootstrap import). Note: `beet update` has **no** `-A` flag and never autotags; `-A` is an `import`-only flag. Errors: 409 config/PATH, 503 failure/timeout
+- `[x]` logout — menu item calls `window.hearthLogout` (now exported by `auth.js`); sidebar `#logout-btn` kept
+- `[x]` manual consolidation trigger — menu item → existing `POST /memory/consolidate`; refreshes the memory list and reports success/failure in chat
 
-### [ ] Frontend cleanup (found during audit)
-- `[ ]` remove orphaned dead refs `sidebar-section-chats` / `#sidebar-sections` (`message.js:9`, `style.css:71-98`)
+### [x] Frontend cleanup (found during audit)
+- `[x]` removed orphaned dead refs `sidebar-section-chats` / `#sidebar-sections` (`message.js` `_setSidebarSection` + listener + bootstrap call; `style.css` `#sidebar-top`, `#sidebar-sections`, `.sidebar-section-btn` rules)
 
 ## Backend / Config
 
 ### [~] Security — extract system-specific values to .env
-- `[x]` config is env-driven via `os.getenv` across `routing_config`/`memory`/`main`/`embedding_router`/`graph`/`auth`/`tools`
-- `[ ]` refresh `.env.example` — documents 17 vars but code reads 60+ (add `MEMORY_DB_PATH`, `CHROMA_PATH`, `AUTH_DB_PATH`, `GRAPH_CHECKPOINT_DB_PATH`, `MODEL_LOCAL`, `OLLAMA_VISION_MODEL`, `CHAT_TOKEN_BUDGET`, `CHAT_MAX_TURNS`, `ROUTE_CONFIDENCE_THRESHOLD`, `ROUTER_EMBEDDING_ENABLED`, `MEMORY_TOP_N`, `MPD_HOST`/`MPD_PORT`, `WEATHER_UNITS`, `TTS_*`, `WAKEWORD_*`, `WHISPER_*`, `CORS_ORIGINS`, `SESSION_COOKIE_SECURE`)
-- `[ ]` env-ify the remaining literals: `/dev/nvidia0` (`main.py:621`), `backend/models` dir (`main.py:334,587`), `../frontend` (`main.py:1035`), prompt filenames (`main.py:171`)
+- `[x]` config is env-driven via `os.getenv` across `routing_config`/`memory`/`main`/`embedding_router`/`graph`/`auth`/`tools` (79 distinct vars in project source, excl. `.venv`)
+- `[ ]` refresh `.env.example` — it documented ~25 of those 79 (the old "60+" note was stale; an even higher "180" was `.venv` pollution). Added only the deployment-specific delta: `MPD_HOST`/`MPD_PORT`, `CORS_ORIGINS`/`SESSION_COOKIE_SECURE`, `TTS_ENGINE`, plus a commented bare-host block for `MEMORY_DB_PATH`/`CHROMA_PATH`/`AUTH_DB_PATH`/`GRAPH_CHECKPOINT_DB_PATH`. Deliberately NOT added (stay as code defaults — safe defaults, still overridable at deploy time): `MODEL_LOCAL` (redundant alias of `OPENAI_CHAT_MODEL`), `ROUTER_EMBEDDING_ENABLED` (already documented), `OLLAMA_VISION_MODEL` (stale name → the real var is `OPENAI_VISION_MODEL`, already documented), and all router/memory/chat/auth/music/voice tuning knobs.
+- `[ ]` env-ify the remaining literals: `/dev/nvidia0` (`main.py:696`), `backend/models` dir (`main.py:396,662,684`), `../frontend` (`main.py:1131`), prompt filenames (`main.py:182,187`)
 
 ## Tests
 
@@ -56,7 +56,7 @@ Legend: `[x]` done · `[ ]` to do · `[~]` in progress/partial · `[P]` parked/d
 ## Music ops
 
 ### [ ] Document beets update
-- Document the command to run when the music library changes: `docker compose exec backend sh -c 'cd /beets && beet update /music'` (confirm flags, e.g. `-A` for no auto-tagging). Add to README.
+- Document the command to run when the music library changes: `docker compose exec backend sh -c 'cd /beets && beet update /music'`. Flags confirmed: `beet update` has no autotag flag (it never autotags); to also pick up *new* files run `beet import -A /music` (the `-A` no-autotag flag is import-only). The settings-menu "Update music library" button now does both (`POST /music/beets/update`). Add to README.
 
 ## Tool calling / LLM-native — PARKED
 
@@ -67,7 +67,7 @@ Legend: `[x]` done · `[ ]` to do · `[~]` in progress/partial · `[P]` parked/d
 
 ## Docs hygiene (#10) — resolved
 - `[x]` `docs/WORK_PLAN_1.md` → this organized plan
-- `[ ]` `docs/DEVELOPER_NOTES.md` → raw scratch notes (source for this plan); kept for now, remove once this supersedes it
+- `[x]` `docs/DEVELOPER_NOTES.md` → raw scratch notes (source for this plan); deleted
 - `[x]` `docs/MEMORY.md` → kept as canonical memory design doc (Phase 1 done / Phase 2 backlog); 2 inaccuracies fixed
 - `[x]` `docs/WEATHER_FASTPATH.json` → deleted
 - `[x]` `docs/PLAN-LLM-NATIVE-TOOL-CALLING.md` → kept, marked PARKED

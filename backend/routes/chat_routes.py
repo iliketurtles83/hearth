@@ -44,60 +44,63 @@ def create_chat_router(services) -> APIRouter:
         chat_source = normalize_chat_source(request.source)
         effective_system = request.system or chat_default_system_prompt
 
+        # Validate image payload if present
+        if request.image_base64:
+            image_error = validate_image(request.image_base64, request.image_mime)
+            if image_error:
+                log.warning("chat.image_invalid | session_id=%s reason=%s", session_id, image_error)
+                return JSONResponse({"error": image_error, "code": "INVALID_IMAGE"}, status_code=422)
+
         # ── Deterministic music fast-path ─────────────────────────────────────
         # Check before graph routing so clear music commands never touch the LLM.
-        music_cmd = parse_music_command(request.message)
-        if music_cmd is not None:
-            music_cmd["prompt"] = request.message
-            music_cmd["user_id"] = user_id
+        # Only applies to text-only requests; attached images always route to vision.
+        if not request.image_base64:
+            music_cmd = parse_music_command(request.message)
+            if music_cmd is not None:
+                music_cmd["prompt"] = request.message
+                music_cmd["user_id"] = user_id
 
-            async def generate_music():
-                yield f"data: {json.dumps({'model': 'music', 'intent': 'music', 'confidence': 1.0})}\n\n"
-                try:
-                    tool_result: ToolResult = await tools.dispatch("music", music_cmd)
-                except Exception as exc:
-                    log.error("chat.music_fast | session_id=%s error=%s", session_id, exc)
-                    yield f"data: {json.dumps(stream_error_payload('MUSIC_COMMAND_FAILED'))}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
-                log.info(
-                    "chat.music_fast | session_id=%s action=%s ok=%s retryable=%s",
-                    session_id, music_cmd.get("action"), tool_result.ok, tool_result.retryable,
-                )
-                response_text = format_music_response(tool_result, music_cmd)
-                # Persist the turn so music interactions appear in session history and
-                # provide follow-up context (mirrors graph.memory_writer logging).
-                if user_id:
+                async def generate_music():
+                    yield f"data: {json.dumps({'model': 'music', 'intent': 'music', 'confidence': 1.0})}\n\n"
                     try:
-                        await asyncio.to_thread(
-                            get_memory_store().log_turn,
-                            session_id,
-                            user_id,
-                            "user",
-                            request.message,
-                        )
-                        await asyncio.to_thread(
-                            get_memory_store().log_turn,
-                            session_id,
-                            user_id,
-                            "assistant",
-                            response_text,
-                        )
+                        tool_result: ToolResult = await tools.dispatch("music", music_cmd)
                     except Exception as exc:
-                        log.warning("chat.music_fast.log_turn | session_id=%s error=%s", session_id, exc)
-                yield f"data: {json.dumps({'text': response_text})}\n\n"
-                yield "data: [DONE]\n\n"
+                        log.error("chat.music_fast | session_id=%s error=%s", session_id, exc)
+                        yield f"data: {json.dumps(stream_error_payload('MUSIC_COMMAND_FAILED'))}\n\n"
+                        yield "data: [DONE]\n\n"
+                        return
+                    log.info(
+                        "chat.music_fast | session_id=%s action=%s ok=%s retryable=%s",
+                        session_id, music_cmd.get("action"), tool_result.ok, tool_result.retryable,
+                    )
+                    response_text = format_music_response(tool_result, music_cmd)
+                    # Persist the turn so music interactions appear in session history and
+                    # provide follow-up context (mirrors graph.memory_writer logging).
+                    if user_id:
+                        try:
+                            await asyncio.to_thread(
+                                get_memory_store().log_turn,
+                                session_id,
+                                user_id,
+                                "user",
+                                request.message,
+                            )
+                            await asyncio.to_thread(
+                                get_memory_store().log_turn,
+                                session_id,
+                                user_id,
+                                "assistant",
+                                response_text,
+                            )
+                        except Exception as exc:
+                            log.warning("chat.music_fast.log_turn | session_id=%s error=%s", session_id, exc)
+                    yield f"data: {json.dumps({'text': response_text})}\n\n"
+                    yield "data: [DONE]\n\n"
 
-            fast_response = StreamingResponse(generate_music(), media_type="text/event-stream")
-            set_session_cookie(fast_response, session_id)
-            return fast_response
+                fast_response = StreamingResponse(generate_music(), media_type="text/event-stream")
+                set_session_cookie(fast_response, session_id)
+                return fast_response
         # ── End music fast-path ───────────────────────────────────────────────
-
-        # Validate image payload if present
-        image_error = validate_image(request.image_base64, request.image_mime)
-        if image_error:
-            log.warning("chat.image_invalid | session_id=%s reason=%s", session_id, image_error)
-            return JSONResponse({"error": image_error, "code": "INVALID_IMAGE"}, status_code=422)
 
         graph_state = {
             "user_id": user_id,

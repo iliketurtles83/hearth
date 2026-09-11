@@ -221,10 +221,16 @@ def _augment_system_with_memories(system: str, memory_hits: list[dict[str, Any]]
     return "\n".join(lines)
 
 
-def _should_inject_memory(decision_intent: str, memory_hits: list[dict[str, Any]], user_message: str) -> bool:
+def _should_inject_memory(
+    decision_intent: str,
+    memory_hits: list[dict[str, Any]],
+    user_message: str,
+    *,
+    needs_memory: bool = False,
+) -> bool:
     if not memory_hits:
         return False
-    if decision_intent == "memory-needed":
+    if needs_memory or decision_intent == "memory-needed":
         return True
 
     # Even for non-memory intents, inject if the query is about the user
@@ -460,6 +466,8 @@ def _heuristic_decision(
         vision_model=vision_model,
     )
     heuristic.planner_status = "heuristic"
+    if heuristic.intent == "memory-needed":
+        heuristic.needs_memory = True
     return heuristic
 
 
@@ -712,7 +720,12 @@ def build_assistant_graph(
             state["user_id"],
             state["message"],
         )
-        inject_memory = _should_inject_memory(state["intent"], memory_hits_all, state["message"])
+        inject_memory = _should_inject_memory(
+            state["intent"],
+            memory_hits_all,
+            state["message"],
+            needs_memory=bool(state.get("needs_memory", False)),
+        )
         memory_hits = memory_hits_all if inject_memory else []
         system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
         augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
