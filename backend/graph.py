@@ -295,6 +295,7 @@ def _similarity_to_confidence(score: float) -> float:
 def _decision_from_embedding(
     tool_label: str,
     tool_score: float,
+    tool_gap: float,
     dialogue_label: str,
     dialogue_score: float,
     heuristic: RouteDecision,
@@ -304,6 +305,35 @@ def _decision_from_embedding(
     vision_model: str,
     reasoning_summary: str,
 ) -> RouteDecision:
+    # When the tool classifier matches weather/music but the gap is small,
+    # defer to the dialogue classifier. This prevents city names or
+    # conversational phrases from accidentally triggering weather/music routing.
+    TOOL_OVERRIDE_GAP = 0.10
+
+    if tool_label in {"weather", "music"} and tool_gap < TOOL_OVERRIDE_GAP:
+        if dialogue_label == "memory-augmented":
+            return RouteDecision(
+                intent="memory-needed",
+                confidence=round(_similarity_to_confidence(dialogue_score), 3),
+                use_cloud=False,
+                model=chat_model,
+                tool=None,
+                planner_status="embedding",
+                reasoning_summary=reasoning_summary,
+                needs_memory=True,
+            )
+        if dialogue_label == "cloud":
+            return RouteDecision(
+                intent="reasoning-heavy",
+                confidence=round(_similarity_to_confidence(dialogue_score), 3),
+                use_cloud=True,
+                model=cloud_model,
+                tool=None,
+                planner_status="embedding",
+                reasoning_summary=reasoning_summary,
+                needs_memory=False,
+            )
+
     if tool_label in {"weather", "music"}:
         return RouteDecision(
             intent="external-data-needed",
@@ -532,6 +562,19 @@ def _decision_state_update(decision: RouteDecision, route_type: str) -> dict[str
 
 # ── Pure responder helpers ───────────────────────────────────────────────────
 
+# Pattern to catch Gemma 4 tool-call leakage: <|tool_call|>call:tool_name{...}
+# or raw <tool_call|> tokens that the model generates when it thinks it should
+# call a tool but the system handles tool dispatch externally.
+_TOOL_CALL_LEAK_PATTERN = re.compile(
+    r"<\|tool_call\|>call:\w+[\s\S]*?(?:<tool_call\|>|<\|/tool_call\|>)",
+    re.DOTALL,
+)
+
+
+def _strip_tool_call_leaks(text: str) -> str:
+    """Remove any leaked tool-call tokens from the LLM response."""
+    return _TOOL_CALL_LEAK_PATTERN.sub("", text).strip()
+
 def _is_weather_fastpath(tool: str, message: str) -> bool:
     return tool == "weather" and not is_weather_reasoning(message)
 
@@ -652,6 +695,7 @@ def build_assistant_graph(
                         decision = _decision_from_embedding(
                             embed_result.tool.label,
                             embed_result.tool.score,
+                            embed_result.tool.gap,
                             embed_result.dialogue.label,
                             embed_result.dialogue.score,
                             heuristic,
@@ -938,6 +982,9 @@ def build_assistant_graph(
             )
             if modality == "voice":
                 writer({"text": response_text})
+
+        # Clean up any leaked tool-call tokens from Gemma 4.
+        response_text = _strip_tool_call_leaks(response_text)
 
         return {"response_text": response_text.strip(), "response_model": response_model}
 
