@@ -1008,6 +1008,9 @@ def build_assistant_graph(
                 if _is_weather_fastpath(state["tool"], state["message"]):
                     response_text = format_weather_response(getattr(tool_result, "data", {}))
                     writer({"text": response_text})
+                elif state["tool"] == "music":
+                    response_text = format_music_response(tool_result, {"action": "play", "prompt": state["message"]})
+                    writer({"text": response_text})
                 else:
                     summary_request = PromptRequest(
                         message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),

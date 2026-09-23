@@ -803,13 +803,13 @@ def _resolve_genre_query(query: str) -> str | None:
 def _extract_search_query(prompt: str) -> str:
     """Strip common command prefixes and return a bare search string."""
     cleaned = re.sub(
-        r"^(play(?:back)?|start\s+playing|queue|add\s+to\s+(?:the\s+)?queue|put\s+on|shuffle)\s+",
+        r"^(?:(?:i\s+(?:want|would\s+like|d\s+like)\s+(?:you\s+)?to|can\s+you|could\s+you|please)\s+)?(play(?:back)?|start\s+playing|queue|add\s+to\s+(?:the\s+)?queue|put\s+on|shuffle)\s+",
         "",
         prompt.strip(),
         flags=re.IGNORECASE,
     )
-    # Remove polite fillers and trailing punctuation.
-    cleaned = re.sub(r"^(the\s+song\s+)?", "", cleaned, flags=re.IGNORECASE)
+    # Remove polite fillers, pronouns, and articles.
+    cleaned = re.sub(r"^(?:(?:for\s+)?me\s+)?(?:the\s+song\s+|some\s+|a\s+|any\s+)?", "", cleaned, flags=re.IGNORECASE)
     cleaned = cleaned.strip().strip("\"' .,!?")
 
     # "a/some/any [random] <artist> song/track/music[s]" → return artist name.
