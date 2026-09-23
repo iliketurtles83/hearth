@@ -16,21 +16,13 @@ MUSIC_CTRL: dict[str, str] = {
     "shuffle": "shuffle",
 }
 
-# Target phrases that are too vague to resolve without LLM help.
-MUSIC_VAGUE: frozenset[str] = frozenset({
-    "something", "anything", "a song", "some songs", "any song",
-    "a track", "some tracks", "any track", "some music", "any music",
-    "a random song", "a random track", "a tune", "some tunes",
-})
-
-
 def parse_music_command(prompt: str, allow_vague: bool = False) -> dict | None:
-    """Deterministically parse a high-confidence music command.
+    """Deterministically parse literal machine playback controls.
 
-    Returns a params dict ready for tools.dispatch("music", ...) if the
-    prompt maps to a known music action with enough specificity.
-    When allow_vague is True, vague targets (e.g. "something chill") are
-    parsed into action/query dicts rather than returning None.
+    Matches literal playback controls (pause, resume, next, skip, stop, shuffle),
+    volume adjustments, and current queue/now-playing status.
+    Natural language playback requests (e.g. 'play ...') are intentionally omitted
+    so they fall through to LLM native tool-calling with context.
     """
     pl = prompt.strip().lower().rstrip(".,!?")
 
@@ -72,63 +64,7 @@ def parse_music_command(prompt: str, allow_vague: bool = False) -> dict | None:
     ):
         return {"action": "queue_view"}
 
-    play_m = re.match(
-        r"^(play(?:back)?|start\s+playing|queue|add\s+to\s+(?:the\s+)?queue|put\s+on|shuffle)\s+(.+)$",
-        pl,
-    )
-    if not play_m:
-        return None
-
-    verb = play_m.group(1)
-    action = "queue" if re.match(r"queue|add\s+to", verb) else "play"
-    target = play_m.group(2).strip().strip(".,!?\"'")
-
-    if not allow_vague:
-        if target in MUSIC_VAGUE:
-            return None
-        if re.match(
-            r"^something\s+(like|similar\s+to|that\s+sounds?\s+like)",
-            target,
-            re.IGNORECASE,
-        ):
-            return None
-        if re.match(
-            r"^(something|anything)\s*(chill|relaxing|upbeat|heavy|fast|slow|random|good)?$",
-            target,
-            re.IGNORECASE,
-        ):
-            return None
-
-    decade_m = re.match(r"^(?:some\s+)?(\d{2})s(?:\s+.*)?$", target, re.IGNORECASE)
-    if decade_m:
-        d = int(decade_m.group(1))
-        yr = (2000 + d) if d < 30 else (1900 + d)
-        return {"action": action, "year_range": (yr, yr + 9)}
-
-    year_m = re.match(
-        r"^(?:(?:music|songs?|tracks?)\s+from\s+)?(\d{4})$", target, re.IGNORECASE
-    )
-    if year_m:
-        yr = int(year_m.group(1))
-        return {"action": action, "year_range": (yr, yr)}
-
-    by_m = re.match(r"^(?P<title>.+?)\s+by\s+(?P<artist>.+)$", target, re.IGNORECASE)
-    if by_m:
-        title = by_m.group("title").strip().strip("\"'")
-        artist = by_m.group("artist").strip().strip("\"'")
-        if title.lower() in MUSIC_VAGUE:
-            return {"action": action, "artist": artist}
-        return {"action": action, "query": title, "artist_filter": artist}
-
-    artist_song_m = re.match(
-        r"^(?:a|some|any)\s+(?:random\s+)?(?P<artist>.+?)\s+(?:song|track|music)s?$",
-        target,
-        re.IGNORECASE,
-    )
-    if artist_song_m:
-        return {"action": action, "artist": artist_song_m.group("artist").strip()}
-
-    return {"action": action, "query": target}
+    return None
 
 
 def format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:

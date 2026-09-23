@@ -49,6 +49,8 @@ from embedding_router import (
 )
 from routing_config import ROUTING_CONFIG
 from tools.weather import format_weather_response, is_weather_reasoning
+from tools.schemas import HEARTH_TOOLS
+from music_fastpath import format_music_response
 
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
@@ -99,6 +101,7 @@ class AssistantState(TypedDict, total=False):
 class PromptRequest:
     message: str
     system: str
+    tools: list[dict[str, Any]] | None = None
 
 
 @dataclass
@@ -141,6 +144,13 @@ def _chunk_thinking(chunk: Any) -> str:
     if isinstance(chunk, dict):
         return str(chunk.get("thinking", "") or "")
     return ""
+
+
+def _chunk_tool_calls(chunk: Any) -> list[dict[str, Any]]:
+    if isinstance(chunk, dict) and "tool_calls" in chunk:
+        val = chunk["tool_calls"]
+        return val if isinstance(val, list) else []
+    return []
 
 
 def _select_history_for_budget(
@@ -849,9 +859,10 @@ def build_assistant_graph(
 
     async def _emit_response_chunks(
         stream: AsyncIterator[Any],
-    ) -> str:
+    ) -> tuple[str, list[dict[str, Any]]]:
         writer = get_stream_writer()
         response_text = ""
+        tool_calls: list[dict[str, Any]] = []
         async for chunk in stream:
             thinking = _chunk_thinking(chunk)
             if thinking:
@@ -861,7 +872,19 @@ def build_assistant_graph(
             if text:
                 writer({"text": text})
                 response_text += text
-        return response_text
+
+            chunk_tools = _chunk_tool_calls(chunk)
+            if chunk_tools:
+                for tc in chunk_tools:
+                    idx = int(tc.get("index", 0))
+                    while len(tool_calls) <= idx:
+                        tool_calls.append({"name": "", "arguments": ""})
+                    fn = tc.get("function", {})
+                    if "name" in fn and fn["name"]:
+                        tool_calls[idx]["name"] += fn["name"]
+                    if "arguments" in fn and fn["arguments"]:
+                        tool_calls[idx]["arguments"] += fn["arguments"]
+        return response_text, tool_calls
 
     async def responder(state: AssistantState) -> dict[str, Any]:
         writer = get_stream_writer()
@@ -872,6 +895,63 @@ def build_assistant_graph(
             state.get("augmented_system") or state.get("system") or "",
             modality,
         )
+
+        async def _execute_llm_tool_calls(
+            tool_calls: list[dict[str, Any]],
+        ) -> str:
+            call = tool_calls[0]
+            t_name = call.get("name", "").strip()
+            raw_args = call.get("arguments", "{}")
+            try:
+                t_args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+            except Exception:
+                t_args = {}
+            if not isinstance(t_args, dict):
+                t_args = {}
+
+            log.info("graph.responder | llm_tool_call | tool=%s args=%s", t_name, t_args)
+
+            if t_name == "weather":
+                t_params = {
+                    "prompt": state["message"],
+                    "location": t_args.get("location"),
+                    "user_id": state["user_id"],
+                    "memory": deps.memory_store,
+                }
+                tool_result = await deps.tool_dispatch("weather", t_params)
+                if getattr(tool_result, "ok", False):
+                    if _is_weather_fastpath("weather", state["message"]):
+                        res = format_weather_response(getattr(tool_result, "data", {}))
+                        writer({"text": res})
+                        return res
+                    else:
+                        summary_request = PromptRequest(
+                            message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),
+                            system=effective_system,
+                        )
+                        res, _ = await _emit_response_chunks(
+                            deps.stream_local(summary_request, model_name=deps.chat_model),
+                        )
+                        return res
+                else:
+                    err = getattr(tool_result, "error", "The weather service was unavailable.") or "The weather service was unavailable."
+                    writer({"text": err})
+                    return err
+
+            elif t_name == "music":
+                t_params = {
+                    "prompt": state["message"],
+                    "action": t_args.get("action", "play"),
+                    "query": t_args.get("query"),
+                    "artist": t_args.get("artist"),
+                    "user_id": state["user_id"],
+                }
+                tool_result = await deps.tool_dispatch("music", t_params)
+                res = format_music_response(tool_result, t_params)
+                writer({"text": res})
+                return res
+
+            return "Tool call completed."
 
         # ── Vision path ───────────────────────────────────────────────────────
         if state.get("intent") == "vision" and state.get("image_base64"):
@@ -884,7 +964,7 @@ def build_assistant_graph(
             local_vision_ok = False
             if deps.stream_local_vision is not None:
                 try:
-                    response_text = await _emit_response_chunks(
+                    response_text, _ = await _emit_response_chunks(
                         deps.stream_local_vision(vision_request, image_b64, image_mime),
                     )
                     response_model = deps.vision_model or deps.chat_model
@@ -902,7 +982,7 @@ def build_assistant_graph(
                     image_b64, image_mime, vision_request.message
                 )
                 try:
-                    response_text = await _emit_response_chunks(
+                    response_text, _ = await _emit_response_chunks(
                         deps.stream_cloud(vision_request.system, vision_cloud_messages),
                     )
                 except Exception as exc:
@@ -933,7 +1013,7 @@ def build_assistant_graph(
                         message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),
                         system=effective_system,
                     )
-                    response_text = await _emit_response_chunks(
+                    response_text, _ = await _emit_response_chunks(
                         deps.stream_local(summary_request, model_name=deps.chat_model),
                     )
             else:
@@ -942,7 +1022,7 @@ def build_assistant_graph(
         elif state.get("use_cloud"):
             response_model = deps.cloud_model
             try:
-                response_text = await _emit_response_chunks(
+                response_text, _ = await _emit_response_chunks(
                     deps.stream_cloud(effective_system, state["cloud_messages"]),
                 )
             except Exception:
@@ -950,15 +1030,23 @@ def build_assistant_graph(
                 response_model = deps.chat_model
                 writer({"notice": "Cloud unavailable \u2014 responding with local model"})
                 writer({"model": deps.chat_model, "intent": state.get("intent", ""), "confidence": state.get("confidence", 0.0), "fallback": True})
-                local_request = PromptRequest(message=state["local_prompt"], system=effective_system)
-                response_text = await _emit_response_chunks(
+                local_request = PromptRequest(message=state["local_prompt"], system=effective_system, tools=HEARTH_TOOLS)
+                response_text, tool_calls = await _emit_response_chunks(
                     deps.stream_local(local_request, model_name=deps.chat_model),
                 )
+                if tool_calls:
+                    response_text = await _execute_llm_tool_calls(tool_calls)
         else:
-            local_request = PromptRequest(message=state["local_prompt"], system=effective_system)
-            response_text = await _emit_response_chunks(
+            local_request = PromptRequest(
+                message=state["local_prompt"],
+                system=effective_system,
+                tools=HEARTH_TOOLS,
+            )
+            response_text, tool_calls = await _emit_response_chunks(
                 deps.stream_local(local_request, model_name=state["model"]),
             )
+            if tool_calls:
+                response_text = await _execute_llm_tool_calls(tool_calls)
 
         # Clean up any leaked tool-call tokens from Gemma 4.
         response_text = _strip_tool_call_leaks(response_text)

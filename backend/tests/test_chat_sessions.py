@@ -512,8 +512,8 @@ async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(mo
         return main.ToolResult(
             ok=True,
             data={
-                "action": "play",
-                "track": {"title": "Battery", "artist": "Metallica"},
+                "action": "pause",
+                "ok": True,
             },
         )
 
@@ -521,22 +521,21 @@ async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(mo
     monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
 
     response = await _chat_ep(
-        main.ChatRequest(message="play Battery by Metallica", source="text"),
+        main.ChatRequest(message="pause the music", source="text"),
         _request("alice"),
     )
     events = await _read_sse_events(response)
 
     assert json.loads(events[0]) == {"model": "music", "intent": "music", "confidence": 1.0}
-    assert json.loads(events[1])["text"] == 'Now playing: "Battery" by Metallica.'
+    assert json.loads(events[1])["text"] == "Paused."
     assert events[-1] == "[DONE]"
     assert dispatched == [
         (
             "music",
             {
-                "action": "play",
-                "query": "battery",
-                "artist_filter": "metallica",
-                "prompt": "play Battery by Metallica",
+                "action": "control",
+                "control": "pause",
+                "prompt": "pause the music",
                 "user_id": "alice",
             },
         )
@@ -544,22 +543,17 @@ async def test_chat_music_fast_path_bypasses_router_and_dispatches_music_tool(mo
 
 
 @pytest.mark.asyncio
-async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypatch):
+async def test_chat_music_fast_path_formats_control_response(monkeypatch):
     class _UnexpectedGraph:
         async def astream(self, *_args, **_kwargs):
-            raise AssertionError("graph should not run for explicit music commands")
+            raise AssertionError("graph should not run for deterministic music control commands")
 
     async def _fake_dispatch(_tool_name: str, _params: dict):
         return main.ToolResult(
             ok=True,
             data={
-                "action": "play",
-                "track": {"title": "As The Pages Burn", "artist": "Oratory"},
-                "tracks": [
-                    {"title": "As The Pages Burn", "artist": "Oratory"},
-                    {"title": "End of All Hope", "artist": "Nightwish"},
-                ],
-                "genre": "heavy metal",
+                "action": "pause",
+                "ok": True,
             },
         )
 
@@ -567,12 +561,12 @@ async def test_chat_music_fast_path_formats_genre_multi_track_response(monkeypat
     monkeypatch.setattr(main.tools, "dispatch", _fake_dispatch)
 
     response = await _chat_ep(
-        main.ChatRequest(message="play Heavy Metal", source="text"),
+        main.ChatRequest(message="pause the music", source="text"),
         _request("alice"),
     )
     events = await _read_sse_events(response)
 
-    assert json.loads(events[1])["text"] == "Now playing: 2 Heavy Metal tracks."
+    assert json.loads(events[1])["text"] == "Paused."
 
 
 @pytest.mark.asyncio

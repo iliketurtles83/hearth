@@ -20,6 +20,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 # ── .env loading (import-order invariant) ───────────────────────────────────
 # `load_env` loads the project .env exactly once and MUST stay the first local
 # import. Several local modules read os.getenv() at import time and capture those
@@ -909,19 +910,23 @@ async def warmup_chat_model() -> bool:
         return False
 
 
-async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
+async def stream_local(request: Any, model_name: str = CHAT_MODEL):
     think_mode = _openai_think_setting()
     async with httpx.AsyncClient(timeout=120) as client:
         messages = [
             {"role": "system", "content": request.system},
             {"role": "user", "content": request.message},
         ]
-        async with client.stream("POST", f"{OPENAI_BASE_URL}/chat/completions", json={
+        payload: dict[str, Any] = {
             "model": model_name,
             "messages": messages,
             "stream": True,
             "max_tokens": 4096,
-        }) as resp:
+        }
+        tools = getattr(request, "tools", None)
+        if tools:
+            payload["tools"] = tools
+        async with client.stream("POST", f"{OPENAI_BASE_URL}/chat/completions", json=payload) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if line.startswith("data: "):
@@ -940,6 +945,9 @@ async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
                     text = delta.get("content", "")
                     if text:
                         yield {"text": text}
+                    tool_calls = delta.get("tool_calls")
+                    if tool_calls:
+                        yield {"tool_calls": tool_calls}
 
 
 # ── Vision helpers ─────────────────────────────────────────────────────────────

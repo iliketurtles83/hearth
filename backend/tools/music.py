@@ -914,8 +914,20 @@ async def run(params: dict[str, Any]) -> ToolResult:
             if "volume" in parsed:
                 params["volume"] = parsed["volume"]
         else:
-            action = "play"
-            query = query or _extract_search_query(prompt)
+            if re.match(r"^(?:queue|add\s+to\s+(?:the\s+)?queue)\b", prompt.strip(), re.IGNORECASE):
+                action = "queue"
+            else:
+                action = "play"
+            by_m = re.match(
+                r"^(?:play(?:back)?|queue|add\s+to\s+(?:the\s+)?queue)\s+(?P<title>.+?)\s+by\s+(?P<artist>.+)$",
+                prompt.strip(),
+                re.IGNORECASE,
+            )
+            if by_m:
+                query = query or by_m.group("title").strip().strip("\"'")
+                artist_filter = artist_filter or by_m.group("artist").strip().strip("\"'")
+            else:
+                query = query or _extract_search_query(prompt)
 
     # ── Now playing ───────────────────────────────────────────────────────────
     if action == "now_playing":
