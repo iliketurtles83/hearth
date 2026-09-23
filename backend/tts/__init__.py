@@ -11,9 +11,13 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import logging
 import os
 from dataclasses import dataclass
 from typing import Protocol
+
+log = logging.getLogger("assistant")
+TTS_WARMUP = os.getenv("TTS_WARMUP", "true").strip().lower() == "true"
 
 
 class TTSEngine(Protocol):
@@ -180,3 +184,30 @@ def error_to_payload(exc: Exception) -> dict[str, object]:
         "code": "TTS_UNKNOWN_ERROR",
         "retryable": False,
     }
+
+
+async def warmup_tts_engine(engine_name: str | None = None) -> bool:
+    """Pre-load the active TTS engine and run a tiny synthesis probe.
+
+    Absorbs the cold model loading, ONNX graph compilation, and voice array
+    deserialization so the first user /tts request does not incur a multi-second delay.
+    Returns True on success, False if disabled or if model assets are missing/failed.
+    Never raises exceptions.
+    """
+    if not TTS_WARMUP:
+        log.info("tts_warmup.skipped | reason=disabled")
+        return False
+    name = get_engine_name(engine_name)
+    try:
+        await synthesize("Hearth ready.", engine_name=name)
+        log.info("tts_warmup.ready | engine=%s", name)
+        return True
+    except Exception as exc:
+        message = str(exc)
+        log.warning(
+            "tts_warmup.failed | engine=%s error=%s",
+            name,
+            message if message else repr(exc),
+        )
+        return False
+

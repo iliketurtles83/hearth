@@ -79,10 +79,10 @@ _WMO_CODES: dict[int, str] = {
 }
 
 # Regex for inline location override.
-# Allows up to 3 optional words between "weather" and the preposition, so
-# "what is the weather like in Tallinn" works ("like" is the intervening word).
+# Allows up to 6 optional words between weather triggers and the preposition, so
+# "what is the weather like in Tallinn" or "wear a warm winter coat in London" works.
 _LOCATION_RE = re.compile(
-    r"\bweather\b(?:\s+\w+){0,3}?\s+(?:in|for|at|near|around)\s+"
+    r"\b(?:weather|forecast|temperature|temp|rain|raining|snow|snowing|umbrella|coat|jacket|sunny|windy|storm|cold|warm|hot|outside)\b(?:\s+\w+){0,6}?\s+(?:in|for|at|near|around)\s+"
     r"([A-Za-z][A-Za-z\s,.\-]{1,60}?)(?:\?|$|\.)",
     re.IGNORECASE,
 )

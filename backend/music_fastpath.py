@@ -134,7 +134,10 @@ def parse_music_command(prompt: str, allow_vague: bool = False) -> dict | None:
 def format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:
     """Format a music ToolResult as a brief plain-text sentence (no LLM needed)."""
     if not tool_result.ok:
-        return tool_result.error or "Music command failed."
+        err = tool_result.error or "Music command failed."
+        if "not playing" in err.lower():
+            return "Nothing is currently playing."
+        return err
 
     data = tool_result.data or {}
     req_action = music_cmd.get("action", "")

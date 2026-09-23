@@ -126,3 +126,69 @@ def test_resolve_whisper_model_source_falls_back_to_size_when_local_absent(monke
     monkeypatch.setattr(main, "WHISPER_MODEL_DIR", "")
     monkeypatch.setattr(main, "WHISPER_MODEL", "definitely-missing-model-xyz")
     assert main._resolve_whisper_model_source() == "definitely-missing-model-xyz"
+
+
+@pytest.mark.asyncio
+async def test_warmup_whisper_disabled(monkeypatch):
+    monkeypatch.setattr(main, "WHISPER_WARMUP", False)
+    assert await main.warmup_whisper_model() is False
+
+
+@pytest.mark.asyncio
+async def test_warmup_whisper_success(monkeypatch):
+    class _FakeWhisper:
+        def transcribe(self, pcm, **kwargs):
+            return [types.SimpleNamespace(text="")], None
+
+    monkeypatch.setattr(main, "WHISPER_WARMUP", True)
+    monkeypatch.setattr(main, "get_whisper_model", lambda: _FakeWhisper())
+    if hasattr(main, "services"):
+        monkeypatch.setattr(main.services, "get_whisper_model", lambda: _FakeWhisper())
+    assert await main.warmup_whisper_model() is True
+
+
+@pytest.mark.asyncio
+async def test_warmup_whisper_failure_handled(monkeypatch):
+    def _explode():
+        raise RuntimeError("whisper error")
+
+    monkeypatch.setattr(main, "WHISPER_WARMUP", True)
+    monkeypatch.setattr(main, "get_whisper_model", _explode)
+    if hasattr(main, "services"):
+        monkeypatch.setattr(main.services, "get_whisper_model", _explode)
+    assert await main.warmup_whisper_model() is False
+
+
+@pytest.mark.asyncio
+async def test_warmup_oww_disabled(monkeypatch):
+    monkeypatch.setattr(main, "WAKEWORD_WARMUP", False)
+    assert await main.warmup_oww_model() is False
+
+
+@pytest.mark.asyncio
+async def test_warmup_oww_success(monkeypatch):
+    class _FakeOWW:
+        def predict(self, chunk):
+            return {"computer_v2": 0.0}
+
+        def reset(self):
+            pass
+
+    monkeypatch.setattr(main, "WAKEWORD_WARMUP", True)
+    monkeypatch.setattr(main, "get_oww_model", lambda: _FakeOWW())
+    if hasattr(main, "services"):
+        monkeypatch.setattr(main.services, "get_oww_model", lambda: _FakeOWW())
+    assert await main.warmup_oww_model() is True
+
+
+@pytest.mark.asyncio
+async def test_warmup_oww_failure_handled(monkeypatch):
+    def _explode():
+        raise RuntimeError("oww error")
+
+    monkeypatch.setattr(main, "WAKEWORD_WARMUP", True)
+    monkeypatch.setattr(main, "get_oww_model", _explode)
+    if hasattr(main, "services"):
+        monkeypatch.setattr(main.services, "get_oww_model", _explode)
+    assert await main.warmup_oww_model() is False
+

@@ -362,6 +362,43 @@ async def openai_embed_text(
     return vector
 
 
+async def openai_embed_batch(
+    texts: list[str],
+    *,
+    base_url: str,
+    model: str,
+    timeout_seconds: float = 30.0,
+    batch_size: int = 32,
+) -> list[np.ndarray]:
+    """Embed multiple texts in batched API calls.
+
+    The OpenAI /v1/embeddings endpoint accepts ``"input": [str, ...]``.
+    Sends texts in chunks of ``batch_size`` to avoid per-request limits on
+    some inference servers. Returns one ndarray per input text, in order.
+    """
+    all_vectors: list[np.ndarray] = []
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        for start in range(0, len(texts), batch_size):
+            chunk = texts[start : start + batch_size]
+            payload = {"model": model, "input": chunk}
+            response = await client.post(f"{base_url}/embeddings", json=payload)
+            response.raise_for_status()
+            data = response.json()
+            # OpenAI format: {"data": [{"embedding": [...], "index": N}, ...]}
+            # Sort by index to guarantee order matches input order.
+            items = sorted(data.get("data", []), key=lambda d: d.get("index", 0))
+            for item in items:
+                vec = np.asarray(item.get("embedding", []), dtype=np.float32)
+                if vec.ndim != 1 or vec.size == 0:
+                    raise ValueError("Invalid embedding in batch response")
+                all_vectors.append(vec)
+    if len(all_vectors) != len(texts):
+        raise ValueError(
+            f"Batch embedding count mismatch: got {len(all_vectors)}, expected {len(texts)}"
+        )
+    return all_vectors
+
+
 async def build_embedding_router(
     *,
     tool_exemplars: dict[str, tuple[str, ...]] | None = None,
@@ -378,8 +415,8 @@ async def build_embedding_router(
     embed_model = model or os.getenv("ROUTER_EMBED_MODEL", ROUTER_EMBED_MODEL)
 
     # Absorb the cold embed-model load on a single probe with a generous
-    # timeout so the per-exemplar calls below don't trip `timeout_seconds`
-    # while the inference server is still loading the model into VRAM.
+    # timeout so the batch call below doesn't trip while the inference
+    # server is still loading the model into VRAM.
     await openai_embed_text(
         "hearth embedding router warmup",
         base_url=embed_base_url,
@@ -393,15 +430,14 @@ async def build_embedding_router(
     for samples in dialogue_bank.values():
         all_texts.extend(samples)
 
-    rows: list[list[float]] = []
-    for text in all_texts:
-        vec = await openai_embed_text(
-            text,
-            base_url=embed_base_url,
-            model=embed_model,
-            timeout_seconds=timeout_seconds,
-        )
-        rows.append(vec.tolist())
+    # Batch-embed all exemplars in a few API calls instead of 75+ sequential ones.
+    vectors = await openai_embed_batch(
+        all_texts,
+        base_url=embed_base_url,
+        model=embed_model,
+        timeout_seconds=max(timeout_seconds, 30.0),
+    )
+    rows = [v.tolist() for v in vectors]
 
     tool_rows = sum(len(samples) for samples in tool_bank.values())
     tool_matrix_rows = rows[:tool_rows]

@@ -129,6 +129,8 @@ import tools.music as music  # noqa: E402  (must come after stubs)
 
 # Patch ToolResult references in the music module.
 music.ToolResult = ToolResult
+music.MUSIC_ROOT = "/media/jack/buffer/audio"
+music.musicpd = _fake_musicpd
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────

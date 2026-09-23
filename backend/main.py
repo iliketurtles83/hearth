@@ -200,10 +200,12 @@ WAKEWORD_MODEL_FILE = os.getenv("WAKEWORD_MODEL_FILE", "computer_v2.onnx")
 OWW_MELSPEC_MODEL_FILE = os.getenv("OWW_MELSPEC_MODEL_FILE", "melspectrogram.onnx")
 OWW_EMBEDDING_MODEL_FILE = os.getenv("OWW_EMBEDDING_MODEL_FILE", "embedding_model.onnx")
 WAKEWORD_THRESHOLD = float(os.getenv("WAKEWORD_THRESHOLD", "0.5"))
+WAKEWORD_WARMUP = os.getenv("WAKEWORD_WARMUP", "true").strip().lower() == "true"
 
 WHISPER_MODEL = os.getenv("WHISPER_MODEL", "base.en")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "").strip().lower()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "").strip().lower()
+WHISPER_WARMUP = os.getenv("WHISPER_WARMUP", "true").strip().lower() == "true"
 # Optional explicit local model dir (downloaded by scripts/download-whisper-model.sh).
 # When empty, we auto-detect backend/models/whisper/<WHISPER_MODEL>.
 WHISPER_MODEL_DIR = os.getenv("WHISPER_MODEL_DIR", "").strip()
@@ -564,10 +566,13 @@ async def _graph_lifespan(_app: FastAPI):
             log.info("auth.tokens.purged | count=%d", purged)
     except Exception as exc:
         log.warning("auth.tokens.purge_failed | error=%s", exc)
-    # Kick off the chat-model warmup up front so the ~80s cold load overlaps
-    # the (fast) embedding-router warmup and graph build below. It is awaited
+    # Kick off model warmups up front so they overlap the
+    # (fast) embedding-router warmup and graph build below. They are awaited
     # before we start serving (see end of this lifespan).
     chat_warmup_task = asyncio.create_task(warmup_chat_model())
+    tts_warmup_task = asyncio.create_task(tts.warmup_tts_engine())
+    whisper_warmup_task = asyncio.create_task(warmup_whisper_model())
+    oww_warmup_task = asyncio.create_task(warmup_oww_model())
     embed_router = None
     # Retry the router build with backoff: the backend can start before
     # the inference server is fully ready, and the first embed call also
@@ -612,14 +617,20 @@ async def _graph_lifespan(_app: FastAPI):
             _app.state.assistant_graph = checkpointed_graph
             _app.state.embedding_router = embed_router
             log.info("graph.ready | checkpointer=sqlite path=%s", default_checkpoint_path())
-            # Await the chat-model warmup (started above, running in parallel) so
-            # the model is resident before we start serving — guarantees the
-            # first /chat takes the fast path. warmup_chat_model never raises.
-            if chat_warmup_task is not None:
-                try:
-                    await chat_warmup_task
-                except Exception as exc:  # defensive; warmup already self-guards
-                    log.warning("chat_warmup.await_failed | error=%s", exc if str(exc) else repr(exc))
+            # Await model warmups (started above, running in parallel) so
+            # models are resident before we start serving — guarantees the
+            # first /chat, /tts, and /transcribe take the fast path.
+            for task_name, task in (
+                ("chat_warmup", chat_warmup_task),
+                ("tts_warmup", tts_warmup_task),
+                ("whisper_warmup", whisper_warmup_task),
+                ("oww_warmup", oww_warmup_task),
+            ):
+                if task is not None:
+                    try:
+                        await task
+                    except Exception as exc:  # defensive; warmups already self-guard
+                        log.warning("%s.await_failed | error=%s", task_name, exc if str(exc) else repr(exc))
             # Start the interval "sleep" consolidation job (no-op when disabled).
             memory_scheduler_task = start_memory_scheduler(get_memory_store)
             if memory_scheduler_task is not None:
@@ -627,10 +638,10 @@ async def _graph_lifespan(_app: FastAPI):
                 log.info("memory_scheduler.started")
             yield
     finally:
-        # If the graph build failed before we reached the await, don't leave the
-        # warmup task orphaned (it would hold an open httpx client past shutdown).
-        if chat_warmup_task is not None and not chat_warmup_task.done():
-            chat_warmup_task.cancel()
+        # Cancel any warmup tasks that may still be running.
+        for task in (chat_warmup_task, tts_warmup_task, whisper_warmup_task, oww_warmup_task):
+            if task is not None and not task.done():
+                task.cancel()
         # Stop the sleep scheduler and let it unwind cleanly.
         if memory_scheduler_task is not None and not memory_scheduler_task.done():
             memory_scheduler_task.cancel()
@@ -670,6 +681,39 @@ def get_oww_model():
         )
     return _oww_model
 
+
+def _warmup_oww_sync() -> None:
+    import numpy as np
+
+    getter = getattr(services, "get_oww_model", get_oww_model) if "services" in globals() else get_oww_model
+    model = getter()
+    dummy_chunk = np.zeros(1280, dtype=np.int16)
+    model.predict(dummy_chunk)
+    model.reset()
+
+
+async def warmup_oww_model() -> bool:
+    """Pre-load openWakeWord model into memory so the first WebSocket connection is fast.
+
+    Returns True on success, False if disabled or if model assets fail to load.
+    Never raises exceptions.
+    """
+    if not WAKEWORD_WARMUP:
+        log.info("oww_warmup.skipped | reason=disabled")
+        return False
+    try:
+        await asyncio.to_thread(_warmup_oww_sync)
+        log.info("oww_warmup.ready | model=%s", WAKEWORD_MODEL_FILE)
+        return True
+    except Exception as exc:
+        message = str(exc)
+        log.warning(
+            "oww_warmup.failed | model=%s error=%s",
+            WAKEWORD_MODEL_FILE,
+            message if message else repr(exc),
+        )
+        return False
+
 # ── faster-whisper model (lazy-loaded on first /transcribe call) ──
 _whisper_model = None
 
@@ -699,6 +743,39 @@ def get_whisper_model():
         log.info("whisper.model_source | source=%s device=%s compute=%s", model_source, device, compute)
         _whisper_model = WhisperModel(model_source, device=device, compute_type=compute)
     return _whisper_model
+
+
+def _warmup_whisper_sync() -> None:
+    import numpy as np
+
+    getter = getattr(services, "get_whisper_model", get_whisper_model) if "services" in globals() else get_whisper_model
+    model = getter()
+    dummy_pcm = np.zeros(1600, dtype=np.float32)
+    segments, _ = model.transcribe(dummy_pcm, language="en", vad_filter=True)
+    list(segments)
+
+
+async def warmup_whisper_model() -> bool:
+    """Pre-load Whisper model and VAD into memory so the first /transcribe is fast.
+
+    Returns True on success, False if disabled or if model assets fail to load.
+    Never raises exceptions.
+    """
+    if not WHISPER_WARMUP:
+        log.info("whisper_warmup.skipped | reason=disabled")
+        return False
+    try:
+        await asyncio.to_thread(_warmup_whisper_sync)
+        log.info("whisper_warmup.ready | model=%s", WHISPER_MODEL)
+        return True
+    except Exception as exc:
+        message = str(exc)
+        log.warning(
+            "whisper_warmup.failed | model=%s error=%s",
+            WHISPER_MODEL,
+            message if message else repr(exc),
+        )
+        return False
 
 
 def _error_response(message: str, code: str, retryable: bool, status_code: int = 400) -> JSONResponse:
@@ -839,11 +916,6 @@ async def stream_local(request: ChatRequest, model_name: str = CHAT_MODEL):
             {"role": "system", "content": request.system},
             {"role": "user", "content": request.message},
         ]
-        # Add thinking/reasoning if enabled (llama.cpp --thinking support)
-        if think_mode:
-            if think_mode is True:
-                think_mode = "high"
-            messages.append({"role": "user", "content": f"[START_THINKING]\n[END_THINKING]"})
         async with client.stream("POST", f"{OPENAI_BASE_URL}/chat/completions", json={
             "model": model_name,
             "messages": messages,

@@ -135,3 +135,33 @@ def test_error_to_payload_for_tts_error():
 def test_error_to_payload_for_generic_error():
     payload = tts.error_to_payload(RuntimeError("oops"))
     assert payload == {"error": "oops", "code": "TTS_UNKNOWN_ERROR", "retryable": False}
+
+
+@pytest.mark.asyncio
+async def test_warmup_tts_engine_success(monkeypatch):
+    module = _module_with_engine_class(_GoodEngine)
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _: module)
+    monkeypatch.setattr(tts, "TTS_WARMUP", True)
+
+    assert await tts.warmup_tts_engine("piper") is True
+
+
+@pytest.mark.asyncio
+async def test_warmup_tts_engine_disabled(monkeypatch):
+    monkeypatch.setattr(tts, "TTS_WARMUP", False)
+    assert await tts.warmup_tts_engine("piper") is False
+
+
+@pytest.mark.asyncio
+async def test_warmup_tts_engine_failure_handled(monkeypatch):
+    class _ExplodingEngine:
+        async def synthesize(self, text: str) -> bytes:
+            raise RuntimeError("synth boom")
+
+    module = _module_with_engine_class(_ExplodingEngine)
+    monkeypatch.setattr(tts.importlib, "import_module", lambda _: module)
+    monkeypatch.setattr(tts, "TTS_WARMUP", True)
+
+    # Must return False and not raise
+    assert await tts.warmup_tts_engine("piper") is False
+

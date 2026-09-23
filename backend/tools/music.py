@@ -979,7 +979,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         except Exception as exc:
             log.error("music.control | action=%s unexpected=%s", cmd, exc)
-            return ToolResult.failure(str(exc), retryable=False)
+            err_msg = str(exc)
+            if "not playing" in err_msg.lower():
+                return ToolResult.failure("Nothing is currently playing.", retryable=False)
+            return ToolResult.failure(err_msg, retryable=False)
 
     # ── Phase 8b: direct song_id resolution (rec engine path) ─────────────────
     if song_id is not None:

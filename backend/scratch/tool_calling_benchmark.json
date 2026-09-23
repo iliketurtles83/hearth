@@ -1,0 +1,123 @@
+{
+  "results": [
+    {
+      "name": "weather_direct",
+      "passed": true,
+      "duration_sec": 9.21,
+      "details": {
+        "called_tool": "get_weather",
+        "args": {
+          "location": "Helsinki",
+          "timeframe": "today"
+        },
+        "tool_match": true,
+        "args_match": true
+      }
+    },
+    {
+      "name": "weather_followup",
+      "passed": true,
+      "duration_sec": 8.8,
+      "details": {
+        "called_tool": "get_weather",
+        "args": {
+          "location": "Paris",
+          "timeframe": "tomorrow"
+        },
+        "tool_match": true,
+        "args_match": true
+      }
+    },
+    {
+      "name": "weather_location_switch",
+      "passed": true,
+      "duration_sec": 10.53,
+      "details": {
+        "called_tool": "get_weather",
+        "args": {
+          "location": "Tokyo"
+        },
+        "tool_match": true,
+        "args_match": true
+      }
+    },
+    {
+      "name": "music_play_artist",
+      "passed": true,
+      "duration_sec": 12.02,
+      "details": {
+        "called_tool": "music_control",
+        "args": {
+          "action": "play",
+          "query": "Radiohead"
+        },
+        "tool_match": true,
+        "args_match": true
+      }
+    },
+    {
+      "name": "music_natural_phrase",
+      "passed": true,
+      "duration_sec": 9.64,
+      "details": {
+        "called_tool": "music_control",
+        "args": {
+          "action": "play",
+          "query": "jazz"
+        },
+        "tool_match": true,
+        "args_match": true
+      }
+    },
+    {
+      "name": "music_pause",
+      "passed": true,
+      "duration_sec": 9.36,
+      "details": {
+        "called_tool": "music_control",
+        "args": {
+          "action": "pause"
+        },
+        "tool_match": true,
+        "args_match": true
+      }
+    },
+    {
+      "name": "social_greeting",
+      "passed": true,
+      "duration_sec": 7.66,
+      "details": {
+        "response_preview": "Good morning to you too! I am having a good day, thank you f"
+      }
+    },
+    {
+      "name": "general_knowledge",
+      "passed": true,
+      "duration_sec": 17.91,
+      "details": {
+        "response_preview": "The sky appears blue due to a phenomenon called **Rayleigh s"
+      }
+    },
+    {
+      "name": "conversation_followup",
+      "passed": true,
+      "duration_sec": 11.05,
+      "details": {
+        "response_preview": "The three hearts are part of their unique circulatory system"
+      }
+    },
+    {
+      "name": "weather_metaphor",
+      "passed": true,
+      "duration_sec": 11.34,
+      "details": {
+        "response_preview": "I'm sorry to hear that. I hope you feel better soon! Is ther"
+      }
+    }
+  ],
+  "summary": {
+    "passed": 10,
+    "total": 10,
+    "avg_dur": 10.751999999999999
+  }
+}

@@ -1,9 +1,8 @@
-"""Tests for Phase 10c — responder node modality-aware output shaping.
+"""Tests for responder node modality-aware output shaping.
 
 Acceptance criteria verified here:
-- Voice responses are compressed via the compression pass.
+- Voice responses use a single-pass model call (no second compression pass).
 - Chat responses pass through unchanged.
-- Compression preserves all factual content (no fact drift).
 - modality field is derived correctly from request source.
 """
 from __future__ import annotations
@@ -214,93 +213,83 @@ async def test_chat_modality_response_passes_through_full_text(monkeypatch):
     assert result["modality"] == "chat"
 
 
-# ── Voice modality: compression pass must run ────────────────────────────────
+# ── Voice modality: single-pass response (no compression LLM call) ───────────
 
 @pytest.mark.asyncio
-async def test_voice_modality_uses_compressed_response(monkeypatch):
-    """For modality='voice', response_text must be the compressed version, not the original."""
+async def test_voice_modality_single_pass_response(monkeypatch):
+    """For modality='voice', response_text must be the direct model output.
+
+    The voice system modifier in the prompt instructs the model to produce
+    brief spoken-style output directly — no second LLM compression pass.
+    """
     _force_local_intent(monkeypatch)
-    compressed = "It's 7 degrees Celsius in Helsinki with 72 percent humidity."
+    voice_response = "It's 7 degrees in Helsinki with 72 percent humidity."
     deps = _make_deps(
-        original_chunks=[_DETAILED_RESPONSE],
-        compressed_response=compressed,
+        original_chunks=[voice_response],
+        compressed_response="Should never be called",
     )
     graph = assistant_graph.build_assistant_graph(deps)
 
     result = await graph.ainvoke(_voice_state())
 
-    assert result["response_text"] == compressed
+    assert result["response_text"] == voice_response
     assert result["modality"] == "voice"
 
 
 @pytest.mark.asyncio
-async def test_voice_modality_compression_is_shorter_than_original(monkeypatch):
-    """Voice response should be shorter than the original (compression worked)."""
+async def test_voice_modality_only_one_model_call(monkeypatch):
+    """Voice responses must use exactly one stream_local call (no compression pass)."""
     _force_local_intent(monkeypatch)
-    compressed = "It's 7°C in Helsinki with 72% humidity and a high of 9°C."
-    deps = _make_deps(
-        original_chunks=[_DETAILED_RESPONSE],
-        compressed_response=compressed,
-    )
-    graph = assistant_graph.build_assistant_graph(deps)
+    call_count = {"n": 0}
 
-    result = await graph.ainvoke(_voice_state())
-
-    original_words = len(_DETAILED_RESPONSE.split())
-    compressed_words = len(result["response_text"].split())
-    assert compressed_words < original_words, (
-        f"Compressed response ({compressed_words} words) should be shorter than "
-        f"original ({original_words} words)"
-    )
-
-
-# ── Fact-drift test: critical factual values must survive compression ─────────
-
-@pytest.mark.asyncio
-async def test_voice_compression_preserves_key_facts_no_drift(monkeypatch):
-    """Voice compression must not drop critical factual values (the primary safety test).
-
-    The fake 'compressed' response is crafted to contain all required facts,
-    simulating a well-behaved compression model.  The test verifies that the
-    graph's response_text (what the user hears via TTS) contains every
-    required fact from the original response.
-
-    This is the architectural guard: even if the compression model drifts,
-    the test will catch it by enforcing that response_text contains all facts.
-    In production, the compression prompt instructs the model to preserve facts.
-    """
-    _force_local_intent(monkeypatch)
-    # A compressed response that preserves all the key facts.
-    compressed_preserving_facts = (
-        "In Helsinki it's 7 degrees Celsius, partly cloudy. "
-        "Humidity is 72 percent, wind northwest at 14 kilometers per hour. "
-        "High of 9 degrees, low of 3 tonight. Twenty percent chance of afternoon rain."
-    )
-    deps = _make_deps(
-        original_chunks=[_DETAILED_RESPONSE],
-        compressed_response=compressed_preserving_facts,
-    )
-    graph = assistant_graph.build_assistant_graph(deps)
-
-    result = await graph.ainvoke(_voice_state())
-
-    response = result["response_text"]
-    for fact in _REQUIRED_FACTS:
-        assert fact in response, (
-            f"Fact '{fact}' from original response is missing in voice-compressed output.\n"
-            f"Original: {_DETAILED_RESPONSE[:120]}...\n"
-            f"Compressed: {response}"
+    async def _fake_router(_message: str):
+        return SimpleNamespace(
+            intent="quick-local",
+            confidence=0.99,
+            use_cloud=False,
+            model=TEST_CHAT_MODEL,
+            tool=None,
+            planner_status="planner",
+            reasoning_summary="",
+            needs_memory=False,
         )
 
+    async def _counting_stream_local(_request, model_name=None):
+        call_count["n"] += 1
+        yield _DETAILED_RESPONSE
 
-# ── Short response: already-short responses bypass compression call ───────────
+    async def _fake_stream_cloud(_system, _messages):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(_tool, _params):
+        raise AssertionError("should not call tool dispatch")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        embedding_router=None,
+        router_route=_fake_router,
+        stream_local=_counting_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+    graph = assistant_graph.build_assistant_graph(deps)
+
+    result = await graph.ainvoke(_voice_state())
+
+    assert call_count["n"] == 1, (
+        f"Expected 1 stream_local call (no compression pass), got {call_count['n']}"
+    )
+    # The full response passes through unchanged (brevity is a model concern).
+    assert result["response_text"] == _DETAILED_RESPONSE
+
 
 @pytest.mark.asyncio
-async def test_voice_short_response_no_compression_model_call(monkeypatch):
-    """Responses under 30 words are stripped of markdown and returned directly
-    without a second model call (compression is not needed)."""
+async def test_voice_short_response_single_model_call(monkeypatch):
+    """Short voice responses also use exactly one model call — no post-processing."""
     _force_local_intent(monkeypatch)
-    short_response = "**Paused.** The music has been paused."
+    short_response = "Paused. The music has been paused."
     call_count = {"n": 0}
 
     async def _fake_router(_message: str):
@@ -339,12 +328,9 @@ async def test_voice_short_response_no_compression_model_call(monkeypatch):
 
     result = await graph.ainvoke(_voice_state(message="pause the music"))
 
-    # Only one stream_local call should have occurred (the original response).
     assert call_count["n"] == 1, (
         f"Expected 1 stream_local call for short response, got {call_count['n']}"
     )
-    # Markdown should be stripped from short responses.
-    assert "**" not in result["response_text"]
     assert "Paused" in result["response_text"]
 
 

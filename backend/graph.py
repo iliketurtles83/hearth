@@ -310,7 +310,7 @@ def _decision_from_embedding(
     # conversational phrases from accidentally triggering weather/music routing.
     TOOL_OVERRIDE_GAP = 0.10
 
-    if tool_label in {"weather", "music"} and tool_gap < TOOL_OVERRIDE_GAP:
+    if tool_label in {"weather", "music", "code"} and tool_gap < TOOL_OVERRIDE_GAP:
         if dialogue_label == "memory-augmented":
             return RouteDecision(
                 intent="memory-needed",
@@ -679,7 +679,15 @@ def build_assistant_graph(
                         f" tool={embed_result.tool.label}:{embed_result.tool.score:.3f}/gap={embed_result.tool.gap:.3f}"
                         f" dialogue={embed_result.dialogue.label}:{embed_result.dialogue.score:.3f}/gap={embed_result.dialogue.gap:.3f}"
                     )
-                    if embed_result.should_escalate:
+                    tool_is_decisive = (
+                        embed_result.tool.label in {"weather", "music", "code", "vision"}
+                        and not embed_result.tool.ambiguous
+                    )
+                    dialogue_is_decisive = (
+                        embed_result.tool.label == "none"
+                        and not embed_result.dialogue.ambiguous
+                    )
+                    if embed_result.should_escalate and not (tool_is_decisive or dialogue_is_decisive):
                         log.info("embedding_route.ambiguous | action=heuristic")
                         decision = _heuristic_fallback()
                         decision.planner_status = "embedding_ambiguous_fallback"
@@ -759,6 +767,29 @@ def build_assistant_graph(
             current_user_message=state["message"],
             summary_text=session_summary,
         )
+
+        system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
+
+        # Skip expensive retrieval (list_items, ChromaDB, graph_recall) for
+        # intents that don't need memory augmentation. History selection and
+        # session summary still apply — they're cheap and needed for context.
+        intent = state.get("intent", "")
+        needs_memory = bool(state.get("needs_memory", False))
+        _SKIP_RETRIEVAL_INTENTS = frozenset({"quick-local", "vision"})
+        if intent in _SKIP_RETRIEVAL_INTENTS and not needs_memory:
+            log.debug(
+                "graph.memory_retrieval | skipped | intent=%s needs_memory=%s session=%s",
+                intent, needs_memory, state.get("session_id", ""),
+            )
+            return {
+                "selected_history": selected_history,
+                "history_tokens": history_tokens,
+                "truncated": truncated,
+                "summary_tokens": summary_tokens,
+                "memories": [],
+                "augmented_system": system_with_summary,
+            }
+
         memory_hits_all = await asyncio.to_thread(
             deps.memory_store.retrieve,
             state["user_id"],
@@ -768,10 +799,9 @@ def build_assistant_graph(
             state["intent"],
             memory_hits_all,
             state["message"],
-            needs_memory=bool(state.get("needs_memory", False)),
+            needs_memory=needs_memory,
         )
         memory_hits = memory_hits_all if inject_memory else []
-        system_with_summary = _augment_system_with_session_summary(state["system"], session_summary)
         augmented_system = _augment_system_with_memories(system_with_summary, memory_hits)
 
         log.debug(
@@ -802,58 +832,25 @@ def build_assistant_graph(
             "cloud_messages": cloud_messages,
         }
 
-    _VOICE_COMPRESS_SYSTEM = (
-        "You convert assistant responses to natural spoken English for audio output. "
-        "Rules:\n"
-        "1. Remove all markdown formatting (headers, bullets, bold, italic, code blocks).\n"
-        "2. Preserve ALL factual content: numbers, names, dates, locations, measurements.\n"
-        "3. Target 20-30% of original length. If already short (under 40 words), keep as-is.\n"
-        "4. Use natural conversational phrasing, as if speaking aloud to someone.\n"
-        "5. Do not add new information. Do not ask follow-up questions.\n"
-        "6. Output the spoken version ONLY — no preamble, no labels."
+    # Voice modality modifier: appended to the system prompt so the model
+    # generates brief, spoken-style output directly — no second LLM pass.
+    _VOICE_SYSTEM_MODIFIER = (
+        "\n\n[MODALITY: VOICE] This response will be spoken aloud. "
+        "Follow the voice reply rules: write for the ear, short sentences, "
+        "no markdown, no lists, no headers. Keep it brief — 1-3 sentences "
+        "for simple answers. Punctuate naturally for pacing."
     )
 
-    async def _compress_response_for_voice(original: str, model_name: str) -> str:
-        """Compress a full chat response into a brief spoken version."""
-        if not original.strip():
-            return original
-        word_count = len(original.split())
-        if word_count <= 30:
-            # Already short — strip markdown and return.
-            import re as _re
-            clean = _re.sub(r"[`*_#>\[\]!]", "", original)
-            clean = _re.sub(r"\s+", " ", clean).strip()
-            return clean
-        compress_request = PromptRequest(
-            message=(
-                f"Original response ({word_count} words):\n{original}\n\nSpoken version:"
-            ),
-            system=_VOICE_COMPRESS_SYSTEM,
-        )
-        compressed = ""
-        async for chunk in deps.stream_local(compress_request, model_name=model_name):
-            compressed += _chunk_text(chunk)
-        result = compressed.strip()
-        log.info(
-            "graph.responder | voice_compress | original_words=%d compressed_words=%d",
-            word_count,
-            len(result.split()),
-        )
-        return result if result else original
+    def _voice_system(system: str, modality: str) -> str:
+        """Append voice modifier to system prompt when modality is voice."""
+        if modality == "voice":
+            return system + _VOICE_SYSTEM_MODIFIER
+        return system
 
     async def _emit_response_chunks(
         stream: AsyncIterator[Any],
-        *,
-        modality: str,
-        compress_model: str,
     ) -> str:
         writer = get_stream_writer()
-        if modality == "voice":
-            collected = ""
-            async for chunk in stream:
-                collected += _chunk_text(chunk)
-            return await _compress_response_for_voice(collected, compress_model)
-
         response_text = ""
         async for chunk in stream:
             thinking = _chunk_thinking(chunk)
@@ -871,6 +868,10 @@ def build_assistant_graph(
         response_text = ""
         response_model = state.get("model", deps.chat_model)
         modality = state.get("modality", "chat")
+        effective_system = _voice_system(
+            state.get("augmented_system") or state.get("system") or "",
+            modality,
+        )
 
         # ── Vision path ───────────────────────────────────────────────────────
         if state.get("intent") == "vision" and state.get("image_base64"):
@@ -878,18 +879,14 @@ def build_assistant_graph(
             image_mime = state.get("image_mime") or "image/png"
             vision_request = PromptRequest(
                 message=state.get("local_prompt") or state["message"],
-                system=state.get("augmented_system") or state.get("system") or "",
+                system=effective_system,
             )
             local_vision_ok = False
             if deps.stream_local_vision is not None:
                 try:
                     response_text = await _emit_response_chunks(
                         deps.stream_local_vision(vision_request, image_b64, image_mime),
-                        modality=modality,
-                        compress_model=deps.chat_model,
                     )
-                    if modality == "voice":
-                        writer({"text": response_text})
                     response_model = deps.vision_model or deps.chat_model
                     local_vision_ok = True
                 except Exception as exc:
@@ -907,11 +904,7 @@ def build_assistant_graph(
                 try:
                     response_text = await _emit_response_chunks(
                         deps.stream_cloud(vision_request.system, vision_cloud_messages),
-                        modality=modality,
-                        compress_model=deps.chat_model,
                     )
-                    if modality == "voice":
-                        writer({"text": response_text})
                 except Exception as exc:
                     log.error("graph.responder | vision_cloud_failed=%s", exc)
                     response_text = (
@@ -938,15 +931,11 @@ def build_assistant_graph(
                 else:
                     summary_request = PromptRequest(
                         message=_tool_summary_prompt(state["message"], getattr(tool_result, "data", {})),
-                        system=state["augmented_system"],
+                        system=effective_system,
                     )
                     response_text = await _emit_response_chunks(
                         deps.stream_local(summary_request, model_name=deps.chat_model),
-                        modality=modality,
-                        compress_model=deps.chat_model,
                     )
-                    if modality == "voice":
-                        writer({"text": response_text})
             else:
                 response_text = getattr(tool_result, "error", "The tool returned no data.") or "The tool returned no data."
                 writer({"text": response_text})
@@ -954,34 +943,22 @@ def build_assistant_graph(
             response_model = deps.cloud_model
             try:
                 response_text = await _emit_response_chunks(
-                    deps.stream_cloud(state["augmented_system"], state["cloud_messages"]),
-                    modality=modality,
-                    compress_model=deps.chat_model,
+                    deps.stream_cloud(effective_system, state["cloud_messages"]),
                 )
-                if modality == "voice":
-                    writer({"text": response_text})
             except Exception:
                 log.warning("graph.cloud_fallback | session_id=%s", state.get("session_id", ""))
                 response_model = deps.chat_model
                 writer({"notice": "Cloud unavailable \u2014 responding with local model"})
                 writer({"model": deps.chat_model, "intent": state.get("intent", ""), "confidence": state.get("confidence", 0.0), "fallback": True})
-                local_request = PromptRequest(message=state["local_prompt"], system=state["augmented_system"])
+                local_request = PromptRequest(message=state["local_prompt"], system=effective_system)
                 response_text = await _emit_response_chunks(
                     deps.stream_local(local_request, model_name=deps.chat_model),
-                    modality=modality,
-                    compress_model=deps.chat_model,
                 )
-                if modality == "voice":
-                    writer({"text": response_text})
         else:
-            local_request = PromptRequest(message=state["local_prompt"], system=state["augmented_system"])
+            local_request = PromptRequest(message=state["local_prompt"], system=effective_system)
             response_text = await _emit_response_chunks(
                 deps.stream_local(local_request, model_name=state["model"]),
-                modality=modality,
-                compress_model=deps.chat_model,
             )
-            if modality == "voice":
-                writer({"text": response_text})
 
         # Clean up any leaked tool-call tokens from Gemma 4.
         response_text = _strip_tool_call_leaks(response_text)
@@ -1114,7 +1091,13 @@ def build_assistant_graph(
                 )
                 _track_background_task(task)
 
-        return {"memory_result": memory_payload}
+        # Clear ephemeral image data so the checkpointer doesn't persist
+        # potentially megabytes of base64 to graph_checkpoints.sqlite.
+        return {
+            "memory_result": memory_payload,
+            "image_base64": None,
+            "image_mime": None,
+        }
 
     # ── Edge routing helpers ───────────────────────────────────────────────────
 

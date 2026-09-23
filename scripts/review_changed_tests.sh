@@ -38,7 +38,7 @@ EOF
 BASE_REF=""
 DRY_RUN=false
 ALLOW_KNOWN_FAILURES=false
-KNOWN_FAILURES_FILE="docs/review/KNOWN_FAILURES.txt"
+KNOWN_FAILURES_FILE="$ROOT_DIR/docs/review/KNOWN_FAILURES.txt"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -176,22 +176,6 @@ if [[ "$DRY_RUN" == "true" ]]; then
   exit 0
 fi
 
-pytest_args=("${selected_tests[@]}" "-q")
-
-if [[ "$ALLOW_KNOWN_FAILURES" == "true" ]]; then
-  if [[ -f "$KNOWN_FAILURES_FILE" ]]; then
-    while IFS= read -r line; do
-      # Ignore comments and blank lines.
-      [[ -z "${line// }" ]] && continue
-      [[ "$line" =~ ^[[:space:]]*# ]] && continue
-      pytest_args+=("--deselect" "$line")
-    done < "$KNOWN_FAILURES_FILE"
-    echo "Applying local known-failures deselection from $KNOWN_FAILURES_FILE"
-  else
-    echo "Known-failures file not found: $KNOWN_FAILURES_FILE"
-  fi
-fi
-
 all_backend_tests=true
 backend_tests=()
 for t in "${selected_tests[@]}"; do
@@ -206,6 +190,25 @@ done
 if [[ "$all_backend_tests" == "true" ]]; then
   cd "$ROOT_DIR/backend"
   pytest_args=("${backend_tests[@]}" "-q")
+else
+  pytest_args=("${selected_tests[@]}" "-q")
+fi
+
+if [[ "$ALLOW_KNOWN_FAILURES" == "true" ]]; then
+  if [[ -f "$KNOWN_FAILURES_FILE" ]]; then
+    while IFS= read -r line; do
+      # Ignore comments and blank lines.
+      [[ -z "${line// }" ]] && continue
+      [[ "$line" =~ ^[[:space:]]*# ]] && continue
+      if [[ "$all_backend_tests" == "true" && "$line" == backend/* ]]; then
+        line="${line#backend/}"
+      fi
+      pytest_args+=("--deselect" "$line")
+    done < "$KNOWN_FAILURES_FILE"
+    echo "Applying local known-failures deselection from $KNOWN_FAILURES_FILE"
+  else
+    echo "Known-failures file not found: $KNOWN_FAILURES_FILE"
+  fi
 fi
 
 "$PYTHON_BIN" -m pytest "${pytest_args[@]}"

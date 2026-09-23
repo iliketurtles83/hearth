@@ -79,13 +79,14 @@ _REASONING_KEYWORDS = [
 
 _EXTERNAL_DATA_KEYWORDS = [
     "weather", "forecast", "temperature", "rain", "snow", "humidity",
+    "umbrella", "winter coat", "rain coat", "is it raining", "is it snowing",
     "news", "headline", "current events", "latest news",
     "stock", "share price", "market today", "market now",
     "what time is it", "what date is it", "live score", "real-time",
 ]
 
 _EXTERNAL_DATA_PATTERNS = [
-    r"\b(weather|forecast|temperature|rain|snow|sunny|humidity)\b",
+    r"\b(weather|forecast|temperature|temp|rain|raining|rainy|snow|snowing|snowy|sunny|sunshine|humidity|humid|wind|windy|umbrella|coat|jacket|freezing|sleet|hail|storm|stormy|cloudy|overcast)\b",
     r"\b(news|headlines|current\s+events|latest\s+news)\b",
     r"\b(stock|share\s+price|market)\b.{0,20}\b(today|now|current)\b",
     r"\bwhat\s+(time|date)\s+is\s+it\b",
@@ -93,7 +94,7 @@ _EXTERNAL_DATA_PATTERNS = [
 ]
 
 _WEATHER_PATTERNS = [
-    r"\b(weather|forecast|temperature|rain|snow|sunny|humidity)\b",
+    r"\b(weather|forecast|temperature|temp|rain|raining|rainy|snow|snowing|snowy|sunny|sunshine|humidity|humid|wind|windy|umbrella|coat|jacket|freezing|sleet|hail|storm|stormy|cloudy|overcast)\b",
 ]
 
 _MUSIC_PATTERNS = [
@@ -224,13 +225,14 @@ _CODE_QUESTION_PATTERNS = [
 ]
 
 _CODE_QUESTION_KEYWORDS = [
-    "explain", "how does", "what does", "walk through", "walk me through",
-    "how does this work", "what does this do", "what is this doing",
-    "understand this code", "make sense of", "what's the difference",
-    "why does this", "review this code", "look at this code",
-    "can you explain", "can you describe", "can you clarify",
-    "what's happening", "what is happening",
-    "coding solution", "code snippet", "how do i",
+    "explain this code", "explain the code", "explain this function", "explain this script",
+    "how does this code", "how does this function", "how does this work",
+    "what does this code", "what does this function", "what does this do", "what is this doing",
+    "walk through this code", "walk me through this code", "walk through this function", "walk me through",
+    "understand this code", "make sense of this code", "what's the difference",
+    "why does this code", "why does this fail", "review this code", "look at this code",
+    "what's happening in this code",
+    "coding solution", "code snippet", "how do i implement", "how do i code",
 ]
 
 
