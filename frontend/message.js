@@ -19,7 +19,6 @@
   const sidebarToggleBtn = document.getElementById('sidebar-toggle-btn');
   const ttsEnableBtn = document.getElementById('tts-enable-btn');
   const ttsStopBtn = document.getElementById('tts-stop-btn');
-  const reasoningToggleBtn = document.getElementById('reasoning-toggle-btn');
   const authUsernameBtn = document.getElementById('auth-username');
 
   window.appUi = { messagesEl, messagesInner, input, sendBtn };
@@ -103,13 +102,6 @@
   function _setReasoningVisible(visible) {
     _showReasoning = !!visible;
     document.body.classList.toggle('hide-reasoning', !_showReasoning);
-    if (reasoningToggleBtn) {
-      reasoningToggleBtn.textContent = `Reasoning: ${_showReasoning ? 'On' : 'Off'}`;
-      reasoningToggleBtn.setAttribute('aria-pressed', String(_showReasoning));
-      reasoningToggleBtn.title = _showReasoning
-        ? 'Hide reasoning summaries'
-        : 'Show reasoning summaries';
-    }
     if (_reasoningMenuItem) {
       _reasoningMenuItem.textContent = `Reasoning: ${_showReasoning ? 'On' : 'Off'}`;
     }
@@ -135,11 +127,6 @@
       // best effort
     }
   }
-
-  reasoningToggleBtn?.addEventListener('click', () => {
-    _setReasoningVisible(!_showReasoning);
-    _saveReasoningPref();
-  });
 
   function _applyTheme(theme) {
     _theme = theme === 'light' ? 'light' : 'dark';
@@ -698,37 +685,109 @@
     return tpl.innerHTML;
   }
 
+  let _currentDuration = 0;
+  let _currentElapsed = 0;
+  let _playbackState = 'stop';
+  let _lastVolume = 60;
+  let _progressTicker = null;
+
+  function _formatTime(seconds) {
+    if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  }
+
+  function _updateProgressDisplay(elapsed, duration) {
+    const fill = document.getElementById('music-progress-fill');
+    const elapsedEl = document.getElementById('music-time-elapsed');
+    const durationEl = document.getElementById('music-time-duration');
+    const safeDuration = Number.isFinite(duration) && duration > 0 ? duration : 0;
+    const safeElapsed = Number.isFinite(elapsed) && elapsed >= 0 ? Math.min(elapsed, safeDuration || elapsed) : 0;
+    if (elapsedEl) elapsedEl.textContent = _formatTime(safeElapsed);
+    if (durationEl) durationEl.textContent = safeDuration > 0 ? _formatTime(safeDuration) : '0:00';
+    if (fill) {
+      const pct = safeDuration > 0 ? Math.min(100, (safeElapsed / safeDuration) * 100) : 0;
+      fill.style.width = `${pct}%`;
+    }
+  }
+
+  function _startProgressTicker() {
+    if (_progressTicker) clearInterval(_progressTicker);
+    _progressTicker = setInterval(() => {
+      if (_playbackState === 'play' && _currentDuration > 0) {
+        _currentElapsed = Math.min(_currentElapsed + 1, _currentDuration);
+        _updateProgressDisplay(_currentElapsed, _currentDuration);
+      }
+    }, 1000);
+  }
+
+  function _stopProgressTicker() {
+    if (_progressTicker) {
+      clearInterval(_progressTicker);
+      _progressTicker = null;
+    }
+  }
+
   async function refreshNowPlaying() {
-    const label = document.getElementById('now-playing-label');
+    const titleEl = document.getElementById('music-track-title');
+    const subtitleEl = document.getElementById('music-track-artist-album');
     const btn = document.getElementById('music-play-pause-btn');
     const volumeInput = document.getElementById('music-volume');
     const volumeValue = document.getElementById('music-volume-value');
-    if (!label) return;
+    if (!titleEl) return;
     try {
       const resp = await (window.apiFetch || fetch)('/music/now_playing', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       currentQueuePos = Number.isInteger(data.pos) ? data.pos : null;
-      if (data.track && data.state !== 'stop') {
+      _playbackState = data.state || 'stop';
+      const isPlaying = data.track && data.state !== 'stop';
+
+      if (isPlaying) {
         const t = data.track;
-        const parts = [t.artist, t.title].filter(Boolean);
-        const nowPlayingText = parts.join(' — ');
-        label.textContent = nowPlayingText;
-        if (musicCollapsedNowPlayingEl) musicCollapsedNowPlayingEl.textContent = nowPlayingText;
-        label.classList.remove('now-playing-idle');
-        musicCollapsedNowPlayingEl?.classList.remove('now-playing-idle');
+        const trackTitle = t.title || 'Unknown track';
+        const subParts = [t.artist, t.album].filter(Boolean);
+        const nowPlayingText = [t.artist, t.title].filter(Boolean).join(' — ') || trackTitle;
+
+        titleEl.textContent = trackTitle;
+        titleEl.classList.remove('now-playing-idle');
+        if (subtitleEl) subtitleEl.textContent = subParts.join(' • ');
+        if (musicCollapsedNowPlayingEl) {
+          musicCollapsedNowPlayingEl.textContent = nowPlayingText;
+          musicCollapsedNowPlayingEl.classList.remove('now-playing-idle');
+        }
         if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
+
+        _currentElapsed = Number.isFinite(data.elapsed) ? data.elapsed : 0;
+        _currentDuration = Number.isFinite(data.duration) ? data.duration : 0;
+        _updateProgressDisplay(_currentElapsed, _currentDuration);
+
+        if (data.state === 'play') {
+          _startProgressTicker();
+        } else {
+          _stopProgressTicker();
+        }
       } else {
-        label.textContent = 'Nothing playing';
-        if (musicCollapsedNowPlayingEl) musicCollapsedNowPlayingEl.textContent = 'Nothing playing';
-        label.classList.add('now-playing-idle');
-        musicCollapsedNowPlayingEl?.classList.add('now-playing-idle');
+        _stopProgressTicker();
+        titleEl.textContent = 'Nothing playing';
+        titleEl.classList.add('now-playing-idle');
+        if (subtitleEl) subtitleEl.textContent = '';
+        if (musicCollapsedNowPlayingEl) {
+          musicCollapsedNowPlayingEl.textContent = 'Nothing playing';
+          musicCollapsedNowPlayingEl.classList.add('now-playing-idle');
+        }
         if (btn) btn.textContent = '▶';
+        _currentElapsed = 0;
+        _currentDuration = 0;
+        _updateProgressDisplay(0, 0);
       }
+
       if (volumeInput && Number.isFinite(data.volume)) {
         const vol = Math.max(0, Math.min(100, Number(data.volume)));
         volumeInput.value = String(vol);
         if (volumeValue) volumeValue.textContent = `${vol}%`;
+        if (vol > 0) _lastVolume = vol;
       }
     } catch {
       // non-fatal — MPD may not be running
@@ -737,20 +796,26 @@
 
   async function refreshQueue() {
     const list = document.getElementById('queue-list');
+    const countBadge = document.getElementById('music-queue-count');
     if (!list) return;
     try {
       const resp = await (window.apiFetch || fetch)('/music/queue', { credentials: 'same-origin' });
       if (!resp.ok) return;
       const data = await resp.json();
       const items = data.queue || [];
+      if (countBadge) countBadge.textContent = String(items.length);
       if (!items.length) {
         list.innerHTML = '<div class="list-item" style="color:var(--text-muted);font-style:italic;font-size:0.75rem">Queue empty</div>';
         return;
       }
       list.innerHTML = items.map(item => {
-        const label = [item.artist, item.title].filter(Boolean).join(' — ') || 'Unknown track';
         const active = currentQueuePos === item.pos ? ' active-track' : '';
-        return `<div class="list-item list-item-clickable${active}" data-pos="${item.pos}" title="Play this track"><span class="list-item-title">${_esc(label)}</span></div>`;
+        const title = item.title || 'Unknown track';
+        const artist = [item.artist, item.album].filter(Boolean).join(' • ');
+        return `<div class="list-item list-item-clickable${active}" data-pos="${item.pos}" title="Play this track">` +
+               `<span class="queue-track-title">${_esc(title)}</span>` +
+               (artist ? `<span class="queue-track-artist">${_esc(artist)}</span>` : '') +
+               `</div>`;
       }).join('');
       list.querySelectorAll('.list-item-clickable').forEach(el => {
         el.addEventListener('click', () => musicControl('play_pos', { pos: parseInt(el.dataset.pos, 10) }));
@@ -778,17 +843,36 @@
   // Wire music control buttons.
   (function _bindMusicControls() {
     const pp = document.getElementById('music-play-pause-btn');
+    const prev = document.getElementById('music-prev-btn');
     const next = document.getElementById('music-next-btn');
     const stop = document.getElementById('music-stop-btn');
+    const shuffle = document.getElementById('music-shuffle-btn');
+    const clearBtn = document.getElementById('music-queue-clear-btn');
+    const muteBtn = document.getElementById('music-mute-btn');
     const volume = document.getElementById('music-volume');
     const volumeValue = document.getElementById('music-volume-value');
+
     if (pp) pp.addEventListener('click', async () => {
       // Toggle based on current label (▶ = resume, ⏸ = pause).
       const action = pp.textContent.trim() === '⏸' ? 'pause' : 'resume';
       await musicControl(action);
     });
+    if (prev) prev.addEventListener('click', () => musicControl('previous'));
     if (next) next.addEventListener('click', () => musicControl('next'));
     if (stop) stop.addEventListener('click', () => musicControl('stop'));
+    if (shuffle) shuffle.addEventListener('click', () => musicControl('shuffle'));
+    if (clearBtn) clearBtn.addEventListener('click', () => musicControl('clear'));
+    if (muteBtn) {
+      muteBtn.addEventListener('click', async () => {
+        const currentVol = volume ? parseInt(volume.value, 10) || 0 : 0;
+        if (currentVol > 0) {
+          _lastVolume = currentVol;
+          await musicControl('set_volume', { volume: 0 });
+        } else {
+          await musicControl('set_volume', { volume: _lastVolume || 60 });
+        }
+      });
+    }
     if (volume) {
       volume.addEventListener('input', () => {
         if (volumeValue) volumeValue.textContent = `${volume.value}%`;
@@ -850,7 +934,7 @@
     const menu = _ensureSessionMenu();
     _sessionMenuSid = session.session_id;
     _sessionMenuTitle = session.title || '';
-    menu.style.display = 'block';
+    menu.style.display = 'flex';
     const rect = kebabBtn.getBoundingClientRect();
     const margin = 4;
     menu.style.left = 'auto';
@@ -918,7 +1002,7 @@
     const menu = _ensureSettingsMenu();
     _themeMenuItem.textContent = `Theme: ${_theme === 'dark' ? 'Dark' : 'Light'}`;
     _reasoningMenuItem.textContent = `Reasoning: ${_showReasoning ? 'On' : 'Off'}`;
-    menu.style.display = 'block';
+    menu.style.display = 'flex';
     const rect = trigger.getBoundingClientRect();
     const margin = 4;
     menu.style.left = 'auto';

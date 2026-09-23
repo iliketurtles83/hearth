@@ -331,18 +331,21 @@ body {
 .session-menu {
   position: fixed;
   z-index: 1100;
-  min-width: 148px;
+  min-width: 160px;
   background: var(--surface-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
-  padding: 0.25rem;
+  padding: 0.35rem;
   display: flex;
   flex-direction: column;
-  gap: 0.1rem;
+  gap: 0.15rem;
 }
 
 .session-menu-item {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
   border: none;
   background: transparent;
   color: var(--text);
@@ -350,8 +353,9 @@ body {
   font-size: 0.82rem;
   font-family: var(--font-ui);
   text-align: left;
-  padding: 0.4rem 0.55rem;
+  padding: 0.45rem 0.65rem;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .session-menu-item:hover {
@@ -366,18 +370,21 @@ body {
 .settings-menu {
   position: fixed;
   z-index: 1100;
-  min-width: 190px;
+  min-width: 210px;
   background: var(--surface-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
-  padding: 0.25rem;
+  padding: 0.35rem;
   display: flex;
   flex-direction: column;
-  gap: 0.1rem;
+  gap: 0.15rem;
 }
 
 .settings-menu-item {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
   border: none;
   background: transparent;
   color: var(--text);
@@ -385,8 +392,9 @@ body {
   font-size: 0.82rem;
   font-family: var(--font-ui);
   text-align: left;
-  padding: 0.4rem 0.55rem;
+  padding: 0.45rem 0.65rem;
   cursor: pointer;
+  white-space: nowrap;
 }
 
 .settings-menu-item:hover:not(:disabled) {
@@ -406,7 +414,7 @@ body {
 .settings-menu-sep {
   height: 1px;
   background: var(--border);
-  margin: 0.2rem 0.3rem;
+  margin: 0.25rem 0.3rem;
 }
 
 .list-item-meta {
@@ -435,80 +443,251 @@ body {
   color: #fa5252;
 }
 
-/* ── Music panel (Phase 8) ─────────────────────────────────────────────────── */
+/* ── Music panel ───────────────────────────────────────────────────────────── */
 
-.music-controls {
-  display: flex;
-  gap: 0.25rem;
-  align-items: center;
-}
-
-#now-playing-bar {
+#music-player-card {
   flex: 0 0 auto;
-  padding: 0.45rem 0.55rem;
-  font-size: 0.84rem;
-  border-radius: 8px;
-  border: 1px solid rgba(108, 138, 255, 0.25);
-  background: linear-gradient(180deg, rgba(108, 138, 255, 0.12), rgba(108, 138, 255, 0.04));
-  margin-bottom: 0.45rem;
-  min-height: 2.2rem;
+  padding: 0.65rem 0.65rem 0.55rem;
+  border-radius: var(--radius);
+  border: 1px solid rgba(108, 138, 255, 0.2);
+  background: linear-gradient(180deg, rgba(108, 138, 255, 0.08) 0%, rgba(35, 38, 53, 0.6) 100%);
   display: flex;
-  align-items: center;
-  overflow: hidden;
+  flex-direction: column;
+  gap: 0.55rem;
 }
 
-#now-playing-label {
+#music-track-info {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+#music-track-title {
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: var(--text);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  color: var(--text);
+  letter-spacing: 0.01em;
 }
 
-#now-playing-label.now-playing-idle {
+#music-track-title.now-playing-idle {
+  font-size: 0.82rem;
   color: var(--text-muted);
   font-style: italic;
+  font-weight: 400;
 }
 
-#queue-list .list-item {
-  padding: 0.25rem 0.4rem;
+#music-track-artist-album {
+  font-size: 0.74rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#music-progress-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+#music-progress-bar {
+  width: 100%;
+  height: 4px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+#music-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: width 0.3s ease;
+}
+
+#music-time-row {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+}
+
+#music-transport-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  padding: 0.1rem 0;
+}
+
+.player-btn {
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: background 0.15s, transform 0.1s, border-color 0.15s;
+  padding: 0.3rem 0.45rem;
   font-size: 0.75rem;
+  line-height: 1;
+  min-width: 28px;
+  height: 28px;
 }
 
-#queue-list .list-item.active-track {
-  border-color: rgba(108, 138, 255, 0.8);
-  background: rgba(108, 138, 255, 0.16);
+.player-btn:hover {
+  background: var(--menu-hover);
+  border-color: rgba(108, 138, 255, 0.4);
 }
 
-#queue-list .list-item.active-track .list-item-title::before {
-  content: "▶ ";
-  color: var(--accent);
+.player-btn:active {
+  transform: scale(0.95);
+}
+
+.player-btn.play-pause-btn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+  min-width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  font-size: 0.85rem;
+  box-shadow: 0 2px 8px rgba(108, 138, 255, 0.35);
+}
+
+.player-btn.play-pause-btn:hover {
+  filter: brightness(1.1);
 }
 
 #music-volume-row {
-  flex: 0 0 auto;
   display: grid;
   grid-template-columns: auto 1fr auto;
   align-items: center;
   gap: 0.45rem;
-  margin-bottom: 0.45rem;
+  padding-top: 0.1rem;
 }
 
-#music-volume-label {
-  font-size: 0.72rem;
+.volume-mute-btn {
+  background: transparent;
+  border: none;
   color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0.1rem 0.2rem;
+  line-height: 1;
+}
+
+.volume-mute-btn:hover {
+  color: var(--text);
 }
 
 #music-volume {
   width: 100%;
+  accent-color: var(--accent);
+  height: 4px;
+  cursor: pointer;
 }
 
 #music-volume-value {
-  font-size: 0.74rem;
-  color: var(--text);
-  min-width: 2.6rem;
+  font-size: 0.72rem;
+  color: var(--text-muted);
+  min-width: 2.4rem;
   text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+#music-queue-section {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  min-height: 0;
+  flex: 1 1 0;
+}
+
+#music-queue-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 0.1rem;
+}
+
+.queue-heading {
+  font-size: 0.76rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.queue-badge {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text);
+  border-radius: 10px;
+  font-size: 0.68rem;
+  font-weight: 500;
+  padding: 0.05rem 0.4rem;
+}
+
+.panel-btn.mini-btn {
+  font-size: 0.68rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 4px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+}
+
+.panel-btn.mini-btn:hover {
+  color: var(--text);
+  border-color: rgba(255, 255, 255, 0.25);
+}
+
+#queue-list .list-item {
+  padding: 0.35rem 0.5rem;
+  font-size: 0.76rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.1rem;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s;
+}
+
+#queue-list .list-item:hover {
+  background: var(--menu-hover);
+}
+
+#queue-list .list-item.active-track {
+  border-left: 3px solid var(--accent);
+  background: rgba(108, 138, 255, 0.12);
+  padding-left: 0.4rem;
+}
+
+#queue-list .queue-track-title {
+  color: var(--text);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+#queue-list .queue-track-artist {
+  font-size: 0.68rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 #music-panel .panel-btn {
@@ -521,7 +700,6 @@ body {
   font-size: 0.78rem;
   line-height: 1;
 }
-
 
 #sidebar-branding {
   display: flex;
@@ -545,14 +723,6 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
-}
-
-#reasoning-toggle-btn {
-  margin-left: auto;
-  font-size: 0.68rem;
-  height: 24px;
-  padding: 0.2rem 0.5rem;
-  white-space: nowrap;
 }
 
 .reasoning-block {

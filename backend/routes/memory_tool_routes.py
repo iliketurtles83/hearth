@@ -120,9 +120,9 @@ def create_memory_tool_router(
 
     @router.post("/music/control")
     async def music_control(request: MusicControlRequest):
-        if request.action not in ("pause", "resume", "next", "stop", "play_pos", "set_volume"):
+        if request.action not in ("pause", "resume", "next", "previous", "stop", "shuffle", "clear", "play_pos", "set_volume"):
             return error_response(
-                f"Unknown action '{request.action}'. Use: pause, resume, next, stop, play_pos, set_volume.",
+                f"Unknown action '{request.action}'. Use: pause, resume, next, previous, stop, shuffle, clear, play_pos, set_volume.",
                 "MUSIC_INVALID_ACTION",
                 False,
                 status_code=400,

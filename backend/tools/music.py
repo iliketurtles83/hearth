@@ -601,7 +601,7 @@ def _sync_play_pos(pos: int) -> None:
 
 
 def _sync_control(action: str) -> None:
-    """Execute a control command: pause / resume / next / stop / shuffle."""
+    """Execute a control command: pause / resume / next / previous / stop / shuffle / clear."""
     def _fn(c: musicpd.MPDClient) -> None:
         if action == "pause":
             c.pause(1)
@@ -609,6 +609,8 @@ def _sync_control(action: str) -> None:
             c.pause(0)
         elif action == "next":
             c.next()
+        elif action == "previous":
+            c.previous()
         elif action == "stop":
             c.stop()
         elif action == "shuffle":
@@ -617,6 +619,8 @@ def _sync_control(action: str) -> None:
             if length == 0:
                 raise ValueError("The queue is empty.")
             c.shuffle()
+        elif action == "clear":
+            c.clear()
         else:
             raise ValueError(f"Unknown control action: {action!r}")
     _with_mpd(_fn)
@@ -730,7 +734,10 @@ _CONTROL_MAP: dict[str, str] = {
     "unpause": "resume",
     "next": "next",
     "skip": "next",
+    "previous": "previous",
+    "prev": "previous",
     "shuffle": "shuffle",
+    "clear": "clear",
 }
 
 

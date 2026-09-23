@@ -59,7 +59,6 @@
           <button id="tts-enable-btn" type="button" style="display:none">Enable Voice</button>
           <button id="tts-stop-btn" type="button" style="display:none">Stop</button>
         </div>
-        <button id="reasoning-toggle-btn" class="panel-btn" type="button" title="Toggle reasoning summaries">Reasoning: On</button>
       </div>
       <div id="sidebar-main">
         <section class="panel" id="sessions-panel">
@@ -75,31 +74,50 @@
           </div>
         </section>
 
-        <!-- Music panel (Phase 8): now-playing + queue -->
+        <!-- Music panel: player card + transport controls + queue -->
         <section class="panel" id="music-panel">
           <div class="panel-header">
             <h2>Music</h2>
             <div class="panel-header-actions">
               <span id="music-collapsed-now-playing" class="collapsed-now-playing now-playing-idle" aria-live="polite">Nothing playing</span>
-              <div class="music-controls" id="music-controls">
-                <button id="music-prev-btn" class="panel-btn" title="Previous / Restart">&#9664;&#9664;</button>
-                <button id="music-play-pause-btn" class="panel-btn" title="Play / Pause">&#9654;</button>
-                <button id="music-next-btn" class="panel-btn" title="Next track">&#9654;&#9654;</button>
-                <button id="music-stop-btn" class="panel-btn" title="Stop">&#9632;</button>
-              </div>
               <button id="music-collapse-btn" class="panel-btn collapse-btn" title="Collapse music section" aria-expanded="true" aria-controls="music-panel-body">▾</button>
             </div>
           </div>
           <div id="music-panel-body" class="panel-body">
-            <div id="now-playing-bar">
-              <span id="now-playing-label" class="now-playing-idle">Nothing playing</span>
+            <div id="music-player-card">
+              <div id="music-track-info">
+                <div id="music-track-title" class="track-title now-playing-idle">Nothing playing</div>
+                <div id="music-track-artist-album" class="track-subtext"></div>
+              </div>
+              <div id="music-progress-container">
+                <div id="music-progress-bar" title="Track progress">
+                  <div id="music-progress-fill" style="width: 0%"></div>
+                </div>
+                <div id="music-time-row">
+                  <span id="music-time-elapsed">0:00</span>
+                  <span id="music-time-duration">0:00</span>
+                </div>
+              </div>
+              <div id="music-transport-row">
+                <button id="music-shuffle-btn" class="player-btn" type="button" title="Shuffle queue">&#128256;</button>
+                <button id="music-prev-btn" class="player-btn" type="button" title="Previous track">&#9664;&#9664;</button>
+                <button id="music-play-pause-btn" class="player-btn play-pause-btn" type="button" title="Play / Pause">&#9654;</button>
+                <button id="music-next-btn" class="player-btn" type="button" title="Next track">&#9654;&#9654;</button>
+                <button id="music-stop-btn" class="player-btn" type="button" title="Stop playback">&#9632;</button>
+              </div>
+              <div id="music-volume-row">
+                <button id="music-mute-btn" class="volume-mute-btn" type="button" title="Mute / Unmute">&#128266;</button>
+                <input id="music-volume" type="range" min="0" max="100" step="1" value="60" aria-label="Volume" />
+                <span id="music-volume-value">60%</span>
+              </div>
             </div>
-            <div id="music-volume-row">
-              <label for="music-volume" id="music-volume-label">Volume</label>
-              <input id="music-volume" type="range" min="0" max="100" step="1" value="60" />
-              <span id="music-volume-value">60%</span>
+            <div id="music-queue-section">
+              <div id="music-queue-header">
+                <span class="queue-heading">Queue <span id="music-queue-count" class="queue-badge">0</span></span>
+                <button id="music-queue-clear-btn" class="panel-btn mini-btn" type="button" title="Clear queue">Clear</button>
+              </div>
+              <div id="queue-list" class="list"></div>
             </div>
-            <div id="queue-list" class="list"></div>
           </div>
         </section>
 

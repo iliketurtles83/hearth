@@ -63,7 +63,13 @@ class _FakeMPDClient:
     def next(self) -> None:
         pass
 
+    def previous(self) -> None:
+        pass
+
     def stop(self) -> None:
+        pass
+
+    def shuffle(self) -> None:
         pass
 
 
@@ -822,3 +828,18 @@ async def test_run_add_to_the_queue_prompt_infers_queue_action():
     assert result.ok
     assert result.data["action"] == "queue"
     mock_q.assert_called_once_with("/music/creep.mp3")
+
+
+def test_sync_control_previous():
+    client = MagicMock()
+    with patch.object(music, "_mpd_connect", return_value=client):
+        music._sync_control("previous")
+    client.previous.assert_called_once()
+
+
+def test_sync_control_clear():
+    client = MagicMock()
+    with patch.object(music, "_mpd_connect", return_value=client):
+        music._sync_control("clear")
+    client.clear.assert_called_once()
+
