@@ -344,13 +344,25 @@ def _decision_from_embedding(
                 needs_memory=False,
             )
 
-    if tool_label in {"weather", "music"}:
+    if tool_label == "weather":
         return RouteDecision(
             intent="external-data-needed",
             confidence=round(_similarity_to_confidence(tool_score), 3),
             use_cloud=False,
             model=chat_model,
             tool=tool_label,
+            planner_status="embedding",
+            reasoning_summary=reasoning_summary,
+            needs_memory=False,
+        )
+
+    if tool_label == "music":
+        return RouteDecision(
+            intent="quick-local",
+            confidence=round(_similarity_to_confidence(tool_score), 3),
+            use_cloud=False,
+            model=chat_model,
+            tool=None,
             planner_status="embedding",
             reasoning_summary=reasoning_summary,
             needs_memory=False,
@@ -498,6 +510,9 @@ def _heuristic_decision(
     cloud_model: str,
     vision_model: str,
 ) -> RouteDecision:
+    if heuristic.tool == "music":
+        heuristic.tool = None
+        heuristic.intent = "quick-local"
     heuristic.model = _pick_model_for_decision(
         heuristic.intent,
         use_cloud=heuristic.use_cloud,
