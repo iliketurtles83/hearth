@@ -6,10 +6,12 @@
   const stopBtn = document.getElementById('stop-btn');
   const sessionListEl = document.getElementById('session-list');
   const sessionNewBtn = document.getElementById('session-new-btn');
-  const memoryListEl = document.getElementById('memory-list');
-  const memoryClearBtn = document.getElementById('memory-clear-btn');
-  const memoryPanel = document.getElementById('memory-panel');
-  const memoryCollapseBtn = document.getElementById('memory-collapse-btn');
+  const memoryModal = document.getElementById('memory-modal');
+  const memoryModalList = document.getElementById('memory-modal-list');
+  const memoryModalCount = document.getElementById('memory-modal-count');
+  const memoryModalClearBtn = document.getElementById('memory-modal-clear-btn');
+  const memoryModalConsolidateBtn = document.getElementById('memory-modal-consolidate-btn');
+  const memoryModalCloseBtn = document.getElementById('memory-modal-close-btn');
   const sessionsPanel = document.getElementById('sessions-panel');
   const sessionsCollapseBtn = document.getElementById('sessions-collapse-btn');
   const musicPanel = document.getElementById('music-panel');
@@ -253,24 +255,52 @@
     collapseBtnEl.title = `${collapsed ? 'Expand' : 'Collapse'} ${label} section`;
   }
 
+  const _ACTIVE_PANEL_KEY = 'hearth:active_panel';
+
+  function expandMusicPanel() {
+    setPanelCollapsed(musicPanel, musicCollapseBtn, false);
+    setPanelCollapsed(sessionsPanel, sessionsCollapseBtn, true);
+    try { window.localStorage.setItem(_ACTIVE_PANEL_KEY, 'music'); } catch {}
+  }
+
+  function expandSessionsPanel() {
+    setPanelCollapsed(sessionsPanel, sessionsCollapseBtn, false);
+    setPanelCollapsed(musicPanel, musicCollapseBtn, true);
+    try { window.localStorage.setItem(_ACTIVE_PANEL_KEY, 'sessions'); } catch {}
+  }
+
   function _bindCollapsiblePanels() {
     sessionsCollapseBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
-      const collapsed = !sessionsPanel?.classList.contains('is-collapsed');
-      setPanelCollapsed(sessionsPanel, sessionsCollapseBtn, collapsed);
-    });
-
-    memoryCollapseBtn?.addEventListener('click', (e) => {
-      e.stopPropagation();
-      const collapsed = !memoryPanel?.classList.contains('is-collapsed');
-      setPanelCollapsed(memoryPanel, memoryCollapseBtn, collapsed);
+      const willBeCollapsed = !sessionsPanel?.classList.contains('is-collapsed');
+      if (!willBeCollapsed) {
+        expandSessionsPanel();
+      } else {
+        setPanelCollapsed(sessionsPanel, sessionsCollapseBtn, true);
+      }
     });
 
     musicCollapseBtn?.addEventListener('click', (e) => {
       e.stopPropagation();
-      const collapsed = !musicPanel?.classList.contains('is-collapsed');
-      setPanelCollapsed(musicPanel, musicCollapseBtn, collapsed);
+      const willBeCollapsed = !musicPanel?.classList.contains('is-collapsed');
+      if (!willBeCollapsed) {
+        expandMusicPanel();
+      } else {
+        setPanelCollapsed(musicPanel, musicCollapseBtn, true);
+      }
     });
+
+    // Restore saved panel preference (default: sessions expanded, music collapsed)
+    try {
+      const saved = window.localStorage.getItem(_ACTIVE_PANEL_KEY);
+      if (saved === 'music') {
+        expandMusicPanel();
+      } else {
+        expandSessionsPanel();
+      }
+    } catch {
+      expandSessionsPanel();
+    }
   }
 
   function closeSidebar() {
@@ -339,13 +369,12 @@
 
   sendBtn.addEventListener('click', send);
   sessionNewBtn?.addEventListener('click', startNewChat);
-  memoryClearBtn?.addEventListener('click', clearAllMemory);
 
   function setLocked(locked) {
     sendBtn.disabled = locked;
     input.disabled = locked;
     if (sessionNewBtn) sessionNewBtn.disabled = locked;
-    if (memoryClearBtn) memoryClearBtn.disabled = locked;
+    if (memoryModalClearBtn) memoryModalClearBtn.disabled = locked;
     if (stopBtn) stopBtn.style.display = locked ? 'flex' : 'none';
     sendBtn.style.display = locked ? 'none' : 'flex';
   }
@@ -553,13 +582,16 @@
   }
 
   function renderMemory(items) {
-    if (!memoryListEl) return;
-    memoryListEl.innerHTML = '';
+    const listEl = document.getElementById('memory-modal-list');
+    const countEl = document.getElementById('memory-modal-count');
+    if (countEl) countEl.textContent = `${items.length} item${items.length === 1 ? '' : 's'}`;
+    if (!listEl) return;
+    listEl.innerHTML = '';
     if (!items.length) {
       const div = document.createElement('div');
-      div.className = 'list-item';
-      div.innerHTML = '<div class="list-item-title">No memory yet</div>';
-      memoryListEl.appendChild(div);
+      div.className = 'memory-modal-item';
+      div.innerHTML = '<div class="memory-modal-key" style="color:var(--text-muted);font-style:italic">No stored memory yet</div>';
+      listEl.appendChild(div);
       return;
     }
 
@@ -571,20 +603,23 @@
         : '';
 
       const div = document.createElement('div');
-      div.className = 'list-item';
+      div.className = 'memory-modal-item';
       div.innerHTML = `
-        <div class="list-item-title">${_esc(item.key)}</div>
-        <div class="list-item-meta">${_esc((item.value || '').slice(0, 90))}</div>
-        <div class="list-item-meta">${_esc(tierLabel)}${consolidatedLabel ? ` · ${_esc(consolidatedLabel)}` : ''}</div>
-        <div class="memory-actions">
-          <button class="memory-delete-btn" data-id="${_esc(item.id)}">Delete</button>
+        <div class="memory-modal-header">
+          <span class="memory-modal-key">${_esc(item.key)}</span>
+          <button class="panel-btn mini-btn danger memory-delete-btn" data-id="${_esc(item.id)}">Delete</button>
+        </div>
+        <div class="memory-modal-value">${_esc(item.value || '')}</div>
+        <div class="memory-modal-meta">
+          <span class="queue-badge">${_esc(tierLabel)}</span>
+          ${consolidatedLabel ? `<span>· ${_esc(consolidatedLabel)}</span>` : ''}
         </div>
       `;
       div.querySelector('.memory-delete-btn')?.addEventListener('click', async (e) => {
         e.stopPropagation();
         await deleteMemory(item.id);
       });
-      memoryListEl.appendChild(div);
+      listEl.appendChild(div);
     }
   }
 
@@ -729,7 +764,7 @@
     }
   }
 
-  async function refreshNowPlaying() {
+  async function refreshNowPlaying(autoExpand = false) {
     const titleEl = document.getElementById('music-track-title');
     const subtitleEl = document.getElementById('music-track-artist-album');
     const btn = document.getElementById('music-play-pause-btn');
@@ -741,6 +776,7 @@
       if (!resp.ok) return;
       const data = await resp.json();
       currentQueuePos = Number.isInteger(data.pos) ? data.pos : null;
+      const previousState = _playbackState;
       _playbackState = data.state || 'stop';
       const isPlaying = data.track && data.state !== 'stop';
 
@@ -765,6 +801,9 @@
 
         if (data.state === 'play') {
           _startProgressTicker();
+          if (autoExpand || previousState !== 'play') {
+            expandMusicPanel();
+          }
         } else {
           _stopProgressTicker();
         }
@@ -834,7 +873,8 @@
         body: JSON.stringify({ action, ...extra }),
       });
       // Brief delay so MPD state settles before polling.
-      setTimeout(() => { refreshNowPlaying(); refreshQueue(); }, 400);
+      const shouldAutoExpand = action === 'resume' || action === 'play_pos';
+      setTimeout(() => { refreshNowPlaying(shouldAutoExpand); refreshQueue(); }, 400);
     } catch {
       // non-fatal
     }
@@ -969,14 +1009,14 @@
       '<button type="button" class="settings-menu-item" data-action="theme" role="menuitem">Theme: Dark</button>' +
       '<button type="button" class="settings-menu-item" data-action="reasoning" role="menuitem">Reasoning: On</button>' +
       '<div class="settings-menu-sep" role="separator"></div>' +
+      '<button type="button" class="settings-menu-item" data-action="memory" role="menuitem">Manage memory</button>' +
       '<button type="button" class="settings-menu-item" data-action="beets" role="menuitem">Update music library</button>' +
-      '<button type="button" class="settings-menu-item" data-action="consolidate" role="menuitem">Consolidate memory</button>' +
       '<div class="settings-menu-sep" role="separator"></div>' +
       '<button type="button" class="settings-menu-item danger" data-action="logout" role="menuitem">Sign out</button>';
     _themeMenuItem = el.querySelector('[data-action="theme"]');
     _reasoningMenuItem = el.querySelector('[data-action="reasoning"]');
     _beetsMenuItem = el.querySelector('[data-action="beets"]');
-    _consolidateMenuItem = el.querySelector('[data-action="consolidate"]');
+    _consolidateMenuItem = null;
     _themeMenuItem.addEventListener('click', () => {
       _applyTheme(_theme === 'dark' ? 'light' : 'dark');
       _saveThemePref();
@@ -985,8 +1025,10 @@
       _setReasoningVisible(!_showReasoning);
       _saveReasoningPref();
     });
+    el.querySelector('[data-action="memory"]').addEventListener('click', () => {
+      openMemoryModal();
+    });
     _beetsMenuItem.addEventListener('click', () => { void updateMusicLibrary(); });
-    _consolidateMenuItem.addEventListener('click', () => { void consolidateMemoryNow(); });
     el.querySelector('[data-action="logout"]').addEventListener('click', () => {
       closeSettingsMenu();
       if (typeof window.hearthLogout === 'function') {
@@ -997,6 +1039,34 @@
     _settingsMenuEl = el;
     return el;
   }
+
+  function openMemoryModal() {
+    closeSettingsMenu();
+    if (memoryModal) {
+      memoryModal.style.display = 'flex';
+      void refreshMemory();
+    }
+  }
+
+  function closeMemoryModal() {
+    if (memoryModal) memoryModal.style.display = 'none';
+  }
+
+  (function _bindMemoryModal() {
+    memoryModalCloseBtn?.addEventListener('click', closeMemoryModal);
+    memoryModalConsolidateBtn?.addEventListener('click', () => { void consolidateMemoryNow(); });
+    memoryModalClearBtn?.addEventListener('click', () => { void clearAllMemory(); });
+
+    memoryModal?.addEventListener('click', (e) => {
+      if (e.target === memoryModal) closeMemoryModal();
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && memoryModal && memoryModal.style.display !== 'none') {
+        closeMemoryModal();
+      }
+    });
+  })();
 
   function openSettingsMenu(trigger) {
     const menu = _ensureSettingsMenu();
@@ -1064,7 +1134,10 @@
   async function consolidateMemoryNow() {
     if (_settingsActionBusy) return;
     _setSettingsActionsBusy(true);
-    if (_consolidateMenuItem) _consolidateMenuItem.textContent = 'Consolidating…';
+    if (memoryModalConsolidateBtn) {
+      memoryModalConsolidateBtn.textContent = 'Consolidating…';
+      memoryModalConsolidateBtn.disabled = true;
+    }
     try {
       const resp = await (window.apiFetch || fetch)('/memory/consolidate', {
         method: 'POST',
@@ -1079,7 +1152,10 @@
       appendMessage('assistant', `⚠ Unable to consolidate memory: ${err.message}`);
     } finally {
       _setSettingsActionsBusy(false);
-      if (_consolidateMenuItem) _consolidateMenuItem.textContent = 'Consolidate memory';
+      if (memoryModalConsolidateBtn) {
+        memoryModalConsolidateBtn.textContent = 'Consolidate memory';
+        memoryModalConsolidateBtn.disabled = false;
+      }
     }
   }
 
@@ -1323,7 +1399,9 @@
       input.focus();
       await refreshSessions();
       await refreshMemory();
-      refreshNowPlaying();
+      const isMusicMsg = /play|queue|music|song|track|artist|jazz|rock|classical/i.test(text || '') ||
+                         /playing|added|resumed/i.test(accumulated || '');
+      refreshNowPlaying(isMusicMsg);
       refreshQueue();
     }
   }
