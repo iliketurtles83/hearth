@@ -12,7 +12,7 @@ import numpy as np
 log = logging.getLogger("assistant.embedding_router")
 
 
-TOOL_CLASSES = ("none", "weather", "music", "code", "vision")
+TOOL_CLASSES = ("none", "weather", "music", "code", "vision", "timer", "calculator", "datetime")
 DIALOGUE_CLASSES = ("local", "cloud", "memory-augmented")
 
 ROUTER_EMBED_MODEL = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
@@ -106,6 +106,57 @@ DEFAULT_TOOL_EXEMPLARS: dict[str, tuple[str, ...]] = {
         "Describe the photo details",
         "Can you OCR this picture",
         "Tell me what is shown in this image",
+    ),
+    "timer": (
+        "Set a timer for 10 minutes",
+        "Remind me to check the oven in 20 minutes",
+        "Set a reminder for 30 minutes",
+        "Start a 5 minute timer",
+        "Cancel my timer",
+        "What timers do I have",
+        "Show my active timers",
+        "Set an alarm for 15 minutes",
+        "Remind me in 1 hour",
+        "How much time is left on my timer",
+        "Delete the reminder",
+        "Set a timer called laundry for 45 minutes",
+        "List my reminders",
+        "Timer for 2 minutes",
+        "Cancel the laundry timer",
+    ),
+    "calculator": (
+        "What is 15 percent of 87.50",
+        "Calculate 2 plus 3 times 4",
+        "What is the square root of 144",
+        "Convert 5 miles to kilometers",
+        "How much is 100 minus 20 percent",
+        "What is 2 to the power of 16",
+        "Convert 150 pounds to kilograms",
+        "What is 87.50 plus 15 percent tip",
+        "Calculate the area of a circle with radius 5",
+        "How many kilometers is 10 miles",
+        "Convert 100 celsius to fahrenheit",
+        "What is 1024 divided by 16",
+        "How many gallons in 20 liters",
+        "Compute sin of pi over 2",
+        "How much is 3.5 times 2.8",
+    ),
+    "datetime": (
+        "What time is it in Tokyo",
+        "Current time in London",
+        "What day of the week is March 15 2026",
+        "How many days until Christmas",
+        "What is today's date",
+        "Time in New York",
+        "What day is January 1 2027",
+        "Days until new year",
+        "What time is it in Berlin",
+        "How many days until Halloween",
+        "What is the date today",
+        "Current time in Sydney",
+        "What day of the week is tomorrow",
+        "Days until Valentine's Day",
+        "Time in America/New_York",
     ),
 }
 

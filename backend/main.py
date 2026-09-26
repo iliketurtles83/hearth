@@ -179,13 +179,19 @@ def _load_hearth_prompt(filename: str, env_var: str, fallback: str) -> str:
     return os.getenv(env_var, fallback)
 
 
+CHAT_PROMPT_FILE = os.getenv("CHAT_PROMPT_FILE", "hearth_prompt.txt")
+CODE_PROMPT_FILE = os.getenv("CODE_PROMPT_FILE", "hearth_coder_prompt.txt")
+MODELS_DIR = os.getenv("MODELS_DIR", os.path.join(os.path.dirname(__file__), "models"))
+FRONTEND_DIR = os.getenv("FRONTEND_DIR", os.path.join(os.path.dirname(__file__), "..", "frontend"))
+WHISPER_GPU_DEVICE_PATH = os.getenv("WHISPER_GPU_DEVICE_PATH", "/dev/nvidia0")
+
 CHAT_DEFAULT_SYSTEM_PROMPT = _load_hearth_prompt(
-    "hearth_prompt.txt",
+    CHAT_PROMPT_FILE,
     "CHAT_DEFAULT_SYSTEM_PROMPT",
     "You are a helpful personal assistant. Be concise and accurate.",
 )
 CODE_DEFAULT_SYSTEM_PROMPT = _load_hearth_prompt(
-    "hearth_coder_prompt.txt",
+    CODE_PROMPT_FILE,
     "CODE_DEFAULT_SYSTEM_PROMPT",
     "You are a helpful coding assistant. Be concise and accurate.",
 )
@@ -396,7 +402,7 @@ def run_beets_update() -> dict:
 
 
 def _validate_startup() -> None:
-    _models_dir = os.path.join(os.path.dirname(__file__), "models")
+    _models_dir = MODELS_DIR
     required_models = _required_wake_models()
     missing_models = [m for m in required_models if not os.path.isfile(os.path.join(_models_dir, m))]
     if missing_models:
@@ -671,7 +677,7 @@ def get_oww_model():
     global _oww_model
     if _oww_model is None:
         from openwakeword.model import Model
-        _models_dir = os.path.join(os.path.dirname(__file__), "models")
+        _models_dir = MODELS_DIR
         # v0.6.0 removed bundled backbone models — pass explicit paths so AudioFeatures
         # doesn't look in the (empty) library resources directory.
         _oww_model = Model(
@@ -726,7 +732,7 @@ def _resolve_whisper_model_source():
     # the downloaded dir survives rebuilds.
     if WHISPER_MODEL_DIR:
         return WHISPER_MODEL_DIR
-    default_dir = os.path.join(os.path.dirname(__file__), "models", "whisper", WHISPER_MODEL)
+    default_dir = os.path.join(MODELS_DIR, "whisper", WHISPER_MODEL)
     if os.path.isfile(os.path.join(default_dir, "model.bin")):
         return default_dir
     return WHISPER_MODEL
@@ -738,7 +744,7 @@ def get_whisper_model():
         if WHISPER_DEVICE:
             device = WHISPER_DEVICE
         else:
-            device = "cuda" if os.path.exists("/dev/nvidia0") else "cpu"
+            device = "cuda" if os.path.exists(WHISPER_GPU_DEVICE_PATH) else "cpu"
         compute = WHISPER_COMPUTE_TYPE or ("float16" if device == "cuda" else "int8")
         model_source = _resolve_whisper_model_source()
         log.info("whisper.model_source | source=%s device=%s compute=%s", model_source, device, compute)
@@ -1208,7 +1214,7 @@ app.include_router(create_code_router(services))
 
 
 # ── Static frontend — MUST be last ────────────────────────────────────────────
-_frontend_dir = os.path.join(os.path.dirname(__file__), "..", "frontend")
+_frontend_dir = FRONTEND_DIR
 if os.path.isdir(_frontend_dir):
     # Serve static assets under /static so API routes (e.g. /health) are
     # not intercepted by the static files app which would return 404.

@@ -49,6 +49,9 @@ from embedding_router import (
 )
 from routing_config import ROUTING_CONFIG
 from tools.weather import format_weather_response, is_weather_reasoning
+from tools.timer import format_timer_response
+from tools.calculator import format_calculator_response
+from tools.datetime_tool import format_datetime_response
 from tools.schemas import HEARTH_TOOLS
 from music_fastpath import format_music_response
 
@@ -320,7 +323,7 @@ def _decision_from_embedding(
     # conversational phrases from accidentally triggering weather/music routing.
     TOOL_OVERRIDE_GAP = 0.10
 
-    if tool_label in {"weather", "music", "code"} and tool_gap < TOOL_OVERRIDE_GAP:
+    if tool_label in {"weather", "music", "code", "timer", "calculator", "datetime"} and tool_gap < TOOL_OVERRIDE_GAP:
         if dialogue_label == "memory-augmented":
             return RouteDecision(
                 intent="memory-needed",
@@ -387,6 +390,18 @@ def _decision_from_embedding(
             use_cloud=False,
             model=chat_model,
             tool=None,
+            planner_status="embedding",
+            reasoning_summary=reasoning_summary,
+            needs_memory=False,
+        )
+
+    if tool_label in ("timer", "calculator", "datetime"):
+        return RouteDecision(
+            intent="external-data-needed",
+            confidence=round(_similarity_to_confidence(tool_score), 3),
+            use_cloud=False,
+            model=chat_model,
+            tool=tool_label,
             planner_status="embedding",
             reasoning_summary=reasoning_summary,
             needs_memory=False,
@@ -925,6 +940,7 @@ def build_assistant_graph(
                 t_args = {}
 
             log.info("graph.responder | llm_tool_call | tool=%s args=%s", t_name, t_args)
+            writer({"tool": t_name})
 
             if t_name == "weather":
                 t_params = {
@@ -963,6 +979,43 @@ def build_assistant_graph(
                 }
                 tool_result = await deps.tool_dispatch("music", t_params)
                 res = format_music_response(tool_result, t_params)
+                writer({"text": res})
+                return res
+
+            elif t_name == "timer":
+                t_params = {
+                    "prompt": state["message"],
+                    "action": t_args.get("action"),
+                    "duration_minutes": t_args.get("duration_minutes"),
+                    "label": t_args.get("label"),
+                    "timer_id": t_args.get("timer_id"),
+                    "user_id": state["user_id"],
+                }
+                tool_result = await deps.tool_dispatch("timer", t_params)
+                res = format_timer_response(tool_result, t_args.get("action", ""))
+                writer({"text": res})
+                return res
+
+            elif t_name == "calculator":
+                t_params = {
+                    "prompt": state["message"],
+                    "expression": t_args.get("expression", state["message"]),
+                    "user_id": state["user_id"],
+                }
+                tool_result = await deps.tool_dispatch("calculator", t_params)
+                res = format_calculator_response(tool_result)
+                writer({"text": res})
+                return res
+
+            elif t_name == "datetime":
+                t_params = {
+                    "prompt": state["message"],
+                    "query": t_args.get("query", state["message"]),
+                    "timezone": t_args.get("timezone"),
+                    "user_id": state["user_id"],
+                }
+                tool_result = await deps.tool_dispatch("datetime", t_params)
+                res = format_datetime_response(tool_result)
                 writer({"text": res})
                 return res
 
@@ -1013,6 +1066,7 @@ def build_assistant_graph(
         # ── End vision path ──────────────────────────────────────────────────
 
         if state.get("tool"):
+            writer({"tool": state["tool"]})
             tool_result = await deps.tool_dispatch(
                 state["tool"],
                 {"prompt": state["message"], "user_id": state["user_id"], "memory": deps.memory_store},
@@ -1025,6 +1079,15 @@ def build_assistant_graph(
                     writer({"text": response_text})
                 elif state["tool"] == "music":
                     response_text = format_music_response(tool_result, {"action": "play", "prompt": state["message"]})
+                    writer({"text": response_text})
+                elif state["tool"] == "timer":
+                    response_text = format_timer_response(tool_result)
+                    writer({"text": response_text})
+                elif state["tool"] == "calculator":
+                    response_text = format_calculator_response(tool_result)
+                    writer({"text": response_text})
+                elif state["tool"] == "datetime":
+                    response_text = format_datetime_response(tool_result)
                     writer({"text": response_text})
                 else:
                     summary_request = PromptRequest(

@@ -61,4 +61,73 @@ HEARTH_TOOLS: list[dict[str, Any]] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "timer",
+            "description": "Set, list, or cancel timers and reminders",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["set", "list", "cancel"],
+                        "description": "Timer action to perform",
+                    },
+                    "duration_minutes": {
+                        "type": "number",
+                        "description": "Duration in minutes for the timer",
+                    },
+                    "label": {
+                        "type": "string",
+                        "description": "Label or reminder text for the timer",
+                    },
+                    "timer_id": {
+                        "type": "string",
+                        "description": "ID of the timer to cancel",
+                    },
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "calculator",
+            "description": "Evaluate a math expression or convert between units",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "Math expression to evaluate, e.g. '15% of 87.50', 'sqrt(144)', '2 ** 16', '5 miles to km'",
+                    },
+                },
+                "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "datetime",
+            "description": "Get current time in a timezone, day of week for a date, or countdown to an event",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The date/time query, e.g. 'time in Tokyo', 'what day is March 15 2026', 'days until Christmas'",
+                    },
+                    "timezone": {
+                        "type": "string",
+                        "description": "Optional timezone name or city, e.g. 'Tokyo', 'America/New_York'",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
 ]
+

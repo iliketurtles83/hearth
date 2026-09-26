@@ -200,3 +200,175 @@ async def test_llm_native_music_tool_calling():
     assert dispatched[0][1]["action"] == "play"
     assert dispatched[0][1]["query"] == "jazz"
     assert 'Now playing: "Autumn Leaves" by Miles Davis.' in result["response_text"]
+
+
+@pytest.mark.asyncio
+async def test_llm_native_timer_tool_calling():
+    """Graph responder executes timer tool call when the local model yields tool_calls."""
+    dispatched = []
+
+    async def _fake_stream_local(req, model_name=None):
+        yield {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "function": {
+                        "name": "timer",
+                        "arguments": '{"action": "set", "duration_minutes": 15, "label": "tea"}',
+                    },
+                }
+            ]
+        }
+
+    async def _fake_stream_cloud(_s, _m):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(tool_name: str, params: dict):
+        dispatched.append((tool_name, params))
+        return ToolResult(
+            ok=True,
+            data={
+                "action": "set",
+                "id": "abc12345",
+                "label": "tea",
+                "duration_minutes": 15,
+                "fires_at": "2026-09-25T18:30:00+00:00",
+            },
+        )
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        embedding_router=None,
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+    graph = assistant_graph.build_assistant_graph(deps)
+
+    state = _base_state()
+    state["message"] = "Can you help me keep track of tea for 15 minutes?"
+    result = await graph.ainvoke(state)
+
+    assert len(dispatched) == 1
+    assert dispatched[0][0] == "timer"
+    assert dispatched[0][1]["action"] == "set"
+    assert dispatched[0][1]["duration_minutes"] == 15
+    assert dispatched[0][1]["label"] == "tea"
+    assert 'Timer set: "tea" — fires in 15 minutes.' in result["response_text"]
+
+
+@pytest.mark.asyncio
+async def test_llm_native_calculator_tool_calling():
+    """Graph responder executes calculator tool call when the local model yields tool_calls."""
+    dispatched = []
+
+    async def _fake_stream_local(req, model_name=None):
+        yield {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "function": {
+                        "name": "calculator",
+                        "arguments": '{"expression": "15% of 87.50"}',
+                    },
+                }
+            ]
+        }
+
+    async def _fake_stream_cloud(_s, _m):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(tool_name: str, params: dict):
+        dispatched.append((tool_name, params))
+        return ToolResult(
+            ok=True,
+            data={
+                "type": "calculation",
+                "expression": "(0.15 * 87.50)",
+                "result": "13.125",
+                "original": "15% of 87.50",
+            },
+        )
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        embedding_router=None,
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+    graph = assistant_graph.build_assistant_graph(deps)
+
+    state = _base_state()
+    state["message"] = "Could you help me do the math on that?"
+    result = await graph.ainvoke(state)
+
+    assert len(dispatched) == 1
+    assert dispatched[0][0] == "calculator"
+    assert dispatched[0][1]["expression"] == "15% of 87.50"
+    assert "13.12" in result["response_text"]
+
+
+@pytest.mark.asyncio
+async def test_llm_native_datetime_tool_calling():
+    """Graph responder executes datetime tool call when the local model yields tool_calls."""
+    dispatched = []
+
+    async def _fake_stream_local(req, model_name=None):
+        yield {
+            "tool_calls": [
+                {
+                    "index": 0,
+                    "function": {
+                        "name": "datetime",
+                        "arguments": '{"query": "time in Tokyo", "timezone": "Tokyo"}',
+                    },
+                }
+            ]
+        }
+
+    async def _fake_stream_cloud(_s, _m):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(tool_name: str, params: dict):
+        dispatched.append((tool_name, params))
+        return ToolResult(
+            ok=True,
+            data={
+                "query_type": "time",
+                "timezone": "Asia/Tokyo",
+                "city": "Tokyo",
+                "local_time": "2026-09-26 00:49",
+                "day_of_week": "Saturday",
+                "date": "2026-09-26",
+                "utc_offset": "+09:00",
+            },
+        )
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        embedding_router=None,
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+    graph = assistant_graph.build_assistant_graph(deps)
+
+    state = _base_state()
+    state["message"] = "What is the current hour over there right now?"
+    result = await graph.ainvoke(state)
+
+    assert len(dispatched) == 1
+    assert dispatched[0][0] == "datetime"
+    assert dispatched[0][1]["timezone"] == "Tokyo"
+    assert "Tokyo" in result["response_text"]
+    assert "00:49" in result["response_text"]

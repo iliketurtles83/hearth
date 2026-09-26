@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import embedding_router as er
+from routing_config import ROUTING_CONFIG
 
 
 def _build_router(
@@ -99,7 +100,7 @@ def test_router_uses_module_threshold_defaults() -> None:
 
 def test_snapshot_model_mismatch_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     router = _build_router(tool_gap=0.02, dialogue_gap=0.02)
-    router.snapshot_model = "nomic-embed-text"
+    router.snapshot_model = ROUTING_CONFIG.router_embed_model
     monkeypatch.setenv("ROUTER_EMBED_MODEL", "mxbai-embed-large")
 
     with pytest.raises(er.EmbeddingRouterSnapshotMismatchError, match="snapshot model mismatch"):
@@ -125,7 +126,7 @@ async def test_warmup_embedding_router_caches_result(monkeypatch: pytest.MonkeyP
     dialogue_index = er.ExemplarIndex.from_embeddings(dialogue_exemplars, [[1.0, 0.0]])
     router = er.EmbeddingIntentRouter(tool_index=tool_index, dialogue_index=dialogue_index)
     snapshot = er.EmbeddingRouterSnapshot(
-        model="nomic-embed-text",
+        model=ROUTING_CONFIG.router_embed_model,
         dim=2,
         created_at_unix=0.0,
         tool_rows=1,

@@ -56,6 +56,24 @@ class TestHeuristicClassifier:
         assert not d.use_cloud
         assert d.tool == "music"
 
+    def test_external_data_intent_timer(self):
+        d = r.classify_intent("Set a timer for 10 minutes")
+        assert d.intent == "external-data-needed"
+        assert not d.use_cloud
+        assert d.tool == "timer"
+
+    def test_external_data_intent_calculator(self):
+        d = r.classify_intent("What is 15% of 87.50?")
+        assert d.intent == "external-data-needed"
+        assert not d.use_cloud
+        assert d.tool == "calculator"
+
+    def test_external_data_intent_datetime(self):
+        d = r.classify_intent("What time is it in Tokyo?")
+        assert d.intent == "external-data-needed"
+        assert not d.use_cloud
+        assert d.tool == "datetime"
+
     def test_memory_intent(self):
         d = r.classify_intent("What is my name? You mentioned it earlier.")
         assert d.intent == "memory-needed"

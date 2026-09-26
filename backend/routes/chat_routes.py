@@ -146,7 +146,7 @@ def create_chat_router(services) -> APIRouter:
                         )
                         if meta.get("reasoning_summary"):
                             log.debug("chat.planner_reasoning | session_id=%s reasoning=%s", session_id, meta["reasoning_summary"])
-                        yield f"data: {json.dumps({'model': active_model, 'intent': intent_for_log, 'confidence': confidence_for_log, 'route_type': route_for_log, 'planner_status': meta.get('planner_status', ''), 'reasoning_summary': meta.get('reasoning_summary', '')})}\n\n"
+                        yield f"data: {json.dumps({'model': active_model, 'intent': intent_for_log, 'confidence': confidence_for_log, 'route_type': route_for_log, 'planner_status': meta.get('planner_status', ''), 'reasoning_summary': meta.get('reasoning_summary', ''), 'tool': meta.get('tool')})}\n\n"
                     elif "text" in event:
                         chunk = event["text"]
                         if first_token_time is None:
@@ -155,6 +155,8 @@ def create_chat_router(services) -> APIRouter:
                         yield f"data: {json.dumps({'text': chunk})}\n\n"
                     elif "thinking" in event:
                         yield f"data: {json.dumps({'thinking': event['thinking']})}\n\n"
+                    elif "tool" in event:
+                        yield f"data: {json.dumps({'tool': event['tool']})}\n\n"
                     elif "notice" in event:
                         fallback_used = True
                         yield f"data: {json.dumps({'notice': event['notice']})}\n\n"

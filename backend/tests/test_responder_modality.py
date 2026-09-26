@@ -38,9 +38,10 @@ os.environ["CHROMA_PATH"] = os.path.join(_tmp_dir, "chroma")
 os.environ["AUTH_DB_PATH"] = os.path.join(_tmp_dir, "auth.db")
 
 import graph as assistant_graph  # noqa: E402
+from intents import CHAT_MODEL, CLOUD_MODEL  # noqa: E402
 
-TEST_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL", "gemma3:4b")
-TEST_CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
+TEST_CHAT_MODEL = CHAT_MODEL
+TEST_CLOUD_MODEL = CLOUD_MODEL
 
 # A verbose response with concrete factual content that compression must preserve.
 _DETAILED_RESPONSE = (

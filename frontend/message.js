@@ -460,18 +460,52 @@
     scrollToBottom();
   }
 
-  function appendModelBadge(wrapper, modelName, intent, fallback) {
+  function appendModelBadge(wrapper, modelName, intent, fallback, tool) {
+    if (!modelName) return;
     const isCloud = modelName.toLowerCase().includes('claude');
     wrapper.querySelector('.model-badge')?.remove();
 
     const badge = document.createElement('span');
     badge.className = 'model-badge ' + (isCloud ? 'cloud' : 'local');
 
-    const intentLabel = intent ? ` · ${intent}` : '';
-    const fallbackLabel = fallback ? ' · fallback' : '';
+    const rawTool = (tool || '').trim().toLowerCase();
+    const rawIntent = (intent || '').trim().toLowerCase();
 
-    badge.textContent = modelName + intentLabel + fallbackLabel;
-    badge.title = `Model: ${modelName}\nIntent: ${intent || 'unknown'}\nRoute: ${isCloud ? 'cloud' : 'local'}${fallback ? ' (fallback)' : ''}`;
+    // Determine clean human-friendly capability/tool label
+    let cleanLabel = '';
+    if (rawTool && rawTool !== 'none') {
+      cleanLabel = rawTool;
+    } else if (rawIntent === 'music' || rawIntent === 'weather' || rawIntent === 'code') {
+      cleanLabel = rawIntent;
+    } else if (rawIntent === 'code-question') {
+      cleanLabel = 'code';
+    } else if (rawIntent === 'memory-needed' || rawIntent === 'memory-augmented') {
+      cleanLabel = 'memory';
+    } else if (rawIntent === 'vision') {
+      cleanLabel = 'vision';
+    }
+
+    let text = modelName;
+    if (modelName.toLowerCase() === 'music') {
+      text = 'music';
+    } else if (cleanLabel && cleanLabel !== modelName.toLowerCase()) {
+      text += ` · ${cleanLabel}`;
+    }
+
+    if (fallback) {
+      text += ' · fallback';
+    }
+
+    badge.textContent = text;
+
+    const tooltipLines = [
+      `Model: ${modelName}`,
+      tool ? `Tool: ${tool}` : null,
+      intent ? `Intent: ${intent}` : null,
+      `Route: ${isCloud ? 'cloud' : 'local'}${fallback ? ' (fallback)' : ''}`,
+    ].filter(Boolean);
+    badge.title = tooltipLines.join('\n');
+
     wrapper.appendChild(badge);
   }
 
@@ -1302,6 +1336,10 @@
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
+      let currentModel = '';
+      let currentIntent = '';
+      let currentFallback = false;
+      let currentTool = '';
 
       while (true) {
         const { done, value } = await reader.read();
@@ -1325,7 +1363,18 @@
           }
 
           if (parsed.model) {
-            appendModelBadge(wrapper, parsed.model, parsed.intent, parsed.fallback);
+            currentModel = parsed.model;
+            if (parsed.intent !== undefined) currentIntent = parsed.intent;
+            if (parsed.fallback !== undefined) currentFallback = Boolean(parsed.fallback);
+            if (parsed.tool !== undefined) currentTool = parsed.tool || '';
+            appendModelBadge(wrapper, currentModel, currentIntent, currentFallback, currentTool);
+          }
+
+          if (parsed.tool) {
+            currentTool = parsed.tool;
+            if (currentModel) {
+              appendModelBadge(wrapper, currentModel, currentIntent, currentFallback, currentTool);
+            }
           }
 
           if (parsed.route_type) {

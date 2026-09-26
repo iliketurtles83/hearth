@@ -32,7 +32,7 @@ LOCAL_MODEL = CHAT_MODEL
 CLOUD_MODEL = os.getenv("MODEL_CLOUD", "claude-sonnet-4-20250514")
 
 ROUTE_CONFIDENCE_THRESHOLD = ROUTING_CONFIG.route_confidence_threshold
-_VALID_TOOL_NAMES = frozenset(["weather", "music"])
+_VALID_TOOL_NAMES = frozenset(["weather", "music", "timer", "calculator", "datetime"])
 
 
 @dataclass
@@ -113,6 +113,61 @@ _MUSIC_KEYWORDS = [
     "artist radio", "put on", "shuffle",
 ]
 
+_TIMER_PATTERNS = [
+    r"\b(set|start|create)\b.{0,30}\b(timer|reminder|alarm)\b",
+    r"\bremind\s+me\b",
+    r"\b(timer|reminder)\b.{0,30}\b(for|in|after)\b",
+    r"\b(cancel|stop|delete|remove)\b.{0,20}\b(timer|reminder|alarm)\b",
+    r"\bwhat\b.{0,20}\b(timer|reminder|alarm)s?\b",
+    r"\bhow\s+much\s+time\b.{0,20}\b(left|remaining)\b",
+    r"\b(list|show)\b.{0,20}\b(timer|reminder|alarm)s?\b",
+    r"\bin\s+\d+\s+minute",
+]
+
+_TIMER_KEYWORDS = [
+    "set a timer", "set timer", "start timer", "start a timer",
+    "remind me", "reminder", "set a reminder", "set reminder",
+    "cancel timer", "cancel reminder", "my timers", "my reminders",
+    "how much time left", "time remaining",
+]
+
+_CALCULATOR_PATTERNS = [
+    r"\b\d+\s*[\+\-\*\/\^]\s*\d+\b",
+    r"\b\d+%\s*(of|tip|off)\b",
+    r"\bwhat('?s| is)\s+\d+",
+    r"\bhow\s+much\s+is\s+\d+",
+    r"\b(calculate|compute|solve|evaluate)\b",
+    r"\b(convert|converting)\s+\d+\s*\w+\s+(to|in)\s+\w+",
+    r"\b\d+\s+(miles?|km|feet|meters?|pounds?|kg|celsius|fahrenheit|gallons?|liters?|ounces?|grams?|inches?|cm|yards?|cups?|ml|mph|kph|bytes?|kb|mb|gb|tb)\s+(to|in)\s+",
+    r"\bsqrt\s*\(",
+    r"\b\d+\s*\*\*\s*\d+\b",
+]
+
+_CALCULATOR_KEYWORDS = [
+    "calculate", "compute", "evaluate",
+    "percent of", "% of", "tip on", "convert",
+    "miles to", "km to", "feet to", "meters to", "pounds to", "kg to",
+    "celsius to", "fahrenheit to", "gallons to", "liters to",
+]
+
+_DATETIME_PATTERNS = [
+    r"\bwhat\s+time\s+is\s+it\b",
+    r"\b(current|local)\s+time\b",
+    r"\btime\s+in\b",
+    r"\bwhat\s+day\s+(is|of\s+the\s+week)\b",
+    r"\bhow\s+many\s+days\s+until\b",
+    r"\bdays\s+(until|to|till|before)\b",
+    r"\btoday'?s?\s+date\b",
+    r"\bwhat\s+date\b",
+]
+
+_DATETIME_KEYWORDS = [
+    "what time is it", "current time", "time in", "local time",
+    "what day is", "day of the week", "what day of",
+    "days until", "how many days", "today's date", "what date",
+    "what is the date",
+]
+
 
 def _looks_like_weather_request(text: str) -> bool:
     return any(re.search(p, text, re.IGNORECASE) for p in _WEATHER_PATTERNS)
@@ -148,6 +203,26 @@ def _looks_like_music_request(text: str) -> bool:
     return any(re.search(pat, text, re.IGNORECASE) for pat in _MUSIC_PATTERNS)
 
 
+def _looks_like_timer_request(text: str) -> bool:
+    p = text.lower()
+    if any(kw in p for kw in _TIMER_KEYWORDS):
+        return True
+    return any(re.search(pat, text, re.IGNORECASE) for pat in _TIMER_PATTERNS)
+
+
+def _looks_like_calculator_request(text: str) -> bool:
+    p = text.lower()
+    score = _score_patterns(p, _CALCULATOR_PATTERNS) + _score_keywords(p, _CALCULATOR_KEYWORDS)
+    return score >= 0.25
+
+
+def _looks_like_datetime_request(text: str) -> bool:
+    p = text.lower()
+    if any(kw in p for kw in _DATETIME_KEYWORDS):
+        return True
+    return any(re.search(pat, text, re.IGNORECASE) for pat in _DATETIME_PATTERNS)
+
+
 def _normalize_external_tool(intent: str, prompt: str, tool_name: str | None) -> str | None:
     if intent != "external-data-needed":
         return None
@@ -164,6 +239,15 @@ def _normalize_external_tool(intent: str, prompt: str, tool_name: str | None) ->
 
     if _looks_like_music_request(prompt):
         return "music"
+
+    if _looks_like_timer_request(prompt):
+        return "timer"
+
+    if _looks_like_calculator_request(prompt):
+        return "calculator"
+
+    if _looks_like_datetime_request(prompt):
+        return "datetime"
 
     return None
 
@@ -283,6 +367,12 @@ def classify_intent(prompt: str) -> RouteDecision:
     if _looks_like_weather_request(p):
         scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.30)
     if _looks_like_music_request(p):
+        scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.55)
+    if _looks_like_timer_request(p):
+        scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.55)
+    if _looks_like_calculator_request(p):
+        scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.55)
+    if _looks_like_datetime_request(p):
         scores["external-data-needed"] = min(1.0, scores["external-data-needed"] + 0.55)
 
     scores["memory-needed"] += _score_patterns(p, _MEMORY_PATTERNS)
