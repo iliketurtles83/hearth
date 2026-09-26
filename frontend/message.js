@@ -844,20 +844,14 @@
         } else {
           _stopProgressTicker();
           if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-            const webPlayer = document.getElementById('hearth-web-player');
-            if (webPlayer && !webPlayer.paused) {
-              webPlayer.pause();
-            }
+            _pauseWebPlayer();
           }
           _updateMediaSession(data.track, false);
         }
       } else {
         _stopProgressTicker();
         if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-          const webPlayer = document.getElementById('hearth-web-player');
-          if (webPlayer && !webPlayer.paused) {
-            webPlayer.pause();
-          }
+          _pauseWebPlayer();
         }
         _updateMediaSession(null, false);
         titleEl.textContent = 'Nothing playing';
@@ -919,11 +913,34 @@
   }
 
   let _currentOutputTarget = localStorage.getItem('hearth:music_output') || 'host';
+  let _isAppPausing = false;
+
+  function _pauseWebPlayer() {
+    const webPlayer = document.getElementById('hearth-web-player');
+    if (webPlayer) {
+      _isAppPausing = true;
+      webPlayer.pause();
+      webPlayer.removeAttribute('src');
+      webPlayer.load();
+      setTimeout(() => {
+        _isAppPausing = false;
+      }, 350);
+    }
+  }
+
+  function _applySavedSinkId(player) {
+    if (!player || typeof player.setSinkId !== 'function') return;
+    const savedSink = localStorage.getItem('hearth:audio_sink_id');
+    if (savedSink && player.sinkId !== savedSink) {
+      player.setSinkId(savedSink).catch(() => {});
+    }
+  }
 
   function _ensureWebPlayerPlaying(forceReconnect = false) {
     if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return;
     const webPlayer = document.getElementById('hearth-web-player');
     if (!webPlayer) return;
+    _applySavedSinkId(webPlayer);
     if (forceReconnect || !webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
       webPlayer.src = '/music/stream?t=' + Date.now();
       webPlayer.load();
@@ -939,6 +956,13 @@
           title: track.title || 'Unknown Title',
           artist: track.artist || 'Unknown Artist',
           album: track.album || '',
+          artwork: [
+            {
+              src: 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512"><rect width="512" height="512" rx="96" fill="%2324283b"/><path d="M384 136v184a56 56 0 1 1-56-56c7.7 0 15 1.6 21.7 4.4V188L224 216v136a56 56 0 1 1-56-56c7.7 0 15 1.6 21.7 4.4V172l176-36h18.3z" fill="%237aa2f7"/></svg>',
+              sizes: '512x512',
+              type: 'image/svg+xml',
+            },
+          ],
         });
       }
       navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
@@ -956,12 +980,12 @@
       if (outputIcon) outputIcon.textContent = '📱';
       if (outputLabel) outputLabel.textContent = 'Device';
       outputBtn.classList.add('active-phone');
-      outputBtn.title = 'Audio output: This device (phone/browser)';
+      outputBtn.title = 'Audio output: This device (phone, Bluetooth, or headphones)';
     } else if (target === 'both') {
       if (outputIcon) outputIcon.textContent = '🌐';
       if (outputLabel) outputLabel.textContent = 'Both';
       outputBtn.classList.add('active-phone');
-      outputBtn.title = 'Audio output: Host + This device';
+      outputBtn.title = 'Audio output: Host + This device (Bluetooth)';
     } else {
       if (outputIcon) outputIcon.textContent = '🖥️';
       if (outputLabel) outputLabel.textContent = 'Host';
@@ -975,12 +999,8 @@
     localStorage.setItem('hearth:music_output', target);
     _updateOutputButtonUI(target);
 
-    const webPlayer = document.getElementById('hearth-web-player');
-
-    if (webPlayer && target === 'host') {
-      webPlayer.pause();
-      webPlayer.removeAttribute('src');
-      webPlayer.load();
+    if (target === 'host') {
+      _pauseWebPlayer();
     }
 
     try {
@@ -1054,6 +1074,21 @@
           }, 1500);
         }
       });
+      // Handle external pauses (e.g. Bluetooth disconnect, headphones unplugged, phone call)
+      webPlayer.addEventListener('pause', () => {
+        if (!_isAppPausing && _playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
+          musicControl('pause');
+        }
+      });
+    }
+
+    if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === 'function') {
+      navigator.mediaDevices.addEventListener('devicechange', () => {
+        const webPlayer = document.getElementById('hearth-web-player');
+        if (webPlayer && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
+          _applySavedSinkId(webPlayer);
+        }
+      });
     }
 
     function _positionMenu() {
@@ -1124,10 +1159,10 @@
       if (!outputOptions) return;
       const options = [
         { id: 'host', label: '🖥️ Host Speakers', desc: 'Computer speakers' },
-        { id: 'phone', label: '📱 This Device', desc: 'Play on this phone/browser' },
-        { id: 'both', label: '🌐 Everywhere', desc: 'Host + this device' },
+        { id: 'phone', label: '📱 This Device / Bluetooth', desc: 'Phone, headphones, or Bluetooth' },
+        { id: 'both', label: '🌐 Everywhere', desc: 'Host + this device / Bluetooth' },
       ];
-      outputOptions.innerHTML = options.map((opt) => {
+      let html = options.map((opt) => {
         const isSelected = _currentOutputTarget === opt.id;
         const check = isSelected ? '<span style="color:var(--accent);font-weight:bold;margin-left:0.5rem;">✓</span>' : '';
         return (
@@ -1141,7 +1176,21 @@
         );
       }).join('');
 
-      outputOptions.querySelectorAll('.music-output-option').forEach((btn) => {
+      if (navigator.mediaDevices && typeof navigator.mediaDevices.selectAudioOutput === 'function') {
+        html += (
+          `<div style="border-top:1px solid var(--border);margin:0.25rem 0;"></div>` +
+          `<button type="button" class="music-output-option" id="music-select-device-btn">` +
+          `<div style="display:flex;flex-direction:column;gap:0.1rem;text-align:left;">` +
+          `<span style="font-weight:500;">🎧 Choose Audio Device...</span>` +
+          `<span style="font-size:0.7rem;color:var(--text-muted);">Select Bluetooth or output sink</span>` +
+          `</div>` +
+          `</button>`
+        );
+      }
+
+      outputOptions.innerHTML = html;
+
+      outputOptions.querySelectorAll('.music-output-option[data-target]').forEach((btn) => {
         btn.addEventListener('click', async (e) => {
           e.stopPropagation();
           const target = btn.dataset.target;
@@ -1150,6 +1199,30 @@
           await _switchOutputTarget(target);
         });
       });
+
+      const selectDeviceBtn = document.getElementById('music-select-device-btn');
+      if (selectDeviceBtn) {
+        selectDeviceBtn.addEventListener('click', async (e) => {
+          e.stopPropagation();
+          outputMenu.classList.add('hidden');
+          outputBtn.setAttribute('aria-expanded', 'false');
+          try {
+            const device = await navigator.mediaDevices.selectAudioOutput();
+            const webPlayer = document.getElementById('hearth-web-player');
+            if (device && webPlayer && typeof webPlayer.setSinkId === 'function') {
+              await webPlayer.setSinkId(device.deviceId);
+              localStorage.setItem('hearth:audio_sink_id', device.deviceId);
+            }
+            if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') {
+              await _switchOutputTarget('phone');
+            } else {
+              _ensureWebPlayerPlaying(true);
+            }
+          } catch {
+            // User cancelled prompt or permission denied
+          }
+        });
+      }
     }
 
     if ('mediaSession' in navigator) {
@@ -1170,12 +1243,7 @@
 
   async function musicControl(action, extra = {}) {
     if (action === 'pause' || action === 'stop') {
-      const webPlayer = document.getElementById('hearth-web-player');
-      if (webPlayer) {
-        webPlayer.pause();
-        webPlayer.removeAttribute('src');
-        webPlayer.load();
-      }
+      _pauseWebPlayer();
     } else if (action === 'resume') {
       _ensureWebPlayerPlaying(true);
     } else if (action === 'next' || action === 'previous' || action === 'play_pos') {
