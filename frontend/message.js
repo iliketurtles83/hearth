@@ -839,15 +839,7 @@
           if (autoExpand || previousState !== 'play') {
             expandMusicPanel();
           }
-          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-            const webPlayer = document.getElementById('hearth-web-player');
-            if (webPlayer && webPlayer.paused) {
-              if (!webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
-                webPlayer.src = '/music/stream?t=' + Date.now();
-              }
-              webPlayer.play().catch(() => {});
-            }
-          }
+          _ensureWebPlayerPlaying();
           _updateMediaSession(data.track, true);
         } else {
           _stopProgressTicker();
@@ -916,7 +908,10 @@
                `</div>`;
       }).join('');
       list.querySelectorAll('.list-item-clickable').forEach(el => {
-        el.addEventListener('click', () => musicControl('play_pos', { pos: parseInt(el.dataset.pos, 10) }));
+        el.addEventListener('click', () => {
+          _ensureWebPlayerPlaying();
+          musicControl('play_pos', { pos: parseInt(el.dataset.pos, 10) });
+        });
       });
     } catch {
       // non-fatal
@@ -924,6 +919,16 @@
   }
 
   let _currentOutputTarget = localStorage.getItem('hearth:music_output') || 'host';
+
+  function _ensureWebPlayerPlaying() {
+    if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return;
+    const webPlayer = document.getElementById('hearth-web-player');
+    if (!webPlayer) return;
+    if (!webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
+      webPlayer.src = '/music/stream?t=' + Date.now();
+    }
+    webPlayer.play().catch(() => {});
+  }
 
   function _updateMediaSession(track, isPlaying) {
     if (!('mediaSession' in navigator)) return;
@@ -971,11 +976,7 @@
 
     const webPlayer = document.getElementById('hearth-web-player');
 
-    // Prime/start web player immediately inside user gesture to avoid mobile autoplay blocking.
-    if (webPlayer && (target === 'phone' || target === 'both')) {
-      webPlayer.src = '/music/stream?t=' + Date.now();
-      webPlayer.play().catch(() => {});
-    } else if (webPlayer && target === 'host') {
+    if (webPlayer && target === 'host') {
       webPlayer.pause();
       webPlayer.removeAttribute('src');
       webPlayer.load();
@@ -1016,6 +1017,10 @@
     } catch {
       // non-fatal
     }
+
+    if (target === 'phone' || target === 'both') {
+      _ensureWebPlayerPlaying();
+    }
   }
 
   function _bindMusicOutputs() {
@@ -1029,6 +1034,17 @@
     }
 
     _updateOutputButtonUI(_currentOutputTarget);
+
+    const webPlayer = document.getElementById('hearth-web-player');
+    if (webPlayer) {
+      webPlayer.addEventListener('error', () => {
+        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+          setTimeout(() => {
+            _ensureWebPlayerPlaying();
+          }, 800);
+        }
+      });
+    }
 
     function _positionMenu() {
       const rect = outputBtn.getBoundingClientRect();
@@ -1178,6 +1194,9 @@
     if (pp) pp.addEventListener('click', async () => {
       // Toggle based on current label (▶ = resume, ⏸ = pause).
       const action = pp.textContent.trim() === '⏸' ? 'pause' : 'resume';
+      if (action === 'resume') {
+        _ensureWebPlayerPlaying();
+      }
       await musicControl(action);
     });
     if (prev) prev.addEventListener('click', () => musicControl('previous'));
