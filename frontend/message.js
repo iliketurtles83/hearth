@@ -1026,7 +1026,29 @@
     const outputOptions = document.getElementById('music-output-options');
     if (!outputBtn || !outputMenu) return;
 
+    if (outputMenu.parentElement !== document.body) {
+      document.body.appendChild(outputMenu);
+    }
+
     _updateOutputButtonUI(_currentOutputTarget);
+
+    function _positionMenu() {
+      const rect = outputBtn.getBoundingClientRect();
+      const menuWidth = 220;
+      const menuHeight = outputMenu.offsetHeight || 135;
+
+      let left = rect.left;
+      if (left + menuWidth > window.innerWidth - 8) {
+        left = Math.max(8, window.innerWidth - menuWidth - 8);
+      }
+      outputMenu.style.left = `${Math.round(left)}px`;
+
+      if (rect.top - menuHeight - 6 > 8) {
+        outputMenu.style.top = `${Math.round(rect.top - menuHeight - 6)}px`;
+      } else {
+        outputMenu.style.top = `${Math.round(rect.bottom + 6)}px`;
+      }
+    }
 
     outputBtn.addEventListener('click', (e) => {
       e.stopPropagation();
@@ -1034,6 +1056,7 @@
       if (isHidden) {
         _renderOutputOptions();
         outputMenu.classList.remove('hidden');
+        _positionMenu();
         outputBtn.setAttribute('aria-expanded', 'true');
       } else {
         outputMenu.classList.add('hidden');
@@ -1048,25 +1071,36 @@
       }
     });
 
+    window.addEventListener('resize', () => {
+      if (!outputMenu.classList.contains('hidden')) {
+        _positionMenu();
+      }
+    });
+
     function _renderOutputOptions() {
       if (!outputOptions) return;
       const options = [
-        { id: 'host', label: '🖥️ Host Speakers' },
-        { id: 'phone', label: '📱 This Device (Phone/Browser)' },
-        { id: 'both', label: '🌐 Everywhere (Both)' },
+        { id: 'host', label: '🖥️ Host Speakers', desc: 'Computer speakers' },
+        { id: 'phone', label: '📱 This Device', desc: 'Play on this phone/browser' },
+        { id: 'both', label: '🌐 Everywhere', desc: 'Host + this device' },
       ];
       outputOptions.innerHTML = options.map((opt) => {
         const isSelected = _currentOutputTarget === opt.id;
-        const check = isSelected ? '<span style="color:var(--accent)">✓</span>' : '';
+        const check = isSelected ? '<span style="color:var(--accent);font-weight:bold;margin-left:0.5rem;">✓</span>' : '';
         return (
           `<button type="button" class="music-output-option${isSelected ? ' selected' : ''}" data-target="${opt.id}">` +
-          `<span>${opt.label}</span>${check}` +
+          `<div style="display:flex;flex-direction:column;gap:0.1rem;text-align:left;">` +
+          `<span style="font-weight:500;">${opt.label}</span>` +
+          `<span style="font-size:0.7rem;color:var(--text-muted);">${opt.desc}</span>` +
+          `</div>` +
+          `${check}` +
           `</button>`
         );
       }).join('');
 
       outputOptions.querySelectorAll('.music-output-option').forEach((btn) => {
-        btn.addEventListener('click', async () => {
+        btn.addEventListener('click', async (e) => {
+          e.stopPropagation();
           const target = btn.dataset.target;
           outputMenu.classList.add('hidden');
           outputBtn.setAttribute('aria-expanded', 'false');
