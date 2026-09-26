@@ -327,7 +327,8 @@
     if (!isMobileLayout()) return;
     if (!document.body.classList.contains('sidebar-open')) return;
     const target = e.target;
-    if (sidebar?.contains(target) || sidebarToggleBtn?.contains(target)) return;
+    const outputMenu = document.getElementById('music-output-menu');
+    if (sidebar?.contains(target) || sidebarToggleBtn?.contains(target) || outputMenu?.contains(target)) return;
     closeSidebar();
   });
 
@@ -970,6 +971,16 @@
 
     const webPlayer = document.getElementById('hearth-web-player');
 
+    // Prime/start web player immediately inside user gesture to avoid mobile autoplay blocking.
+    if (webPlayer && (target === 'phone' || target === 'both')) {
+      webPlayer.src = '/music/stream?t=' + Date.now();
+      webPlayer.play().catch(() => {});
+    } else if (webPlayer && target === 'host') {
+      webPlayer.pause();
+      webPlayer.removeAttribute('src');
+      webPlayer.load();
+    }
+
     try {
       if (target === 'phone') {
         // Output 1 = Web Stream (exclusive)
@@ -979,10 +990,6 @@
           credentials: 'same-origin',
           body: JSON.stringify({ output_id: '1', mode: 'exclusive' }),
         });
-        if (webPlayer) {
-          webPlayer.src = '/music/stream?t=' + Date.now();
-          webPlayer.play().catch(() => {});
-        }
       } else if (target === 'both') {
         // Output 0 = Host, Output 1 = Web Stream (mirror)
         await (window.apiFetch || fetch)('/music/outputs/select', {
@@ -997,17 +1004,8 @@
           credentials: 'same-origin',
           body: JSON.stringify({ output_id: '1', mode: 'enable' }),
         });
-        if (webPlayer) {
-          webPlayer.src = '/music/stream?t=' + Date.now();
-          webPlayer.play().catch(() => {});
-        }
       } else {
         // Output 0 = Host (exclusive)
-        if (webPlayer) {
-          webPlayer.pause();
-          webPlayer.removeAttribute('src');
-          webPlayer.load();
-        }
         await (window.apiFetch || fetch)('/music/outputs/select', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1034,20 +1032,26 @@
 
     function _positionMenu() {
       const rect = outputBtn.getBoundingClientRect();
-      const menuWidth = 220;
-      const menuHeight = outputMenu.offsetHeight || 135;
+      const margin = 8;
+      const menuWidth = Math.min(230, window.innerWidth - margin * 2);
+      outputMenu.style.width = `${menuWidth}px`;
 
       let left = rect.left;
-      if (left + menuWidth > window.innerWidth - 8) {
-        left = Math.max(8, window.innerWidth - menuWidth - 8);
+      if (left + menuWidth > window.innerWidth - margin) {
+        left = Math.max(margin, window.innerWidth - menuWidth - margin);
       }
       outputMenu.style.left = `${Math.round(left)}px`;
 
-      if (rect.top - menuHeight - 6 > 8) {
-        outputMenu.style.top = `${Math.round(rect.top - menuHeight - 6)}px`;
+      const menuHeight = outputMenu.offsetHeight || 135;
+      let top;
+      if (rect.top - menuHeight - margin >= margin) {
+        top = rect.top - menuHeight - margin;
+      } else if (rect.bottom + margin + menuHeight <= window.innerHeight - margin) {
+        top = rect.bottom + margin;
       } else {
-        outputMenu.style.top = `${Math.round(rect.bottom + 6)}px`;
+        top = Math.max(margin, Math.min(window.innerHeight - menuHeight - margin, rect.top - menuHeight - margin));
       }
+      outputMenu.style.top = `${Math.round(top)}px`;
     }
 
     outputBtn.addEventListener('click', (e) => {
@@ -1065,7 +1069,14 @@
     });
 
     document.addEventListener('click', (e) => {
-      if (!outputMenu.contains(e.target) && e.target !== outputBtn) {
+      if (outputMenu.classList.contains('hidden')) return;
+      if (outputMenu.contains(e.target) || outputBtn.contains(e.target)) return;
+      outputMenu.classList.add('hidden');
+      outputBtn.setAttribute('aria-expanded', 'false');
+    });
+
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !outputMenu.classList.contains('hidden')) {
         outputMenu.classList.add('hidden');
         outputBtn.setAttribute('aria-expanded', 'false');
       }
@@ -1076,6 +1087,12 @@
         _positionMenu();
       }
     });
+
+    window.addEventListener('scroll', () => {
+      if (!outputMenu.classList.contains('hidden')) {
+        _positionMenu();
+      }
+    }, true);
 
     function _renderOutputOptions() {
       if (!outputOptions) return;

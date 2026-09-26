@@ -1223,8 +1223,14 @@ if os.path.isdir(_frontend_dir):
     # Serve the SPA entrypoint for root and unknown paths (client-side routing).
     @app.get("/", include_in_schema=False)
     async def _index():
-        return FileResponse(os.path.join(_frontend_dir, "index.html"))
+        return FileResponse(
+            os.path.join(_frontend_dir, "index.html"),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )
 
     @app.get("/{full_path:path}", include_in_schema=False)
     async def _spa_catchall(full_path: str):
-        return FileResponse(os.path.join(_frontend_dir, "index.html"))
+        return FileResponse(
+            os.path.join(_frontend_dir, "index.html"),
+            headers={"Cache-Control": "no-cache, must-revalidate"},
+        )

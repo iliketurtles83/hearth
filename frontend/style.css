@@ -577,15 +577,24 @@ body {
   border-radius: 4px;
   cursor: pointer;
   font-size: 0.72rem;
-  padding: 0.2rem 0.4rem;
+  padding: 0.25rem 0.45rem;
+  min-height: 28px;
   line-height: 1;
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
   transition: all var(--transition);
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
-.music-output-btn:hover {
+.music-output-btn * {
+  pointer-events: none;
+}
+
+.music-output-btn:hover,
+.music-output-btn:active {
   color: var(--text);
   border-color: var(--border-focus);
 }
@@ -602,8 +611,10 @@ body {
 
 .music-output-menu {
   position: fixed;
-  z-index: 1200;
+  z-index: 2000;
   min-width: 220px;
+  max-height: calc(100dvh - 16px);
+  overflow-y: auto;
   background: var(--surface-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius);
@@ -613,7 +624,6 @@ body {
   flex-direction: column;
   gap: 0.2rem;
 }
-
 
 .music-output-menu-header {
   font-size: 0.68rem;
@@ -637,11 +647,18 @@ body {
   font-size: 0.78rem;
   font-family: var(--font-ui);
   text-align: left;
-  padding: 0.4rem 0.55rem;
+  padding: 0.45rem 0.55rem;
+  min-height: 38px;
   cursor: pointer;
+  touch-action: manipulation;
 }
 
-.music-output-option:hover {
+.music-output-option * {
+  pointer-events: none;
+}
+
+.music-output-option:hover,
+.music-output-option:active {
   background: var(--menu-hover);
 }
 
