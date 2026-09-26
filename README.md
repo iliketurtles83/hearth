@@ -284,10 +284,11 @@ Listen to your personal music collection through MPD and Beets:
   - *"Shuffle my playlist"*
   - *"Set volume to 60"*
   - *"What's playing?"*
-- **Beets Integration**: Queries your existing Beets database for artist, album, and genre queries.
-- **Library Updates**: Update your library from the web UI settings menu or via `POST /music/beets/update`.
+- **Library Updates**: Update your library from the web UI settings menu ("Update music library"), via `POST /music/beets/update`, or manually from the terminal:
+  ```bash
+  docker compose exec backend sh -c 'cd /beets && beet update /music && beet import -A /music'
+  ```
 
-### Code Understanding
 
 - **Question Mode**: Hearth routes explanation requests (*"how does this algorithm work?"*, *"explain this error"*) through a code-optimized prompt.
 - **Safe Guardrails**: Code execution and filesystem writes are strictly disallowed; requests are kept as safe, conversational programming explanations.
