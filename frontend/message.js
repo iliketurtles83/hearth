@@ -920,12 +920,13 @@
 
   let _currentOutputTarget = localStorage.getItem('hearth:music_output') || 'host';
 
-  function _ensureWebPlayerPlaying() {
+  function _ensureWebPlayerPlaying(forceReconnect = false) {
     if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return;
     const webPlayer = document.getElementById('hearth-web-player');
     if (!webPlayer) return;
-    if (!webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
+    if (forceReconnect || !webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
       webPlayer.src = '/music/stream?t=' + Date.now();
+      webPlayer.load();
     }
     webPlayer.play().catch(() => {});
   }
@@ -1038,10 +1039,19 @@
     const webPlayer = document.getElementById('hearth-web-player');
     if (webPlayer) {
       webPlayer.addEventListener('error', () => {
-        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+        if (_playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
           setTimeout(() => {
-            _ensureWebPlayerPlaying();
+            _ensureWebPlayerPlaying(true);
           }, 800);
+        }
+      });
+      webPlayer.addEventListener('stalled', () => {
+        if (_playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
+          setTimeout(() => {
+            if (webPlayer.paused) {
+              _ensureWebPlayerPlaying(true);
+            }
+          }, 1500);
         }
       });
     }
@@ -1144,7 +1154,10 @@
 
     if ('mediaSession' in navigator) {
       try {
-        navigator.mediaSession.setActionHandler('play', () => musicControl('resume'));
+        navigator.mediaSession.setActionHandler('play', () => {
+          _ensureWebPlayerPlaying(true);
+          musicControl('resume');
+        });
         navigator.mediaSession.setActionHandler('pause', () => musicControl('pause'));
         navigator.mediaSession.setActionHandler('previoustrack', () => musicControl('previous'));
         navigator.mediaSession.setActionHandler('nexttrack', () => musicControl('next'));
@@ -1158,8 +1171,18 @@
   async function musicControl(action, extra = {}) {
     if (action === 'pause' || action === 'stop') {
       const webPlayer = document.getElementById('hearth-web-player');
-      if (webPlayer && !webPlayer.paused) {
+      if (webPlayer) {
         webPlayer.pause();
+        webPlayer.removeAttribute('src');
+        webPlayer.load();
+      }
+    } else if (action === 'resume') {
+      _ensureWebPlayerPlaying(true);
+    } else if (action === 'next' || action === 'previous' || action === 'play_pos') {
+      if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+        setTimeout(() => {
+          _ensureWebPlayerPlaying(true);
+        }, 150);
       }
     }
     try {
@@ -1195,7 +1218,7 @@
       // Toggle based on current label (▶ = resume, ⏸ = pause).
       const action = pp.textContent.trim() === '⏸' ? 'pause' : 'resume';
       if (action === 'resume') {
-        _ensureWebPlayerPlaying();
+        _ensureWebPlayerPlaying(true);
       }
       await musicControl(action);
     });
@@ -1218,9 +1241,17 @@
     if (volume) {
       volume.addEventListener('input', () => {
         if (volumeValue) volumeValue.textContent = `${volume.value}%`;
+        const webPlayer = document.getElementById('hearth-web-player');
+        if (webPlayer && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
+          webPlayer.volume = Math.max(0, Math.min(1, (parseInt(volume.value, 10) || 0) / 100));
+        }
       });
       volume.addEventListener('change', () => {
         const value = Math.max(0, Math.min(100, parseInt(volume.value, 10) || 0));
+        const webPlayer = document.getElementById('hearth-web-player');
+        if (webPlayer && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
+          webPlayer.volume = value / 100;
+        }
         musicControl('set_volume', { volume: value });
       });
     }
