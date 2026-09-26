@@ -563,10 +563,88 @@ body {
 
 #music-volume-row {
   display: grid;
-  grid-template-columns: auto 1fr auto;
+  grid-template-columns: auto auto 1fr auto;
   align-items: center;
   gap: 0.45rem;
   padding-top: 0.1rem;
+  position: relative;
+}
+
+.music-output-btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.72rem;
+  padding: 0.2rem 0.4rem;
+  line-height: 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  transition: all var(--transition);
+}
+
+.music-output-btn:hover {
+  color: var(--text);
+  border-color: var(--border-focus);
+}
+
+.music-output-btn.active-phone {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-subtle, rgba(230, 110, 80, 0.1));
+}
+
+.music-output-menu {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 1100;
+  min-width: 190px;
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.4);
+  padding: 0.35rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+}
+
+.music-output-menu-header {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 0.25rem 0.45rem 0.15rem;
+}
+
+.music-output-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  font-family: var(--font-ui);
+  text-align: left;
+  padding: 0.4rem 0.55rem;
+  cursor: pointer;
+}
+
+.music-output-option:hover {
+  background: var(--menu-hover);
+}
+
+.music-output-option.selected {
+  color: var(--accent);
+  font-weight: 500;
 }
 
 .volume-mute-btn {

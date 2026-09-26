@@ -9,11 +9,19 @@
 :443 {
 	tls /certs/cert.pem /certs/key.pem
 
-	reverse_proxy backend:8000 {
-		# Pass standard proxy headers so the backend can log the real client IP.
-		header_up X-Real-IP {remote_host}
-		header_up X-Forwarded-For {remote_host}
-		header_up X-Forwarded-Proto https
+	handle /music/stream* {
+		reverse_proxy mpd:8800 {
+			flush_interval -1
+		}
+	}
+
+	handle {
+		reverse_proxy backend:8000 {
+			# Pass standard proxy headers so the backend can log the real client IP.
+			header_up X-Real-IP {remote_host}
+			header_up X-Forwarded-For {remote_host}
+			header_up X-Forwarded-Proto https
+		}
 	}
 }
 

@@ -838,11 +838,35 @@
           if (autoExpand || previousState !== 'play') {
             expandMusicPanel();
           }
+          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+            const webPlayer = document.getElementById('hearth-web-player');
+            if (webPlayer && webPlayer.paused) {
+              if (!webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
+                webPlayer.src = '/music/stream?t=' + Date.now();
+              }
+              webPlayer.play().catch(() => {});
+            }
+          }
+          _updateMediaSession(data.track, true);
         } else {
           _stopProgressTicker();
+          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+            const webPlayer = document.getElementById('hearth-web-player');
+            if (webPlayer && !webPlayer.paused) {
+              webPlayer.pause();
+            }
+          }
+          _updateMediaSession(data.track, false);
         }
       } else {
         _stopProgressTicker();
+        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+          const webPlayer = document.getElementById('hearth-web-player');
+          if (webPlayer && !webPlayer.paused) {
+            webPlayer.pause();
+          }
+        }
+        _updateMediaSession(null, false);
         titleEl.textContent = 'Nothing playing';
         titleEl.classList.add('now-playing-idle');
         if (subtitleEl) subtitleEl.textContent = '';
@@ -898,7 +922,179 @@
     }
   }
 
+  let _currentOutputTarget = localStorage.getItem('hearth:music_output') || 'host';
+
+  function _updateMediaSession(track, isPlaying) {
+    if (!('mediaSession' in navigator)) return;
+    try {
+      if (track) {
+        navigator.mediaSession.metadata = new MediaMetadata({
+          title: track.title || 'Unknown Title',
+          artist: track.artist || 'Unknown Artist',
+          album: track.album || '',
+        });
+      }
+      navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+    } catch {
+      // non-fatal
+    }
+  }
+
+  function _updateOutputButtonUI(target) {
+    const outputIcon = document.getElementById('music-output-icon');
+    const outputLabel = document.getElementById('music-output-label');
+    const outputBtn = document.getElementById('music-output-btn');
+    if (!outputBtn) return;
+    if (target === 'phone') {
+      if (outputIcon) outputIcon.textContent = '📱';
+      if (outputLabel) outputLabel.textContent = 'Device';
+      outputBtn.classList.add('active-phone');
+      outputBtn.title = 'Audio output: This device (phone/browser)';
+    } else if (target === 'both') {
+      if (outputIcon) outputIcon.textContent = '🌐';
+      if (outputLabel) outputLabel.textContent = 'Both';
+      outputBtn.classList.add('active-phone');
+      outputBtn.title = 'Audio output: Host + This device';
+    } else {
+      if (outputIcon) outputIcon.textContent = '🖥️';
+      if (outputLabel) outputLabel.textContent = 'Host';
+      outputBtn.classList.remove('active-phone');
+      outputBtn.title = 'Audio output: Host speakers';
+    }
+  }
+
+  async function _switchOutputTarget(target) {
+    _currentOutputTarget = target;
+    localStorage.setItem('hearth:music_output', target);
+    _updateOutputButtonUI(target);
+
+    const webPlayer = document.getElementById('hearth-web-player');
+
+    try {
+      if (target === 'phone') {
+        // Output 1 = Web Stream (exclusive)
+        await (window.apiFetch || fetch)('/music/outputs/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ output_id: '1', mode: 'exclusive' }),
+        });
+        if (webPlayer) {
+          webPlayer.src = '/music/stream?t=' + Date.now();
+          webPlayer.play().catch(() => {});
+        }
+      } else if (target === 'both') {
+        // Output 0 = Host, Output 1 = Web Stream (mirror)
+        await (window.apiFetch || fetch)('/music/outputs/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ output_id: '0', mode: 'enable' }),
+        });
+        await (window.apiFetch || fetch)('/music/outputs/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ output_id: '1', mode: 'enable' }),
+        });
+        if (webPlayer) {
+          webPlayer.src = '/music/stream?t=' + Date.now();
+          webPlayer.play().catch(() => {});
+        }
+      } else {
+        // Output 0 = Host (exclusive)
+        if (webPlayer) {
+          webPlayer.pause();
+          webPlayer.removeAttribute('src');
+          webPlayer.load();
+        }
+        await (window.apiFetch || fetch)('/music/outputs/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ output_id: '0', mode: 'exclusive' }),
+        });
+      }
+    } catch {
+      // non-fatal
+    }
+  }
+
+  function _bindMusicOutputs() {
+    const outputBtn = document.getElementById('music-output-btn');
+    const outputMenu = document.getElementById('music-output-menu');
+    const outputOptions = document.getElementById('music-output-options');
+    if (!outputBtn || !outputMenu) return;
+
+    _updateOutputButtonUI(_currentOutputTarget);
+
+    outputBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const isHidden = outputMenu.classList.contains('hidden');
+      if (isHidden) {
+        _renderOutputOptions();
+        outputMenu.classList.remove('hidden');
+        outputBtn.setAttribute('aria-expanded', 'true');
+      } else {
+        outputMenu.classList.add('hidden');
+        outputBtn.setAttribute('aria-expanded', 'false');
+      }
+    });
+
+    document.addEventListener('click', (e) => {
+      if (!outputMenu.contains(e.target) && e.target !== outputBtn) {
+        outputMenu.classList.add('hidden');
+        outputBtn.setAttribute('aria-expanded', 'false');
+      }
+    });
+
+    function _renderOutputOptions() {
+      if (!outputOptions) return;
+      const options = [
+        { id: 'host', label: '🖥️ Host Speakers' },
+        { id: 'phone', label: '📱 This Device (Phone/Browser)' },
+        { id: 'both', label: '🌐 Everywhere (Both)' },
+      ];
+      outputOptions.innerHTML = options.map((opt) => {
+        const isSelected = _currentOutputTarget === opt.id;
+        const check = isSelected ? '<span style="color:var(--accent)">✓</span>' : '';
+        return (
+          `<button type="button" class="music-output-option${isSelected ? ' selected' : ''}" data-target="${opt.id}">` +
+          `<span>${opt.label}</span>${check}` +
+          `</button>`
+        );
+      }).join('');
+
+      outputOptions.querySelectorAll('.music-output-option').forEach((btn) => {
+        btn.addEventListener('click', async () => {
+          const target = btn.dataset.target;
+          outputMenu.classList.add('hidden');
+          outputBtn.setAttribute('aria-expanded', 'false');
+          await _switchOutputTarget(target);
+        });
+      });
+    }
+
+    if ('mediaSession' in navigator) {
+      try {
+        navigator.mediaSession.setActionHandler('play', () => musicControl('resume'));
+        navigator.mediaSession.setActionHandler('pause', () => musicControl('pause'));
+        navigator.mediaSession.setActionHandler('previoustrack', () => musicControl('previous'));
+        navigator.mediaSession.setActionHandler('nexttrack', () => musicControl('next'));
+        navigator.mediaSession.setActionHandler('stop', () => musicControl('stop'));
+      } catch {
+        // non-fatal
+      }
+    }
+  }
+
   async function musicControl(action, extra = {}) {
+    if (action === 'pause' || action === 'stop') {
+      const webPlayer = document.getElementById('hearth-web-player');
+      if (webPlayer && !webPlayer.paused) {
+        webPlayer.pause();
+      }
+    }
     try {
       await (window.apiFetch || fetch)('/music/control', {
         method: 'POST',
@@ -925,6 +1121,8 @@
     const muteBtn = document.getElementById('music-mute-btn');
     const volume = document.getElementById('music-volume');
     const volumeValue = document.getElementById('music-volume-value');
+
+    _bindMusicOutputs();
 
     if (pp) pp.addEventListener('click', async () => {
       // Toggle based on current label (▶ = resume, ⏸ = pause).

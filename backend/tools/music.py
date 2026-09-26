@@ -724,6 +724,59 @@ def _sync_queue_tracks(tracks: list[dict[str, Any]]) -> None:
     _with_mpd(_fn)
 
 
+def _sync_get_outputs() -> list[dict[str, Any]]:
+    """Return all MPD audio outputs and their current status."""
+    def _fn(c: musicpd.MPDClient) -> list[dict[str, Any]]:
+        raw = c.outputs()
+        return [
+            {
+                "id": str(o.get("outputid", "")),
+                "name": o.get("outputname", f"Output {o.get('outputid')}"),
+                "enabled": str(o.get("outputenabled", "0")) == "1",
+                "plugin": o.get("plugin", ""),
+            }
+            for o in raw
+        ]
+    return _with_mpd(_fn)
+
+
+def _sync_set_output(output_id: str, mode: str = "exclusive") -> list[dict[str, Any]]:
+    """Set MPD output state (exclusive, mirror/both, enable, disable, toggle)."""
+    def _fn(c: musicpd.MPDClient) -> list[dict[str, Any]]:
+        outputs = c.outputs()
+        target_id = str(output_id)
+        for out in outputs:
+            oid = str(out.get("outputid", ""))
+            if mode == "exclusive":
+                if oid == target_id:
+                    c.enableoutput(int(oid))
+                else:
+                    c.disableoutput(int(oid))
+            elif mode in ("enable", "mirror", "both"):
+                if oid == target_id:
+                    c.enableoutput(int(oid))
+            elif mode == "disable":
+                if oid == target_id:
+                    c.disableoutput(int(oid))
+            elif mode == "toggle":
+                if oid == target_id:
+                    if str(out.get("outputenabled", "0")) == "1":
+                        c.disableoutput(int(oid))
+                    else:
+                        c.enableoutput(int(oid))
+        return [
+            {
+                "id": str(o.get("outputid", "")),
+                "name": o.get("outputname", f"Output {o.get('outputid')}"),
+                "enabled": str(o.get("outputenabled", "0")) == "1",
+                "plugin": o.get("plugin", ""),
+            }
+            for o in c.outputs()
+        ]
+    return _with_mpd(_fn)
+
+
+
 # ── Intent parsing ─────────────────────────────────────────────────────────────
 
 _CONTROL_MAP: dict[str, str] = {
@@ -958,6 +1011,34 @@ async def run(params: dict[str, Any]) -> ToolResult:
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         except Exception as exc:
             log.error("music.queue_view | unexpected=%s", exc)
+            return ToolResult.failure(str(exc), retryable=False)
+
+    # ── Outputs view ──────────────────────────────────────────────────────────
+    if action == "outputs":
+        try:
+            data = await asyncio.to_thread(_sync_get_outputs)
+            return ToolResult(ok=True, data={"outputs": data})
+        except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+            log.warning("music.outputs | mpd_error=%s", exc)
+            return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+        except Exception as exc:
+            log.error("music.outputs | unexpected=%s", exc)
+            return ToolResult.failure(str(exc), retryable=False)
+
+    # ── Select output ─────────────────────────────────────────────────────────
+    if action == "select_output":
+        target_id = params.get("output_id")
+        if target_id is None:
+            return ToolResult.failure("output_id is required.", retryable=False)
+        mode = str(params.get("mode", "exclusive"))
+        try:
+            data = await asyncio.to_thread(_sync_set_output, str(target_id), mode)
+            return ToolResult(ok=True, data={"action": "select_output", "ok": True, "outputs": data})
+        except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+            log.warning("music.select_output | mpd_error=%s", exc)
+            return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+        except Exception as exc:
+            log.error("music.select_output | unexpected=%s", exc)
             return ToolResult.failure(str(exc), retryable=False)
 
     # ── Playback control ──────────────────────────────────────────────────────

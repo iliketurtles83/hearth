@@ -106,10 +106,19 @@
                 <button id="music-stop-btn" class="player-btn" type="button" title="Stop playback">&#9632;</button>
               </div>
               <div id="music-volume-row">
+                <button id="music-output-btn" class="music-output-btn" type="button" title="Select audio destination" aria-haspopup="true" aria-expanded="false">
+                  <span id="music-output-icon">🖥️</span>
+                  <span id="music-output-label">Host</span>
+                </button>
                 <button id="music-mute-btn" class="volume-mute-btn" type="button" title="Mute / Unmute">&#128266;</button>
                 <input id="music-volume" type="range" min="0" max="100" step="1" value="60" aria-label="Volume" />
                 <span id="music-volume-value">60%</span>
               </div>
+              <div id="music-output-menu" class="music-output-menu hidden" role="menu">
+                <div class="music-output-menu-header">Audio Destination</div>
+                <div id="music-output-options"></div>
+              </div>
+              <audio id="hearth-web-player" preload="none"></audio>
             </div>
             <div id="music-queue-section">
               <div id="music-queue-header">

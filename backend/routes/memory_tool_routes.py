@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 
 from app_schemas import (
     MusicControlRequest,
+    MusicOutputSelectRequest,
     MusicPlayRequest,
     MusicQueueRequest,
     MusicSearchRequest,
@@ -144,6 +145,21 @@ def create_memory_tool_router(
     @router.get("/music/queue")
     async def music_queue_view():
         return await _music_run({"action": "queue_view", "prompt": ""})
+
+    @router.get("/music/outputs")
+    async def music_get_outputs():
+        return await _music_run({"action": "outputs", "prompt": ""})
+
+    @router.post("/music/outputs/select")
+    async def music_select_output(request: MusicOutputSelectRequest):
+        return await _music_run(
+            {
+                "action": "select_output",
+                "output_id": request.output_id,
+                "mode": request.mode,
+                "prompt": "",
+            }
+        )
 
     @router.post("/music/beets/update")
     async def music_beets_update():

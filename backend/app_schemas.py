@@ -53,6 +53,12 @@ class MusicControlRequest(BaseModel):
     volume: int | None = None
 
 
+class MusicOutputSelectRequest(BaseModel):
+    output_id: str
+    mode: str = "exclusive"
+
+
+
 class RegisterRequest(BaseModel):
     username: str
     password: str
