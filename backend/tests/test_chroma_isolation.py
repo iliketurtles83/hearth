@@ -23,6 +23,15 @@ from memory import MemoryStore
 # ── Fixtures ─────────────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def mock_openai_embed_sync(monkeypatch):
+    """The embedder fails closed without an endpoint; give Chroma real vectors."""
+    monkeypatch.setattr(
+        "memory._openai_embed_sync",
+        lambda text, **kw: [float(len(text) % 7 + 1), 1.0, 0.5, 0.25],
+    )
+
+
 @pytest.fixture()
 def store(tmp_path):
     return MemoryStore(

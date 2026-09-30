@@ -193,9 +193,9 @@ CREATE INDEX idx_tool_events_tool ON tool_events(tool_name);
 
 `HashEmbedingFunction` → `OllamaEmbeddingFunction` using `nomic-embed-text` via Ollama (same model `embedding_router.py` already uses: `ROUTER_EMBED_MODEL`).
 
-**Implementation**: `_ollama_embed_sync()` helper in `memory.py` (note: `embedding_router.py` has its own separate `ollama_embed_text()` — not shared). `OllamaEmbeddingFunction` implements ChromaDB's `EmbeddingFunction` interface with a simple in-process cache (a plain `dict`; no LRU eviction). Graceful fallback to hash-based embedding if Ollama is unreachable. `MemoryStore._maybe_recreate_collection()` detects dimension mismatch on startup and recreates the ChromaDB collection so the new embedder takes effect without manual cleanup.
+**Implementation**: `_ollama_embed_sync()` helper in `memory.py` (note: `embedding_router.py` has its own separate `ollama_embed_text()` — not shared). `OllamaEmbeddingFunction` implements ChromaDB's `EmbeddingFunction` interface with a simple in-process cache (a plain `dict`; no LRU eviction). Fails closed if the endpoint is unreachable: `OpenAIEmbeddingFunction` raises `EmbeddingUnavailableError` (no hash fallback — non-semantic vectors must never enter the index), `_upsert_chroma()` logs `memory.index_deferred` and leaves the row SQLite-only, and the next successful write re-indexes missing rows. On startup `MemoryStore._reconcile_index()` compares the dimension of the vectors actually stored against a live probe, recreates the collection only on a real mismatch (embedding model changed), then indexes every live fact/preference row missing from Chroma (document text `key: value`, since the source message isn't kept in SQLite). If the embedder is down at boot, the index is left untouched.
 
-**Gotcha**: Existing ChromaDB data was embedded with 192-dim hash vectors. The dimension mismatch detection triggers a silent collection drop on first boot after this change — old vectors are lost. New vectors are 768-dim (nomic-embed-text).
+**Gotcha**: Changing `ROUTER_EMBED_MODEL` to one with a different dimension drops the collection on next boot and rebuilds it from SQLite (logged as `memory.collection_recreate` then `memory.index_rebuilt`).
 
 ### 1.2 Fix LLM extraction to use `/api/chat` ✅
 
@@ -258,7 +258,7 @@ Do NOT capture:
 
 **Files changed**: `backend/memory.py`, `backend/tests/test_memory_isolation.py`
 
-**Migration path**: On first boot after deployment, `MemoryStore._maybe_recreate_collection()` detects that the existing ChromaDB collection was built with 192-dim hash embeddings while the runtime embedder produces 768-dim vectors. It silently drops and recreates the `conversation_memory` collection. Old vectors are lost; new vectors are generated from original text on next retrieval.
+**Migration path**: On boot, `MemoryStore._reconcile_index()` recreates the `conversation_memory` collection only if its stored vectors' dimension differs from the live embedder's, then rebuilds missing vectors from SQLite.
 
 **No schema migrations needed**: Phase 1 changes don't add or modify any SQLite tables. The existing `facts`, `preferences`, `summaries`, and `conversation_log` tables are used as-is.
 

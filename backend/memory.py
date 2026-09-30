@@ -12,7 +12,6 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-import hashlib
 import time
 import json
 import asyncio
@@ -96,11 +95,24 @@ class MemoryCommand:
     query: str | None = None
 
 
+_COLLECTION_NAME = "conversation_memory"
+_REINDEX_BATCH = 64
+
+
+class EmbeddingUnavailableError(RuntimeError):
+    """Raised when the embedding endpoint cannot produce a vector."""
+
+
+def _embed_endpoint() -> tuple[str, str]:
+    base_url = (os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
+    model = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
+    return base_url, model
+
+
 def _openai_embed_sync(text: str, *, base_url: str, model: str) -> list[float] | None:
     """Synchronous embedding call via OpenAI-compatible /v1/embeddings.
 
-    Returns None when the endpoint is unreachable so callers can fall back
-    to deterministic hash-based embeddings.
+    Returns None when the endpoint is unreachable or returns no vector.
     """
     try:
         payload = {"model": model, "input": text}
@@ -121,20 +133,13 @@ def _openai_embed_sync(text: str, *, base_url: str, model: str) -> list[float] |
 class OpenAIEmbeddingFunction(EmbeddingFunction):
     """ChromaDB embedding function backed by local OpenAI-compatible endpoint (nomic-embed-text).
 
-    Embeddings are cached per instance.  If the endpoint is unreachable the
-    function falls back to a deterministic hash-based embedding so that
-    ChromaDB operations never crash.
+    Embeddings are cached per instance.  If the endpoint is unreachable this
+    raises EmbeddingUnavailableError rather than returning a substitute vector:
+    non-semantic vectors must never enter the semantic index.  SQLite is the
+    canonical store, so MemoryStore defers indexing and retries later.
     """
 
-    def __init__(
-        self,
-        base_url: str | None = None,
-        model: str | None = None,
-        fallback_dim: int = 192,
-    ) -> None:
-        self._base_url = (base_url or os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
-        self._model = model or os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
-        self._fallback_dim = fallback_dim
+    def __init__(self) -> None:
         self._cache: dict[str, list[float]] = {}
 
     def _embed_one(self, text: str) -> list[float]:
@@ -142,26 +147,12 @@ class OpenAIEmbeddingFunction(EmbeddingFunction):
         if cached is not None:
             return cached
 
-        openai_url = (os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
-        embed_model = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
-
-        vec = _openai_embed_sync(text, base_url=openai_url, model=embed_model)
-        if vec is not None:
-            self._cache[text] = vec
-            return vec
-
-        # Fallback: deterministic hash-based sparse embedding.
-        hash_vec = np.zeros(self._fallback_dim, dtype=np.float32)
-        for token in re.findall(r"[a-z0-9]+", text.lower()):
-            digest = hashlib.sha256(token.encode("utf-8")).digest()
-            idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % self._fallback_dim
-            hash_vec[idx] += 1.0
-        norm = float(np.linalg.norm(hash_vec))
-        if norm > 0.0:
-            hash_vec /= norm
-        result = hash_vec.tolist()
-        self._cache[text] = result
-        return result
+        base_url, model = _embed_endpoint()
+        vec = _openai_embed_sync(text, base_url=base_url, model=model)
+        if vec is None:
+            raise EmbeddingUnavailableError("embedding endpoint unavailable")
+        self._cache[text] = vec
+        return vec
 
     def __call__(self, input: Documents) -> list[list[float]]:
         return [self._embed_one(t) for t in input]
@@ -204,70 +195,101 @@ class MemoryStore:
         self._embedder = OpenAIEmbeddingFunction()
         self._chroma = chromadb.PersistentClient(path=self.chroma_path)
         self._collection = self._chroma.get_or_create_collection(
-            name="conversation_memory",
+            name=_COLLECTION_NAME,
             embedding_function=self._embedder,
         )
-        self._maybe_recreate_collection()
+        # Set when a Chroma write was deferred; cleared once the index catches up.
+        self._index_stale = False
+        self._reconcile_index()
 
-    def _maybe_recreate_collection(self) -> None:
-        """Recreate the ChromaDB collection if embedding dimensions changed.
+    def _stored_embedding_dim(self) -> int | None:
+        """Return the dimension of vectors already in the collection, or None if empty."""
+        got = self._collection.get(limit=1, include=["embeddings"])
+        embeddings = got.get("embeddings")
+        if embeddings is None or len(embeddings) == 0:
+            return None
+        return len(embeddings[0])
 
-        When switching from the old hash-based embedder (192-dim) to
-        Ollama's nomic-embed-text (typically 768-dim) the existing
-        collection will reject new embeddings.  Detect the mismatch
-        and recreate the collection so the new embedder takes effect.
+    def _reconcile_index(self) -> None:
+        """Bring the Chroma index in line with SQLite, the canonical store.
+
+        The collection is recreated only when its stored vectors have a
+        different dimension from the live embedder's (i.e. the embedding model
+        changed); then every fact/preference row missing from Chroma is indexed.
+        If the embedder is unreachable (e.g. still warming up at boot) the index
+        is left untouched and rows are picked up by a later reconcile.
         """
-        openai_url = (os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
-        embed_model = os.getenv("ROUTER_EMBED_MODEL", "nomic-embed-text")
-        try:
-            vec = _openai_embed_sync("probe", base_url=openai_url, model=embed_model)
-            if vec is None:
-                return
-            new_dim = len(vec)
-        except Exception:
+        base_url, model = _embed_endpoint()
+        probe = _openai_embed_sync("probe", base_url=base_url, model=model)
+        if probe is None:
+            log.warning("memory.index_reconcile_skipped | reason=embedder_unavailable")
+            self._index_stale = True
             return
 
         try:
-            existing = self._chroma.get_collection(name="conversation_memory")
-            if existing.metadata and existing.metadata.get("hnsw:space"):
-                existing_dim = existing.__len__()
-                if existing_dim > 0:
-                    # Collection has data — check if we need to recreate.
-                    pass
-        except Exception:
-            return
-
-        # Heuristic: if the collection exists with data and the embedder
-        # changed, recreate it.  We detect this by trying to embed a
-        # probe and comparing dimensionality against stored vectors.
-        try:
-            existing = self._chroma.get_collection(name="conversation_memory")
-            count = existing.__len__()
-
-            # Probe with old embedder dimension (192).
-            old_vec = np.zeros(192, dtype=np.float32)
-            for token in re.findall(r"[a-z0-9]+", "probe"):
-                digest = hashlib.sha256(token.encode("utf-8")).digest()
-                idx = int.from_bytes(digest[:8], byteorder="big", signed=False) % 192
-                old_vec[idx] += 1.0
-            norm = float(np.linalg.norm(old_vec))
-            if norm > 0:
-                old_vec /= norm
-            old_dim = len(old_vec)
-
-            if new_dim != old_dim:
+            stored_dim = self._stored_embedding_dim()
+            if stored_dim is not None and stored_dim != len(probe):
                 log.info(
                     "memory.collection_recreate | reason=embedding_dimension_mismatch "
-                    "old_dim=%d new_dim=%d count=%d",
-                    old_dim, new_dim, count,
+                    "stored_dim=%d new_dim=%d count=%d",
+                    stored_dim, len(probe), self._collection.count(),
                 )
-                self._chroma.delete_collection(name="conversation_memory")
+                self._chroma.delete_collection(name=_COLLECTION_NAME)
                 self._collection = self._chroma.get_or_create_collection(
-                    name="conversation_memory",
+                    name=_COLLECTION_NAME,
                     embedding_function=self._embedder,
                 )
-        except Exception:
-            pass
+            self._index_missing_rows()
+            self._index_stale = False
+        except Exception as exc:
+            log.warning("memory.index_reconcile_failed | error=%s", type(exc).__name__)
+            self._index_stale = True
+
+    def _index_missing_rows(self) -> None:
+        """Index every live fact/preference row that has no vector in Chroma.
+
+        The original source message is not kept in SQLite, so rebuilt entries
+        embed "key: value".  Caller holds _lock (or is __init__).
+        """
+        now = time.time()
+        rows = self._conn.execute(
+            """
+            SELECT 'facts:' || id AS memory_id, 'facts' AS table_name,
+                   user_id, key, value, source, created_at AS ts
+            FROM facts
+            WHERE expires_at IS NULL OR expires_at > ?
+            UNION ALL
+            SELECT 'preferences:' || id, 'preferences',
+                   user_id, key, value, 'preference', updated_at
+            FROM preferences
+            """,
+            (now,),
+        ).fetchall()
+        if not rows:
+            return
+
+        indexed = set(self._collection.get(include=[])["ids"])
+        missing = [r for r in rows if r["memory_id"] not in indexed]
+        for i in range(0, len(missing), _REINDEX_BATCH):
+            batch = missing[i : i + _REINDEX_BATCH]
+            self._collection.upsert(
+                ids=[r["memory_id"] for r in batch],
+                documents=[f"{str(r['key']).replace('_', ' ')}: {r['value']}" for r in batch],
+                metadatas=[
+                    {
+                        "table": r["table_name"],
+                        "key": r["key"],
+                        "value": r["value"],
+                        "source": r["source"],
+                        "user_id": r["user_id"],
+                        "created_at": r["ts"],
+                        "consent_status": "reindexed",
+                    }
+                    for r in batch
+                ],
+            )
+        if missing:
+            log.info("memory.index_rebuilt | indexed=%d", len(missing))
 
     _SENSITIVE_SECRET_PATTERNS = [
         r"\b(api[_-]?key|token|password|secret|passwd|bearer)\b",
@@ -956,7 +978,25 @@ class MemoryStore:
             asyncio.set_event_loop(None)
 
     def _upsert_chroma(self, memory_id: str, text: str, metadata: dict[str, Any]) -> None:
-        self._collection.upsert(ids=[memory_id], documents=[text], metadatas=[metadata])
+        """Index one memory row.  Caller holds _lock.
+
+        Fails closed: if the embedder is down the row stays SQLite-only and is
+        indexed by the next successful reconcile.
+        """
+        try:
+            self._collection.upsert(ids=[memory_id], documents=[text], metadatas=[metadata])
+        except Exception as exc:
+            log.warning(
+                "memory.index_deferred | id=%s error=%s", memory_id, type(exc).__name__
+            )
+            self._index_stale = True
+            return
+        if self._index_stale:
+            try:
+                self._index_missing_rows()
+                self._index_stale = False
+            except Exception as exc:
+                log.warning("memory.index_retry_failed | error=%s", type(exc).__name__)
 
     def _forget_by_query(self, user_id: str, query: str) -> int:
         q = query.strip().lower()
@@ -1075,7 +1115,12 @@ class MemoryStore:
                         """,
                         (user_id, c.key, c.value, now),
                     )
-                    row_id = cur.lastrowid
+                    # lastrowid is stale when ON CONFLICT takes the UPDATE branch.
+                    pref_row = cur.execute(
+                        "SELECT id FROM preferences WHERE user_id = ? AND key = ? LIMIT 1",
+                        (user_id, c.key),
+                    ).fetchone()
+                    row_id = int(pref_row["id"])
                     memory_id = f"preferences:{row_id}"
                 else:
                     cur.execute(
