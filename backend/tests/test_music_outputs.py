@@ -81,6 +81,18 @@ def test_sync_set_output_mirror():
         assert res[1]["enabled"] is True
 
 
+def test_sync_set_output_both():
+    mock_client = _MockMPDClient(outputs=[
+        {"outputid": "0", "outputname": "Host Speakers", "outputenabled": "0", "plugin": "pulse"},
+        {"outputid": "1", "outputname": "Web Stream", "outputenabled": "0", "plugin": "httpd"},
+    ])
+    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+        # In both/all mode, all outputs should be enabled
+        res = music_mod._sync_set_output("all", mode="both")
+        assert res[0]["enabled"] is True
+        assert res[1]["enabled"] is True
+
+
 def test_sync_set_output_toggle_and_disable():
     mock_client = _MockMPDClient()
     with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
@@ -157,4 +169,11 @@ def test_api_music_outputs_and_select():
         assert data2["action"] == "select_output"
         assert data2["outputs"][1]["enabled"] is True
         assert data2["outputs"][0]["enabled"] is False
+
+        resp3 = client.post("/music/outputs/select", json={"output_id": "all", "mode": "both"})
+        assert resp3.status_code == 200
+        data3 = resp3.json()
+        assert data3["action"] == "select_output"
+        assert data3["outputs"][0]["enabled"] is True
+        assert data3["outputs"][1]["enabled"] is True
 

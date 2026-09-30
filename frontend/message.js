@@ -332,6 +332,32 @@
     closeSidebar();
   });
 
+  function syncViewportHeight() {
+    if (!window.visualViewport) {
+      document.documentElement.style.setProperty('--app-height', '100%');
+      return;
+    }
+    const height = window.visualViewport.height;
+    document.documentElement.style.setProperty('--app-height', `${height}px`);
+    if (window.scrollY !== 0 || window.scrollX !== 0) {
+      window.scrollTo(0, 0);
+    }
+  }
+
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener('resize', () => {
+      syncViewportHeight();
+      scrollToBottom();
+    });
+    window.visualViewport.addEventListener('scroll', syncViewportHeight);
+  }
+
+  window.addEventListener('scroll', () => {
+    if (window.scrollY !== 0 || window.scrollX !== 0) {
+      window.scrollTo(0, 0);
+    }
+  }, { passive: true });
+
   window.addEventListener('resize', () => {
     if (!isMobileLayout()) closeSidebar();
   });
@@ -354,6 +380,30 @@
     if (e.key !== 'Escape') return;
     closeSessionMenu();
     closeSettingsMenu();
+  });
+
+  input.addEventListener('focus', () => {
+    requestAnimationFrame(() => {
+      syncViewportHeight();
+      scrollToBottom();
+    });
+    setTimeout(() => {
+      syncViewportHeight();
+      scrollToBottom();
+    }, 150);
+    setTimeout(() => {
+      syncViewportHeight();
+      scrollToBottom();
+    }, 350);
+  });
+
+  input.addEventListener('blur', () => {
+    requestAnimationFrame(() => {
+      syncViewportHeight();
+    });
+    setTimeout(() => {
+      syncViewportHeight();
+    }, 150);
   });
 
   input.addEventListener('input', () => {
@@ -839,7 +889,12 @@
           if (autoExpand || previousState !== 'play') {
             expandMusicPanel();
           }
-          _ensureWebPlayerPlaying();
+          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+            const webPlayer = document.getElementById('hearth-web-player');
+            if (webPlayer && (!webPlayer.paused || autoExpand)) {
+              _ensureWebPlayerPlaying(false);
+            }
+          }
           _updateMediaSession(data.track, true);
         } else {
           _stopProgressTicker();
@@ -903,7 +958,9 @@
       }).join('');
       list.querySelectorAll('.list-item-clickable').forEach(el => {
         el.addEventListener('click', () => {
-          _ensureWebPlayerPlaying();
+          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+            _ensureWebPlayerPlaying(true);
+          }
           musicControl('play_pos', { pos: parseInt(el.dataset.pos, 10) });
         });
       });
@@ -912,7 +969,14 @@
     }
   }
 
-  let _currentOutputTarget = localStorage.getItem('hearth:music_output') || 'host';
+  function _isHostDevice() {
+    const h = window.location.hostname;
+    return h === 'localhost' || h === '127.0.0.1' || h === '[::1]';
+  }
+
+  let _currentOutputTarget = (_isHostDevice() && !localStorage.getItem('hearth:audio_sink_id'))
+    ? 'host'
+    : (localStorage.getItem('hearth:music_output') || 'host');
   let _isAppPausing = false;
 
   function _pauseWebPlayer() {
@@ -938,14 +1002,24 @@
 
   function _ensureWebPlayerPlaying(forceReconnect = false) {
     if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return;
+    // On the host machine with default speakers, MPD Output 0 already plays directly via PulseAudio/PipeWire.
+    // Never double-stream over HTTP into default host speakers.
+    if (_isHostDevice() && !localStorage.getItem('hearth:audio_sink_id')) {
+      _pauseWebPlayer();
+      return;
+    }
     const webPlayer = document.getElementById('hearth-web-player');
     if (!webPlayer) return;
     _applySavedSinkId(webPlayer);
+    if (_playbackState !== 'play' && !forceReconnect) return;
     if (forceReconnect || !webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
       webPlayer.src = '/music/stream?t=' + Date.now();
       webPlayer.load();
     }
-    webPlayer.play().catch(() => {});
+    const playPromise = webPlayer.play();
+    if (playPromise !== undefined) {
+      playPromise.catch(() => {});
+    }
   }
 
   function _updateMediaSession(track, isPlaying) {
@@ -1001,11 +1075,17 @@
 
     if (target === 'host') {
       _pauseWebPlayer();
+    } else if (target === 'phone' || target === 'both') {
+      // Must start/resume webPlayer synchronously inside user interaction
+      // to satisfy mobile autoplay policies before making any network requests.
+      if (_playbackState === 'play') {
+        _ensureWebPlayerPlaying(true);
+      }
     }
 
     try {
       if (target === 'phone') {
-        // Output 1 = Web Stream (exclusive)
+        // Output 1 = Web Stream (exclusive - disables Host Speakers)
         await (window.apiFetch || fetch)('/music/outputs/select', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1013,34 +1093,24 @@
           body: JSON.stringify({ output_id: '1', mode: 'exclusive' }),
         });
       } else if (target === 'both') {
-        // Output 0 = Host, Output 1 = Web Stream (mirror)
+        // Both Host Speakers and Web Stream enabled in a single request
+        await (window.apiFetch || fetch)('/music/outputs/select', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          credentials: 'same-origin',
+          body: JSON.stringify({ output_id: 'all', mode: 'both' }),
+        });
+      } else {
+        // Output 0 = Host (enable Host Speakers, keep Web Stream running)
         await (window.apiFetch || fetch)('/music/outputs/select', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           credentials: 'same-origin',
           body: JSON.stringify({ output_id: '0', mode: 'enable' }),
         });
-        await (window.apiFetch || fetch)('/music/outputs/select', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ output_id: '1', mode: 'enable' }),
-        });
-      } else {
-        // Output 0 = Host (exclusive)
-        await (window.apiFetch || fetch)('/music/outputs/select', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ output_id: '0', mode: 'exclusive' }),
-        });
       }
     } catch {
       // non-fatal
-    }
-
-    if (target === 'phone' || target === 'both') {
-      _ensureWebPlayerPlaying();
     }
   }
 
@@ -1059,25 +1129,10 @@
     const webPlayer = document.getElementById('hearth-web-player');
     if (webPlayer) {
       webPlayer.addEventListener('error', () => {
-        if (_playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
+        if (_playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') && !_isHostDevice()) {
           setTimeout(() => {
             _ensureWebPlayerPlaying(true);
-          }, 800);
-        }
-      });
-      webPlayer.addEventListener('stalled', () => {
-        if (_playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
-          setTimeout(() => {
-            if (webPlayer.paused) {
-              _ensureWebPlayerPlaying(true);
-            }
-          }, 1500);
-        }
-      });
-      // Handle external pauses (e.g. Bluetooth disconnect, headphones unplugged, phone call)
-      webPlayer.addEventListener('pause', () => {
-        if (!_isAppPausing && _playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both')) {
-          musicControl('pause');
+          }, 1000);
         }
       });
     }
@@ -1245,12 +1300,8 @@
     if (action === 'pause' || action === 'stop') {
       _pauseWebPlayer();
     } else if (action === 'resume') {
-      _ensureWebPlayerPlaying(true);
-    } else if (action === 'next' || action === 'previous' || action === 'play_pos') {
       if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-        setTimeout(() => {
-          _ensureWebPlayerPlaying(true);
-        }, 150);
+        _ensureWebPlayerPlaying(true);
       }
     }
     try {
@@ -1286,7 +1337,11 @@
       // Toggle based on current label (▶ = resume, ⏸ = pause).
       const action = pp.textContent.trim() === '⏸' ? 'pause' : 'resume';
       if (action === 'resume') {
-        _ensureWebPlayerPlaying(true);
+        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+          _ensureWebPlayerPlaying(true);
+        }
+      } else {
+        _pauseWebPlayer();
       }
       await musicControl(action);
     });
@@ -1860,6 +1915,7 @@
   }
 
   async function bootstrap() {
+    syncViewportHeight();
     _bindCollapsiblePanels();
     _loadReasoningPref();
     _loadThemePref();

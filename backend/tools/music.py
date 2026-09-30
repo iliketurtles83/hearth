@@ -745,7 +745,20 @@ def _sync_set_output(output_id: str, mode: str = "exclusive") -> list[dict[str, 
     def _fn(c: musicpd.MPDClient) -> list[dict[str, Any]]:
         outputs = c.outputs()
         target_id = str(output_id)
-        if mode == "exclusive":
+        if target_id in ("all", "both") or mode in ("all", "both"):
+            for out in outputs:
+                oid = out.get("outputid")
+                if oid is not None:
+                    c.enableoutput(int(oid))
+            try:
+                status = c.status()
+                if "error" in status:
+                    c.clearerror()
+                if status.get("state") == "pause" and status.get("songid"):
+                    c.play()
+            except Exception:
+                pass
+        elif mode == "exclusive":
             # Enable target output FIRST to avoid having 0 active outputs while playing,
             # which causes MPD to pause with "Failed to open audio output".
             c.enableoutput(int(target_id))
@@ -761,7 +774,7 @@ def _sync_set_output(output_id: str, mode: str = "exclusive") -> list[dict[str, 
                     c.play()
             except Exception:
                 pass
-        elif mode in ("enable", "mirror", "both"):
+        elif mode in ("enable", "mirror"):
             c.enableoutput(int(target_id))
         elif mode == "disable":
             c.disableoutput(int(target_id))
