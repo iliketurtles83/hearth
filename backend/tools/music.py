@@ -574,7 +574,7 @@ def _sync_play(url: str) -> dict[str, Any]:
     def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
         c.clear()
         added = _add_mpd_paths(c, [path])
-        if added == 0:
+        if not added:
             raise FileNotFoundError(f"Track not available in MPD library: {path}")
         c.play()
         # Confirm MPD transitioned to play and capture timing for UI sync.
@@ -595,7 +595,7 @@ def _sync_queue(url: str) -> None:
 
     def _fn(c: musicpd.MPDClient) -> None:
         added = _add_mpd_paths(c, [path])
-        if added == 0:
+        if not added:
             raise FileNotFoundError(f"Track not available in MPD library: {path}")
 
     _with_mpd(_fn)
@@ -711,30 +711,36 @@ def _sync_play_tracks(tracks: list[dict[str, Any]]) -> dict[str, Any]:
 
     def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
         c.clear()
-        added = _add_mpd_paths(c, paths)
-        if added == 0:
+        added_paths = _add_mpd_paths(c, paths)
+        if not added_paths:
             raise FileNotFoundError("No selected tracks are available in the MPD library")
         c.play()
         status = c.status()
+        added_set = set(added_paths)
+        queued_tracks = [t for t, p in zip(tracks, paths) if p in added_set]
         return {
             "state": status.get("state", "stop"),
             "elapsed": float(status.get("elapsed", 0)),
             "duration": float(status["duration"]) if "duration" in status else None,
+            "queued_tracks": queued_tracks,
         }
 
     return _with_mpd(_fn)
 
 
-def _sync_queue_tracks(tracks: list[dict[str, Any]]) -> None:
+def _sync_queue_tracks(tracks: list[dict[str, Any]]) -> dict[str, Any]:
     """Append all tracks to the current MPD queue without changing playback."""
     paths = [_url_to_mpd_path(t["url"]) for t in tracks]
 
-    def _fn(c: musicpd.MPDClient) -> None:
-        added = _add_mpd_paths(c, paths)
-        if added == 0:
+    def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
+        added_paths = _add_mpd_paths(c, paths)
+        if not added_paths:
             raise FileNotFoundError("No selected tracks are available in the MPD library")
+        added_set = set(added_paths)
+        queued_tracks = [t for t, p in zip(tracks, paths) if p in added_set]
+        return {"queued_tracks": queued_tracks}
 
-    _with_mpd(_fn)
+    return _with_mpd(_fn)
 
 
 def _sync_get_outputs() -> list[dict[str, Any]]:
@@ -956,12 +962,12 @@ def _is_mpd_missing_path_error(exc: Exception) -> bool:
     return "No such directory" in str(exc)
 
 
-def _add_mpd_paths(client: musicpd.MPDClient, paths: list[str]) -> int:
-    added = 0
+def _add_mpd_paths(client: musicpd.MPDClient, paths: list[str]) -> list[str]:
+    added: list[str] = []
     for path in paths:
         try:
             client.add(path)
-            added += 1
+            added.append(path)
         except Exception as exc:
             if _is_mpd_missing_path_error(exc):
                 log.warning("mpd.add_skip_missing | path=%s", path)
@@ -1156,9 +1162,12 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
         try:
             if action == "queue":
-                await asyncio.to_thread(_sync_queue_tracks, tracks)
+                q_result = await asyncio.to_thread(_sync_queue_tracks, tracks)
+                queued = q_result.get("queued_tracks", tracks)
+                mpd_status = {}
             else:
                 mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                queued = mpd_status.pop("queued_tracks", tracks)
         except FileNotFoundError as exc:
             log.warning("music.artist_radio | library_miss=%s", exc)
             return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1167,10 +1176,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         return ToolResult(ok=True, data={
             "action": "queue" if action == "queue" else "play",
-            "track": tracks[0],
-            "tracks": tracks,
+            "track": queued[0],
+            "tracks": queued,
             "confidence": 1.0,
-            "picked_from": len(tracks),
+            "picked_from": len(queued),
             **mpd_status,
         })
 
@@ -1215,9 +1224,12 @@ async def run(params: dict[str, Any]) -> ToolResult:
         if tracks:
             try:
                 if action == "queue":
-                    await asyncio.to_thread(_sync_queue_tracks, tracks)
+                    q_result = await asyncio.to_thread(_sync_queue_tracks, tracks)
+                    queued = q_result.get("queued_tracks", tracks)
+                    mpd_status = {}
                 else:
                     mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                    queued = mpd_status.pop("queued_tracks", tracks)
             except FileNotFoundError as exc:
                 log.warning("music.title_artist_radio_fallback | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1226,10 +1238,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
             return ToolResult(ok=True, data={
                 "action": "queue" if action == "queue" else "play",
-                "track": tracks[0],
-                "tracks": tracks,
+                "track": queued[0],
+                "tracks": queued,
                 "confidence": 0.7,
-                "picked_from": len(tracks),
+                "picked_from": len(queued),
                 **mpd_status,
             })
         return ToolResult.failure(
@@ -1258,9 +1270,12 @@ async def run(params: dict[str, Any]) -> ToolResult:
         )
         try:
             if action == "queue":
-                await asyncio.to_thread(_sync_queue_tracks, tracks)
+                q_result = await asyncio.to_thread(_sync_queue_tracks, tracks)
+                queued = q_result.get("queued_tracks", tracks)
+                mpd_status = {}
             else:
                 mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                queued = mpd_status.pop("queued_tracks", tracks)
         except FileNotFoundError as exc:
             log.warning("music.year_range_play | library_miss=%s", exc)
             return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1269,10 +1284,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         return ToolResult(ok=True, data={
             "action": "queue" if action == "queue" else "play",
-            "track": tracks[0],
-            "tracks": tracks,
+            "track": queued[0],
+            "tracks": queued,
             "confidence": 0.9,
-            "picked_from": len(all_year_tracks),
+            "picked_from": len(queued),
             **mpd_status,
         })
 
@@ -1325,6 +1340,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
         if tracks:
             try:
                 mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                queued = mpd_status.pop("queued_tracks", tracks)
             except FileNotFoundError as exc:
                 log.warning("music.genre_radio | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1333,11 +1349,11 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
             return ToolResult(ok=True, data={
                 "action": "play",
-                "track": tracks[0],
-                "tracks": tracks,
+                "track": queued[0],
+                "tracks": queued,
                 "genre": genre_match,
                 "confidence": 0.9,
-                "picked_from": len(tracks),
+                "picked_from": len(queued),
                 **mpd_status,
             })
         # Genre returned nothing — for decade terms, fall back to year column.
@@ -1363,6 +1379,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 tracks = _rng.sample(_year_tracks, _n_pick)
                 try:
                     mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                    queued = mpd_status.pop("queued_tracks", tracks)
                 except FileNotFoundError as exc:
                     log.warning("music.decade_year_fallback | library_miss=%s", exc)
                     return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1371,10 +1388,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
                     return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
                 return ToolResult(ok=True, data={
                     "action": "play",
-                    "track": tracks[0],
-                    "tracks": tracks,
+                    "track": queued[0],
+                    "tracks": queued,
                     "confidence": 0.9,
-                    "picked_from": len(_year_tracks),
+                    "picked_from": len(queued),
                     **mpd_status,
                 })
 
@@ -1402,9 +1419,12 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
         try:
             if action == "queue":
-                await asyncio.to_thread(_sync_queue_tracks, tracks)
+                q_result = await asyncio.to_thread(_sync_queue_tracks, tracks)
+                queued = q_result.get("queued_tracks", tracks)
+                mpd_status = {}
             else:
                 mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                queued = mpd_status.pop("queued_tracks", tracks)
         except FileNotFoundError as exc:
             log.warning("music.artist_radio_fallback | library_miss=%s", exc)
             return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1413,10 +1433,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
         return ToolResult(ok=True, data={
             "action": "queue" if action == "queue" else "play",
-            "track": tracks[0],
-            "tracks": tracks,
+            "track": queued[0],
+            "tracks": queued,
             "confidence": 0.7,
-            "picked_from": len(tracks),
+            "picked_from": len(queued),
             **mpd_status,
         })
 
@@ -1454,6 +1474,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
         if tracks:
             try:
                 mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                queued = mpd_status.pop("queued_tracks", tracks)
             except FileNotFoundError as exc:
                 log.warning("music.artist_radio_heuristic | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1462,10 +1483,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
             return ToolResult(ok=True, data={
                 "action": "play",
-                "track": tracks[0],
-                "tracks": tracks,
+                "track": queued[0],
+                "tracks": queued,
                 "confidence": 0.85,
-                "picked_from": len(tracks),
+                "picked_from": len(queued),
                 **mpd_status,
             })
         # artist_radio returned nothing (shouldn't happen if LIKE found results,
@@ -1495,6 +1516,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
         if tracks:
             try:
                 mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+                queued = mpd_status.pop("queued_tracks", tracks)
             except FileNotFoundError as exc:
                 log.warning("music.artist_radio_multiword | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1503,10 +1525,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
             return ToolResult(ok=True, data={
                 "action": "play",
-                "track": tracks[0],
-                "tracks": tracks,
+                "track": queued[0],
+                "tracks": queued,
                 "confidence": 0.86,
-                "picked_from": len(tracks),
+                "picked_from": len(queued),
                 **mpd_status,
             })
 
