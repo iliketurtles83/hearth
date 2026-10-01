@@ -789,7 +789,9 @@ class MemoryStore:
         # contain the most recent, highest-value facts).
         text = text.strip()[-1500:] if len(text.strip()) > 1500 else text.strip()
 
-        openai_url = (os.getenv("OPENAI_EMBED_BASE_URL") or os.getenv("OPENAI_BASE_URL", "http://localhost:10001/v1")).rstrip("/")
+        # Chat completion, so the chat endpoint — never OPENAI_EMBED_BASE_URL, which
+        # may point at an embedding-only llama-server.
+        openai_url = os.getenv("OPENAI_BASE_URL", "http://localhost:10000/v1").rstrip("/")
         chat_model = (
             os.getenv("OPENAI_CHAT_MODEL")
             or os.getenv("MODEL_LOCAL")
