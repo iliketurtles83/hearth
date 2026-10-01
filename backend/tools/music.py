@@ -566,19 +566,26 @@ def _with_mpd(fn):
             pass
 
 
-def _sync_play(url: str) -> None:
-    """Clear queue, add track, and start playing."""
+def _sync_play(url: str) -> dict[str, Any]:
+    """Clear queue, add track, and start playing. Returns MPD playback status."""
     path = _url_to_mpd_path(url)
     log.debug("mpd.play | path=%s", path)
 
-    def _fn(c: musicpd.MPDClient) -> None:
+    def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
         c.clear()
         added = _add_mpd_paths(c, [path])
         if added == 0:
             raise FileNotFoundError(f"Track not available in MPD library: {path}")
         c.play()
+        # Confirm MPD transitioned to play and capture timing for UI sync.
+        status = c.status()
+        return {
+            "state": status.get("state", "stop"),
+            "elapsed": float(status.get("elapsed", 0)),
+            "duration": float(status["duration"]) if "duration" in status else None,
+        }
 
-    _with_mpd(_fn)
+    return _with_mpd(_fn)
 
 
 def _sync_queue(url: str) -> None:
@@ -698,18 +705,24 @@ def _sync_queue_view() -> dict[str, Any]:
     return _with_mpd(_fn)
 
 
-def _sync_play_tracks(tracks: list[dict[str, Any]]) -> None:
-    """Clear queue, add all tracks, and start playing."""
+def _sync_play_tracks(tracks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Clear queue, add all tracks, and start playing. Returns MPD playback status."""
     paths = [_url_to_mpd_path(t["url"]) for t in tracks]
 
-    def _fn(c: musicpd.MPDClient) -> None:
+    def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
         c.clear()
         added = _add_mpd_paths(c, paths)
         if added == 0:
             raise FileNotFoundError("No selected tracks are available in the MPD library")
         c.play()
+        status = c.status()
+        return {
+            "state": status.get("state", "stop"),
+            "elapsed": float(status.get("elapsed", 0)),
+            "duration": float(status["duration"]) if "duration" in status else None,
+        }
 
-    _with_mpd(_fn)
+    return _with_mpd(_fn)
 
 
 def _sync_queue_tracks(tracks: list[dict[str, Any]]) -> None:
@@ -1122,8 +1135,8 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 await asyncio.to_thread(_sync_queue, track["url"])
                 return ToolResult(ok=True, data={"action": "queue", "track": track, "tracks": None, "confidence": 1.0, "picked_from": 1})
             else:
-                await asyncio.to_thread(_sync_play, track["url"])
-                return ToolResult(ok=True, data={"action": "play", "track": track, "tracks": None, "confidence": 1.0, "picked_from": 1})
+                mpd_status = await asyncio.to_thread(_sync_play, track["url"])
+                return ToolResult(ok=True, data={"action": "play", "track": track, "tracks": None, "confidence": 1.0, "picked_from": 1, **mpd_status})
         except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
             log.warning("music.song_id_play | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
@@ -1145,7 +1158,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             if action == "queue":
                 await asyncio.to_thread(_sync_queue_tracks, tracks)
             else:
-                await asyncio.to_thread(_sync_play_tracks, tracks)
+                mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
         except FileNotFoundError as exc:
             log.warning("music.artist_radio | library_miss=%s", exc)
             return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1158,6 +1171,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             "tracks": tracks,
             "confidence": 1.0,
             "picked_from": len(tracks),
+            **mpd_status,
         })
 
     # ── Compound title + artist search ("title by artist") ────────────────────
@@ -1181,8 +1195,8 @@ async def run(params: dict[str, Any]) -> ToolResult:
                     await asyncio.to_thread(_sync_queue, top["url"])
                     return ToolResult(ok=True, data={"action": "queue", "track": top, "tracks": None, "confidence": confidence, "picked_from": len(results)})
                 else:
-                    await asyncio.to_thread(_sync_play, top["url"])
-                    return ToolResult(ok=True, data={"action": "play", "track": top, "tracks": None, "confidence": confidence, "picked_from": len(results)})
+                    mpd_status = await asyncio.to_thread(_sync_play, top["url"])
+                    return ToolResult(ok=True, data={"action": "play", "track": top, "tracks": None, "confidence": confidence, "picked_from": len(results), **mpd_status})
             except FileNotFoundError as exc:
                 log.warning("music.title_artist_play | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1203,7 +1217,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 if action == "queue":
                     await asyncio.to_thread(_sync_queue_tracks, tracks)
                 else:
-                    await asyncio.to_thread(_sync_play_tracks, tracks)
+                    mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
             except FileNotFoundError as exc:
                 log.warning("music.title_artist_radio_fallback | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1216,6 +1230,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 "tracks": tracks,
                 "confidence": 0.7,
                 "picked_from": len(tracks),
+                **mpd_status,
             })
         return ToolResult.failure(
             f"No tracks found for '{query}' by '{artist_filter}'.", retryable=False
@@ -1245,7 +1260,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             if action == "queue":
                 await asyncio.to_thread(_sync_queue_tracks, tracks)
             else:
-                await asyncio.to_thread(_sync_play_tracks, tracks)
+                mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
         except FileNotFoundError as exc:
             log.warning("music.year_range_play | library_miss=%s", exc)
             return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1258,6 +1273,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             "tracks": tracks,
             "confidence": 0.9,
             "picked_from": len(all_year_tracks),
+            **mpd_status,
         })
 
     # ── Search (explicit action="search") ─────────────────────────────────────
@@ -1308,7 +1324,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
         if tracks:
             try:
-                await asyncio.to_thread(_sync_play_tracks, tracks)
+                mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
             except FileNotFoundError as exc:
                 log.warning("music.genre_radio | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1322,6 +1338,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 "genre": genre_match,
                 "confidence": 0.9,
                 "picked_from": len(tracks),
+                **mpd_status,
             })
         # Genre returned nothing — for decade terms, fall back to year column.
         _decade_m = re.match(r"^(\d{2})s$", genre_match)
@@ -1345,7 +1362,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 _n_pick = _playlist_pick_count(len(_year_tracks), requested_n=None)
                 tracks = _rng.sample(_year_tracks, _n_pick)
                 try:
-                    await asyncio.to_thread(_sync_play_tracks, tracks)
+                    mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
                 except FileNotFoundError as exc:
                     log.warning("music.decade_year_fallback | library_miss=%s", exc)
                     return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1358,6 +1375,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                     "tracks": tracks,
                     "confidence": 0.9,
                     "picked_from": len(_year_tracks),
+                    **mpd_status,
                 })
 
     try:
@@ -1386,7 +1404,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             if action == "queue":
                 await asyncio.to_thread(_sync_queue_tracks, tracks)
             else:
-                await asyncio.to_thread(_sync_play_tracks, tracks)
+                mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
         except FileNotFoundError as exc:
             log.warning("music.artist_radio_fallback | library_miss=%s", exc)
             return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1399,6 +1417,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             "tracks": tracks,
             "confidence": 0.7,
             "picked_from": len(tracks),
+            **mpd_status,
         })
 
     # Artist-radio heuristic: if the query looks like an artist/genre name rather
@@ -1434,7 +1453,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
         if tracks:
             try:
-                await asyncio.to_thread(_sync_play_tracks, tracks)
+                mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
             except FileNotFoundError as exc:
                 log.warning("music.artist_radio_heuristic | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1447,6 +1466,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 "tracks": tracks,
                 "confidence": 0.85,
                 "picked_from": len(tracks),
+                **mpd_status,
             })
         # artist_radio returned nothing (shouldn't happen if LIKE found results,
         # but fall through to single-pick as safety net).
@@ -1474,7 +1494,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
         if tracks:
             try:
-                await asyncio.to_thread(_sync_play_tracks, tracks)
+                mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
             except FileNotFoundError as exc:
                 log.warning("music.artist_radio_multiword | library_miss=%s", exc)
                 return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
@@ -1487,6 +1507,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                 "tracks": tracks,
                 "confidence": 0.86,
                 "picked_from": len(tracks),
+                **mpd_status,
             })
 
     # Auto-pick with availability fallback:
@@ -1511,7 +1532,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
                     "action": "queue", "track": candidate, "tracks": None,
                     "confidence": confidence, "picked_from": len(results),
                 })
-            await asyncio.to_thread(_sync_play, candidate["url"])
+            mpd_status = await asyncio.to_thread(_sync_play, candidate["url"])
             log.info(
                 "music.auto_pick | query=%r picked=%r artist=%r confidence=%.3f candidates=%d index=%d",
                 q,
@@ -1523,7 +1544,7 @@ async def run(params: dict[str, Any]) -> ToolResult:
             )
             return ToolResult(ok=True, data={
                 "action": "play", "track": candidate, "tracks": None,
-                "confidence": confidence, "picked_from": len(results),
+                "confidence": confidence, "picked_from": len(results), **mpd_status,
             })
         except FileNotFoundError as exc:
             if first_missing is None:
