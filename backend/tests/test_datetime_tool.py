@@ -127,3 +127,11 @@ async def test_today_date():
     assert result.data["query_type"] == "date"
     assert "date" in result.data
     assert "day_of_week" in result.data
+
+def test_auto_register_imports_all_builtin_tools(caplog):
+    import tools
+    with caplog.at_level("WARNING", logger="assistant.tools"):
+        tools._auto_register()
+    assert "skipping" not in caplog.text
+    for name in ("weather", "music", "timer", "calculator", "datetime"):
+        assert tools.get(name) is not None

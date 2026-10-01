@@ -13,7 +13,7 @@ Hearth is a local-first personal AI assistant combining:
 
 **Repo Profile**: Medium-sized monorepo, backend-centric (Python + vanilla JavaScript).
 **Runtime**: Python 3.11 (Docker), 3.12/3.13 (local venv). Vanilla JS frontend.
-**Deployment**: `docker compose up -d --build` (backend port 8000 is internal-only; Caddy on 443/80).
+**Deployment**: `docker compose up -d --build` (backend port 8000 is internal-only; Caddy publishes HTTPS on `HEARTH_BIND_IP:HEARTH_HTTPS_PORT`, default 443).
 
 ### Top-Level Layout (Quick Orientation)
 
@@ -21,7 +21,7 @@ Hearth is a local-first personal AI assistant combining:
 - `frontend/` — Vanilla JS SPA, CSS, and static web assets (served directly by FastAPI).
 - `scripts/` — Local validation gates (`review_baseline.sh`, `review_changed_tests.sh`) and model download utilities.
 - `docs/` — Architecture context (`docs/PROJECT_CONTEXT.md`), memory specification (`docs/MEMORY.md`), and review checklists.
-- `caddy/` — Caddyfile reverse proxy configuration (TLS termination on :443, HTTP redirect on :80).
+- `caddy/` — Caddyfile reverse proxy configuration (TLS termination on :443; host bind via `HEARTH_BIND_IP`/`HEARTH_HTTPS_PORT`).
 - `mpd/` — Music Player Daemon configuration (`mpd.conf`).
 - `.github/` — CI workflows (`.github/workflows/backend-review-gates.yml`).
 - Root configs: `docker-compose.yml`, `README.md`, `config.yaml` (Beets), `genres.txt`.
@@ -56,7 +56,9 @@ Hearth is a local-first personal AI assistant combining:
 - `docs/review/SECURITY_CORRECTNESS_CHECKLIST.md` — per-PR security + correctness checklist.
 - `docs/review/ENFORCEMENT.md` — enforcement guide.
 - `docs/MEMORY.md` — memory design doc; read before restructuring memory.
-- `caddy/Caddyfile` — TLS termination on :443, HTTP→HTTPS redirect on :80, reverse_proxy to backend:8000.
+- `caddy/Caddyfile` — TLS termination on :443, reverse_proxy to backend:8000 (and `/music/stream*` to mpd:8800). Its :80 redirect block exists but compose no longer publishes :80; MPD's :8800 is internal-only too.
+- `scripts/nomic-embed.sh` — CPU llama-server for nomic-embed-text (`NOMIC_HOST`/`NOMIC_PORT`, default 127.0.0.1:10001); point `OPENAI_EMBED_BASE_URL` at it. Memory extraction (chat) always uses `OPENAI_BASE_URL`, never the embed URL.
+- `scripts/renew-tailscale-cert.sh` — writes a Tailscale cert to `caddy/certs/` and restarts Caddy if it changed.
 - `mpd/` — MPD config directory (mpd.conf).
 - `config.yaml` — Beets config (non-interactive, no MusicBrainz lookups, copy: no, move: no).
 - `genres.txt` — curated genre definitions for music classification.

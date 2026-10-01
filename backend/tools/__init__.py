@@ -67,12 +67,13 @@ def _auto_register() -> None:
     drive import here so that tools are available from first request without
     a lazy-import race condition.
     """
-    _builtin_tools = ["weather", "music", "timer", "calculator", "datetime"]
-    for tool_name in _builtin_tools:
+    # Module names, not registry names: datetime_tool registers itself as "datetime".
+    _builtin_modules = ["weather", "music", "timer", "calculator", "datetime_tool"]
+    for module_name in _builtin_modules:
         try:
-            importlib.import_module(f"tools.{tool_name}")
+            importlib.import_module(f"tools.{module_name}")
         except ImportError as exc:
-            log.warning("tools.auto_register | skipping tool=%s error=%s", tool_name, exc)
+            log.warning("tools.auto_register | skipping module=%s error=%s", module_name, exc)
 
 
 _auto_register()

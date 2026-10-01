@@ -204,6 +204,14 @@ mkcert -cert-file caddy/certs/cert.pem -key-file caddy/certs/key.pem \
     localhost 127.0.0.1 192.168.1.50
 ```
 
+**Alternative — Tailscale certificate.** If clients reach Hearth over Tailscale, a Tailscale-issued (Let's Encrypt) certificate is trusted by phones without installing a CA. Enable HTTPS certificates for the tailnet (admin console → DNS), then:
+
+```bash
+bash scripts/renew-tailscale-cert.sh   # writes caddy/certs/{cert,key}.pem, restarts Caddy if changed
+```
+
+Certificates last 90 days; run the script on a timer (e.g. weekly). If another proxy already owns `:443` on the host, set `HEARTH_BIND_IP` / `HEARTH_HTTPS_PORT` (e.g. the Tailscale IP and `8443`) and open `https://<machine>.<tailnet>.ts.net:8443`.
+
 ### 3. Download Runtime Models
 
 Fetch the wake-word, whisper transcription, and TTS model files:
@@ -307,7 +315,8 @@ Key variables configured in `.env`:
 | | `MODEL_CLOUD` | `claude-sonnet-4-20250514` | Optional Anthropic model for cloud fallback |
 | | `ANTHROPIC_API_KEY` | `""` | API key for Anthropic fallback (optional) |
 | | `CHAT_MODEL_WARMUP` | `true` | Pre-load chat model into VRAM on startup |
-| **Router** | `ROUTER_EMBED_MODEL` | `nomic-embed-text` | Model used for embedding router exemplar classification |
+| **Router** | `OPENAI_EMBED_BASE_URL` | *(OPENAI_BASE_URL)* | Separate embedding server (e.g. `scripts/nomic-embed.sh`, `NOMIC_HOST`/`NOMIC_PORT`) |
+| | `ROUTER_EMBED_MODEL` | `nomic-embed-text` | Model used for embedding router exemplar classification |
 | | `ROUTER_EMBEDDING_ENABLED` | `true` | Enable embedding-based intent classifier |
 | | `ROUTE_CONFIDENCE_THRESHOLD` | `0.70` | Confidence required before cloud fallback escalation |
 | **Memory** | `MEMORY_TOP_N` | `5` | Maximum memory hits injected into context |
@@ -318,7 +327,8 @@ Key variables configured in `.env`:
 | **Music** | `MUSIC_PATH` | `/path/to/music` | Host directory containing audio files |
 | | `BEETS_DB_DIR` | `/path/to/beets` | Host directory containing Beets `library.db` |
 | | `MPD_HOST` | `mpd` | Hostname of MPD daemon |
-| **Network & Auth** | `CORS_ORIGINS` | `*` | Allowed CORS origins (set to exact LAN HTTPS address in prod) |
+| **Network & Auth** | `HEARTH_BIND_IP` / `HEARTH_HTTPS_PORT` | `0.0.0.0` / `443` | Host address/port Caddy publishes HTTPS on |
+| | `CORS_ORIGINS` | `*` | Allowed CORS origins (set to exact LAN HTTPS address in prod) |
 | | `SESSION_COOKIE_SECURE` | `false` | Send cookies only over HTTPS (`true` when Caddy terminates TLS) |
 
 ---

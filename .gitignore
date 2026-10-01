@@ -24,3 +24,4 @@ backend/models/whisper/
 # mkcert-generated certificates — never commit private keys
 caddy/certs/
 backend/tests/artifacts/tts-benchmark.json
+.aider*

@@ -9,15 +9,23 @@ services:
     restart: unless-stopped
     command: ["mpd", "--stdout", "--no-daemon", "/config/mpd.conf"]
     # Keep MPD's control port internal to the compose network (use `expose`) to
-    # avoid conflicts with any host MPD instance. Expose the web/HTTP port if
-    # you want web access on the host.
+    # avoid conflicts with any host MPD instance.
+    # The HTTP stream (:8800) is not published either: Caddy proxies
+    # /music/stream to mpd:8800 over the compose network, behind HTTPS.
     expose:
       - "6600"
-    ports:
-      - "8800:8800"
+      - "8800"
     volumes:
       - ./mpd:/config
-      - ${MUSIC_PATH}:/music:ro
+      # Long syntax with create_host_path: false — if MUSIC_PATH is missing (e.g. a
+      # network share not mounted yet) the container fails to start instead of
+      # Docker silently creating an empty root-owned directory.
+      - type: bind
+        source: ${MUSIC_PATH}
+        target: /music
+        read_only: true
+        bind:
+          create_host_path: false
       - ./mpd/playlists:/config/playlists
       # PulseAudio socket for host user (PipeWire-pulse compatibility)
       - ${PULSE_SOCKET}:${PULSE_SOCKET}:ro
@@ -76,7 +84,11 @@ services:
       - ./backend:/app
       - ./frontend:/frontend
       # Music library — writable so beets import can create temp files during remux.
-      - ${MUSIC_PATH}:/music
+      - type: bind
+        source: ${MUSIC_PATH}
+        target: /music
+        bind:
+          create_host_path: false
       # Beets library DB directory — mounted read-only so backend can query items.
       # Set BEETS_DB_DIR in .env to the directory containing library.db.
       - ${BEETS_DB_DIR}:/beets
@@ -97,16 +109,18 @@ services:
       # mid-warmup.
       start_period: 120s
 
-  # Caddy terminates TLS on the LAN edge and reverse-proxies to the backend.
-  # Certificates are generated with mkcert and mounted read-only.
-  # See README — HTTPS Setup section for cert generation steps.
+  # Caddy terminates TLS and reverse-proxies to the backend.
+  # Certificates (mkcert or `tailscale cert`) are mounted read-only from
+  # caddy/certs. See README — HTTPS Setup section.
+  # HEARTH_BIND_IP / HEARTH_HTTPS_PORT pick the host address: set them to share
+  # a machine with another :443 reverse proxy (e.g. a Tailscale IP on :8443).
+  # Plain HTTP (:80) is not published: open https:// directly.
   caddy:
     image: caddy:2-alpine
     container_name: assistant-caddy
     restart: unless-stopped
     ports:
-      - "443:443"
-      - "80:80"
+      - "${HEARTH_BIND_IP:-0.0.0.0}:${HEARTH_HTTPS_PORT:-443}:443"
     volumes:
       - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
       - ./caddy/certs:/certs:ro
@@ -120,5 +134,4 @@ services:
       start_period: 15s
 
 volumes:
-  open-webui:
   hearth-data:
