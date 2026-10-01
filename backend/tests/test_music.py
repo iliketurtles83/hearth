@@ -129,13 +129,13 @@ import os
 os.environ.setdefault("BEETS_DB_PATH", "/nonexistent/test.db")
 os.environ.setdefault("MPD_HOST", "localhost")
 os.environ.setdefault("MPD_PORT", "6600")
-os.environ.setdefault("MUSIC_ROOT", "/media/jack/buffer/audio")
+os.environ.setdefault("MUSIC_ROOT", "/srv/music")
 
 import tools.music as music  # noqa: E402  (must come after stubs)
 
 # Patch ToolResult references in the music module.
 music.ToolResult = ToolResult
-music.MUSIC_ROOT = "/media/jack/buffer/audio"
+music.MUSIC_ROOT = "/srv/music"
 music.musicpd = _fake_musicpd
 
 
@@ -152,13 +152,13 @@ def _make_rows(records: list[dict]) -> list[sqlite3.Row]:
 # ── Path rewrite tests ─────────────────────────────────────────────────────────
 
 def test_url_to_mpd_path_standard():
-    url = "/media/jack/buffer/audio/rock/artist/song.mp3"
+    url = "/srv/music/rock/artist/song.mp3"
     assert music._url_to_mpd_path(url) == "rock/artist/song.mp3"
 
 
 def test_url_to_mpd_path_bytes_path():
     """Beets items.path may be stored as bytes; decoded path strips MUSIC_ROOT."""
-    path_bytes = b"/media/jack/buffer/audio/rock/The Band/My Song.mp3"
+    path_bytes = b"/srv/music/rock/The Band/My Song.mp3"
     assert music._url_to_mpd_path(path_bytes) == "rock/The Band/My Song.mp3"
 
 
@@ -171,7 +171,7 @@ def test_url_to_mpd_path_no_prefix_match():
 
 def test_url_to_mpd_path_no_file_prefix():
     """Non-file:// URLs fall through the decode branch."""
-    url = "/media/jack/buffer/audio/song.mp3"
+    url = "/srv/music/song.mp3"
     result = music._url_to_mpd_path(url)
     assert result == "song.mp3"
 
@@ -179,8 +179,8 @@ def test_url_to_mpd_path_no_file_prefix():
 def test_url_to_mpd_path_strips_host_root_when_container_root_differs(monkeypatch):
     """When Beets stores host paths, strip MUSIC_PATH_HOST if MUSIC_ROOT does not match."""
     monkeypatch.setattr(music, "MUSIC_ROOT", "/music")
-    monkeypatch.setattr(music, "MUSIC_PATH_HOST", "/media/jack/buffer/audio")
-    url = "/media/jack/buffer/audio/metal/Metallica/Battery.mp3"
+    monkeypatch.setattr(music, "MUSIC_PATH_HOST", "/srv/music")
+    url = "/srv/music/metal/Metallica/Battery.mp3"
     assert music._url_to_mpd_path(url) == "metal/Metallica/Battery.mp3"
 
 
@@ -240,7 +240,7 @@ def test_mpd_connect_raises_after_two_failures():
 @pytest.mark.asyncio
 async def test_play_mpd_total_failure_returns_retryable():
     """MPD connection failure during play → retryable ToolResult."""
-    fake_track = {"id": 1, "title": "T", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/t.mp3", "score": 0.9}
+    fake_track = {"id": 1, "title": "T", "artist": "A", "album": "B", "url": "/srv/music/t.mp3", "score": 0.9}
     with (
         patch.object(music, "_sync_search", return_value=[fake_track]),
         patch.object(music, "_sync_play", side_effect=ConnectionRefusedError("mpd down")),
@@ -256,8 +256,8 @@ async def test_play_mpd_total_failure_returns_retryable():
 async def test_search_returns_ranked_results():
     """Search results are returned in rating-descending order."""
     ranked = [
-        {"id": 1, "title": "Popular Song", "artist": "Artist", "album": "Album", "url": "/media/jack/buffer/audio/a.mp3", "score": 0.9},
-        {"id": 2, "title": "Obscure Song", "artist": "Artist", "album": "Album", "url": "/media/jack/buffer/audio/b.mp3", "score": 0.76},
+        {"id": 1, "title": "Popular Song", "artist": "Artist", "album": "Album", "url": "/srv/music/a.mp3", "score": 0.9},
+        {"id": 2, "title": "Obscure Song", "artist": "Artist", "album": "Album", "url": "/srv/music/b.mp3", "score": 0.76},
     ]
     with patch.object(music, "_sync_search", return_value=ranked):
         result = await music.run({"action": "search", "query": "artist", "prompt": "artist"})
@@ -272,7 +272,7 @@ def test_artist_radio_seeded_determinism():
     """Same seed always returns the same track list."""
     songs = [
         {"id": i, "title": f"Song {i}", "artist": "TestBand", "album": "A",
-         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "rating": i * 10}
+         "url": f"/srv/music/s{i}.mp3", "score": 0.0, "rating": i * 10}
         for i in range(1, 20)
     ]
     with patch.object(music, "_sync_artist_songs", return_value=songs):
@@ -286,7 +286,7 @@ def test_artist_radio_no_duplicates():
     """Artist radio never returns the same song twice."""
     songs = [
         {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
-         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "rating": 1}
+         "url": f"/srv/music/s{i}.mp3", "score": 0.0, "rating": 1}
         for i in range(1, 8)
     ]
     with patch.object(music, "_sync_artist_songs", return_value=songs):
@@ -311,7 +311,7 @@ def test_artist_radio_default_target_is_adaptive(monkeypatch):
     monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
     songs = [
         {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
-         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.0, "rating": i}
+         "url": f"/srv/music/s{i}.mp3", "score": 0.0, "rating": i}
         for i in range(1, 41)
     ]
     with patch.object(music, "_sync_artist_songs", return_value=songs):
@@ -327,7 +327,7 @@ def test_weighted_unique_sample_never_underfills_target_under_skew():
             "title": f"Song {i}",
             "artist": "Band",
             "album": "A",
-            "url": f"/media/jack/buffer/audio/s{i}.mp3",
+            "url": f"/srv/music/s{i}.mp3",
             "score": 0.0,
             "rating": 1000 if i == 1 else 0.01,
         }
@@ -356,7 +356,7 @@ def test_artist_radio_default_target_not_underfilled_with_skew(monkeypatch):
             "title": f"Song {i}",
             "artist": "Band",
             "album": "A",
-            "url": f"/media/jack/buffer/audio/s{i}.mp3",
+            "url": f"/srv/music/s{i}.mp3",
             "score": 0.0,
             "rating": 500.0 if i == 1 else 0.01,
         }
@@ -380,7 +380,7 @@ def test_genre_radio_default_target_not_underfilled_with_skew(monkeypatch):
             "title": f"Song {i}",
             "artist": "Band",
             "album": "A",
-            "url": f"/media/jack/buffer/audio/s{i}.mp3",
+            "url": f"/srv/music/s{i}.mp3",
             "score": 0.0,
             "rating": 700.0 if i == 1 else 0.01,
         }
@@ -424,7 +424,7 @@ def test_sync_genre_songs_uses_genres_column_when_genre_missing(monkeypatch):
             "title": "Track 1",
             "artist": "Band",
             "album": "A",
-            "path": "/media/jack/buffer/audio/s1.mp3",
+            "path": "/srv/music/s1.mp3",
             "rating": 10,
         }
     ]
@@ -462,8 +462,8 @@ def test_resolve_genre_query_matches_taxonomy_term(monkeypatch):
 @pytest.mark.asyncio
 async def test_play_prefers_genre_first_when_query_matches_known_genre(monkeypatch):
     tracks = [
-        {"id": 1, "title": "Track 1", "artist": "Band", "album": "A", "url": "/media/jack/buffer/audio/t1.mp3", "score": 0.0, "rating": 10},
-        {"id": 2, "title": "Track 2", "artist": "Band", "album": "A", "url": "/media/jack/buffer/audio/t2.mp3", "score": 0.0, "rating": 8},
+        {"id": 1, "title": "Track 1", "artist": "Band", "album": "A", "url": "/srv/music/t1.mp3", "score": 0.0, "rating": 10},
+        {"id": 2, "title": "Track 2", "artist": "Band", "album": "A", "url": "/srv/music/t2.mp3", "score": 0.0, "rating": 8},
     ]
     monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: "metal")
 
@@ -483,11 +483,11 @@ async def test_play_prefers_genre_first_when_query_matches_known_genre(monkeypat
 @pytest.mark.asyncio
 async def test_play_michael_jackson_uses_artist_heuristic_when_not_genre(monkeypatch):
     search_results = [
-        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "/media/jack/buffer/audio/bj.mp3", "score": 0.9},
-        {"id": 11, "title": "Beat It", "artist": "Michael Jackson", "album": "Thriller", "url": "/media/jack/buffer/audio/bi.mp3", "score": 0.8},
+        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "/srv/music/bj.mp3", "score": 0.9},
+        {"id": 11, "title": "Beat It", "artist": "Michael Jackson", "album": "Thriller", "url": "/srv/music/bi.mp3", "score": 0.8},
     ]
     radio_tracks = [
-        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "/media/jack/buffer/audio/bj.mp3", "score": 0.0, "rating": 100},
+        {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "/srv/music/bj.mp3", "score": 0.0, "rating": 100},
     ]
     monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: None)
 
@@ -512,7 +512,7 @@ async def test_play_multiword_artist_prefers_artist_matches_even_when_title_hits
             "title": "24 Michael Jackson_ I Can't Help It",
             "artist": "DJ Jazzy Jeff & Mick Boogie",
             "album": "Mixtape",
-            "url": "/media/jack/buffer/audio/mix.mp3",
+            "url": "/srv/music/mix.mp3",
             "score": 0.9,
         },
         {
@@ -520,7 +520,7 @@ async def test_play_multiword_artist_prefers_artist_matches_even_when_title_hits
             "title": "Billie Jean",
             "artist": "Michael Jackson",
             "album": "Thriller",
-            "url": "/media/jack/buffer/audio/bj.mp3",
+            "url": "/srv/music/bj.mp3",
             "score": 0.8,
         },
     ]
@@ -530,7 +530,7 @@ async def test_play_multiword_artist_prefers_artist_matches_even_when_title_hits
             "title": "Billie Jean",
             "artist": "Michael Jackson",
             "album": "Thriller",
-            "url": "/media/jack/buffer/audio/bj.mp3",
+            "url": "/srv/music/bj.mp3",
             "score": 0.0,
             "rating": 100,
         }
@@ -571,9 +571,9 @@ def test_sync_play_tracks_skips_missing_mpd_paths():
 
     client = ClientWithMissingPath()
     tracks = [
-        {"url": "/media/jack/buffer/audio/ok/song1.mp3"},
-        {"url": "/media/jack/buffer/audio/missing/song.mp3"},
-        {"url": "/media/jack/buffer/audio/ok/song2.mp3"},
+        {"url": "/srv/music/ok/song1.mp3"},
+        {"url": "/srv/music/missing/song.mp3"},
+        {"url": "/srv/music/ok/song2.mp3"},
     ]
 
     with patch.object(music, "_mpd_connect", return_value=client):
@@ -588,7 +588,7 @@ async def test_play_falls_back_to_artist_radio():
     """When LIKE search returns nothing, fall back to artist radio."""
     tracks = [
         {"id": 1, "title": "Song", "artist": "Band", "album": "A",
-         "url": "/media/jack/buffer/audio/s.mp3", "score": 0.0, "rating": 1}
+         "url": "/srv/music/s.mp3", "score": 0.0, "rating": 1}
     ]
     with (
         patch.object(music, "_sync_search", return_value=[]),
@@ -605,7 +605,7 @@ async def test_play_falls_back_to_artist_radio():
 async def test_queue_artist_param_uses_queue_tracks_not_play_tracks():
     tracks = [
         {"id": 1, "title": "Song", "artist": "Band", "album": "A",
-         "url": "/media/jack/buffer/audio/s.mp3", "score": 0.0, "rating": 1}
+         "url": "/srv/music/s.mp3", "score": 0.0, "rating": 1}
     ]
     with (
         patch.object(music, "artist_radio", return_value=tracks),
@@ -622,7 +622,7 @@ async def test_queue_artist_param_uses_queue_tracks_not_play_tracks():
 async def test_queue_title_artist_miss_falls_back_to_queue_tracks():
     tracks = [
         {"id": 3, "title": "Song 3", "artist": "Band", "album": "A",
-         "url": "/media/jack/buffer/audio/s3.mp3", "score": 0.0, "rating": 1}
+         "url": "/srv/music/s3.mp3", "score": 0.0, "rating": 1}
     ]
     with (
         patch.object(music, "_sync_search_by_title_artist", return_value=[]),
@@ -645,7 +645,7 @@ async def test_queue_title_artist_miss_falls_back_to_queue_tracks():
 async def test_queue_year_range_uses_queue_tracks_not_play_tracks():
     pool = [
         {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
-         "url": f"/media/jack/buffer/audio/s{i}.mp3", "score": 0.9}
+         "url": f"/srv/music/s{i}.mp3", "score": 0.9}
         for i in range(1, 7)
     ]
     with (
@@ -663,7 +663,7 @@ async def test_queue_year_range_uses_queue_tracks_not_play_tracks():
 async def test_queue_no_results_falls_back_to_queue_tracks():
     tracks = [
         {"id": 2, "title": "Song", "artist": "Band", "album": "A",
-         "url": "/media/jack/buffer/audio/s2.mp3", "score": 0.0, "rating": 1}
+         "url": "/srv/music/s2.mp3", "score": 0.0, "rating": 1}
     ]
     with (
         patch.object(music, "_sync_search", return_value=[]),
@@ -683,8 +683,8 @@ async def test_queue_no_results_falls_back_to_queue_tracks():
 async def test_auto_pick_selects_first_result():
     """Multiple search results → auto-pick first (highest ranked)."""
     results = [
-        {"id": 10, "title": "Hit Song", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/hit.mp3", "score": 0.9},
-        {"id": 11, "title": "Other Song", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/other.mp3", "score": 0.76},
+        {"id": 10, "title": "Hit Song", "artist": "A", "album": "B", "url": "/srv/music/hit.mp3", "score": 0.9},
+        {"id": 11, "title": "Other Song", "artist": "A", "album": "B", "url": "/srv/music/other.mp3", "score": 0.76},
     ]
     with (
         patch.object(music, "_sync_search", return_value=results),
@@ -762,7 +762,7 @@ def test_sync_now_playing_includes_pos_and_volume():
 @pytest.mark.asyncio
 async def test_song_id_resolution():
     """Direct song_id lookup bypasses search and plays by id."""
-    track = {"id": 42, "title": "Direct Track", "artist": "A", "album": "B", "url": "/media/jack/buffer/audio/d.mp3", "score": 1.0}
+    track = {"id": 42, "title": "Direct Track", "artist": "A", "album": "B", "url": "/srv/music/d.mp3", "score": 1.0}
     with (
         patch.object(music, "_sync_get_by_id", return_value=track),
         patch.object(music, "_sync_play", return_value=None),

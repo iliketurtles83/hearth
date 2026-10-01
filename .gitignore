@@ -25,3 +25,6 @@ backend/models/whisper/
 caddy/certs/
 backend/tests/artifacts/tts-benchmark.json
 .aider*
+# MPD-saved playlists hold absolute host music paths — keep them out of git
+mpd/playlists/*
+!mpd/playlists/.gitkeep
