@@ -1371,7 +1371,6 @@ async def run(params: dict[str, Any]) -> ToolResult:
             except sqlite3.OperationalError:
                 return ToolResult.failure(
                     "Music library database is temporarily unavailable. Please retry.",
-                    retryable=True,
                 )
             if _year_tracks:
                 _rng = random.Random(int(time.time()))
