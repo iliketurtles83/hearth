@@ -1076,9 +1076,6 @@
       }).join('');
       list.querySelectorAll('.list-item-clickable').forEach(el => {
         el.addEventListener('click', () => {
-          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-            _ensureWebPlayerPlaying(true);
-          }
           musicControl('play_pos', { pos: parseInt(el.dataset.pos, 10) });
         });
       });
@@ -1432,6 +1429,13 @@
         credentials: 'same-origin',
         body: JSON.stringify({ action, ...extra }),
       });
+      // Reconnect the web stream only after MPD has switched tracks: connecting
+      // first (or keeping the old connection) plays the old track's buffered tail.
+      if (action === 'next' || action === 'previous' || action === 'play_pos') {
+        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+          _ensureWebPlayerPlaying(true);
+        }
+      }
       // Brief delay so MPD state settles before polling.
       const shouldAutoExpand = action === 'resume' || action === 'play_pos';
       setTimeout(() => { refreshNowPlaying(shouldAutoExpand); refreshQueue(); }, 400);
