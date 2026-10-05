@@ -90,10 +90,11 @@ def _load_helpers():
     lines = src.read_text().splitlines()
     # Find the function definitions and extract them.
     extracted: list[str] = [
-        "import os, sqlite3, shutil, subprocess, logging",
+        "import os, sqlite3, shutil, subprocess, logging, threading",
         "log = logging.getLogger('beets_startup_test')",
+        "_BEETS_UPDATE_LOCK = threading.Lock()",
     ]
-    targets = {"_beets_db_has_items", "_bootstrap_beets_library_if_empty", "run_beets_update"}
+    targets = {"_beets_db_has_items", "_beet_base_cmd", "_bootstrap_beets_library_if_empty", "run_beets_update", "_run_beets_update", "_stamp_beets_mtimes"}
     i = 0
     while i < len(lines):
         line = lines[i]
@@ -114,6 +115,7 @@ def _load_helpers():
 
     ns: dict = {}
     exec(compile("\n".join(extracted), str(src), "exec"), ns)  # noqa: S102
+    _load_helpers.ns = ns
     return (
         ns["_beets_db_has_items"],
         ns["_bootstrap_beets_library_if_empty"],
@@ -302,10 +304,10 @@ def test_beets_update_runs_update_then_import_no_autotag(tmp_path, monkeypatch):
     assert mock_run.call_count == 2
     first_cmd = mock_run.call_args_list[0][0][0]
     second_cmd = mock_run.call_args_list[1][0][0]
-    assert first_cmd[:3] == ["/usr/bin/beet", "-l", str(db)]
-    assert first_cmd[3:] == ["update", str(tmp_path)]
-    assert second_cmd[:3] == ["/usr/bin/beet", "-l", str(db)]
-    assert second_cmd[3:] == ["import", "-A", str(tmp_path)]
+    assert first_cmd[:5] == ["/usr/bin/beet", "-l", str(db), "-d", str(tmp_path)]
+    assert first_cmd[5:] == ["update"]
+    assert second_cmd[:5] == ["/usr/bin/beet", "-l", str(db), "-d", str(tmp_path)]
+    assert second_cmd[5:] == ["import", "-A", "-q", str(tmp_path)]
 
 
 def test_beets_update_reports_failure_stderr_tail(tmp_path, monkeypatch):
@@ -339,3 +341,45 @@ def test_beets_update_reports_timeout(tmp_path, monkeypatch):
 
     assert result["ok"] is False
     assert result["code"] == "BEETS_UPDATE_TIMEOUT"
+
+
+def test_beets_update_rejects_concurrent_run(tmp_path, monkeypatch):
+    monkeypatch.setenv("BEETS_DB_PATH", str(tmp_path / "library.db"))
+    monkeypatch.setenv("MUSIC_ROOT", str(tmp_path))
+    lock = _load_helpers.ns["_BEETS_UPDATE_LOCK"]
+
+    assert lock.acquire(blocking=False)
+    try:
+        with patch("subprocess.run") as mock_run:
+            result = run_beets_update()
+    finally:
+        lock.release()
+
+    assert result["ok"] is False
+    assert result["code"] == "BEETS_UPDATE_IN_PROGRESS"
+    mock_run.assert_not_called()
+
+
+def test_stamp_beets_mtimes_records_file_mtimes(tmp_path):
+    db = tmp_path / "library.db"
+    music = tmp_path / "music"
+    (music / "album").mkdir(parents=True)
+    track = music / "album" / "song.mp3"
+    track.write_bytes(b"x")
+    os.utime(track, (1_700_000_000, 1_700_000_000))
+
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, path BLOB, mtime REAL)")
+    conn.executemany(
+        "INSERT INTO items (id, path, mtime) VALUES (?, ?, 0)",
+        [(1, b"album/song.mp3"), (2, b"album/missing.mp3")],
+    )
+    conn.commit()
+    conn.close()
+
+    _load_helpers.ns["_stamp_beets_mtimes"](str(db), str(music))
+
+    conn = sqlite3.connect(db)
+    mtimes = dict(conn.execute("SELECT id, mtime FROM items").fetchall())
+    conn.close()
+    assert mtimes == {1: 1_700_000_000.0, 2: 0.0}

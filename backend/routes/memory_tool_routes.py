@@ -166,7 +166,7 @@ def create_memory_tool_router(
         result = await asyncio.to_thread(run_beets_update)
         if result.get("ok"):
             return JSONResponse(result)
-        status = 409 if result.get("code") in ("BEETS_MUSIC_ROOT_MISSING", "BEETS_NOT_FOUND") else 503
+        status = 409 if result.get("code") in ("BEETS_MUSIC_ROOT_MISSING", "BEETS_NOT_FOUND", "BEETS_UPDATE_IN_PROGRESS") else 503
         return JSONResponse(result, status_code=status)
 
     return router

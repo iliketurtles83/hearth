@@ -844,9 +844,10 @@ async def test_beets_update_endpoint_runs_update_and_import(tmp_path, monkeypatc
     assert mock_run.call_count == 2
     first_cmd = mock_run.call_args_list[0][0][0]
     second_cmd = mock_run.call_args_list[1][0][0]
-    assert first_cmd[:3] == ["/usr/bin/beet", "-l", str(db)]
-    assert first_cmd[3:] == ["update", str(music_root)]
-    assert second_cmd[3:] == ["import", "-A", str(music_root)]
+    assert first_cmd[:5] == ["/usr/bin/beet", "-l", str(db), "-d", str(music_root)]
+    assert first_cmd[-1] == "update"
+    assert second_cmd[:5] == first_cmd[:5]
+    assert second_cmd[-4:] == ["import", "-A", "-q", str(music_root)]
 
 
 @pytest.mark.asyncio
