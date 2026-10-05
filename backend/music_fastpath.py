@@ -16,6 +16,22 @@ MUSIC_CTRL: dict[str, str] = {
     "shuffle": "shuffle",
 }
 
+# Control commands the LLM tool schema may pass directly as `action`.
+CONTROL_ACTIONS = frozenset({*MUSIC_CTRL.values(), "previous", "clear"})
+
+
+def normalize_music_action(params: dict) -> dict:
+    """Map schema-level control actions (action="pause") onto action="control".
+
+    The music tool schema lists pause/resume/next/... as actions, but the tool
+    and response formatter expect {"action": "control", "control": <cmd>}.
+    """
+    action = params.get("action")
+    if action in CONTROL_ACTIONS:
+        params["control"] = params.get("control") or action
+        params["action"] = "control"
+    return params
+
 def parse_music_command(prompt: str, allow_vague: bool = False) -> dict | None:
     """Deterministically parse literal machine playback controls.
 
@@ -83,6 +99,18 @@ def format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:
         track = data.get("track")
         tracks = data.get("tracks")
         verb = "Queued" if data_action == "queue" else "Now playing"
+        count = len(tracks) if tracks else 0
+        noun = "track" if count == 1 else "tracks"
+        playlist = data.get("playlist")
+        if isinstance(playlist, str) and playlist:
+            return f'{verb} playlist "{playlist}" ({count} {noun}).'
+        album = data.get("album")
+        if isinstance(album, str) and album and count:
+            by = f' by {data["album_artist"]}' if data.get("album_artist") else ""
+            total = data.get("album_total")
+            if isinstance(total, int) and total > count:
+                return f'{verb} {count} of {total} tracks from "{album}"{by}.'
+            return f'{verb} the album "{album}"{by} ({count} {noun}).'
         if tracks and len(tracks) > 1:
             genre = data.get("genre")
             if isinstance(genre, str) and genre.strip():
