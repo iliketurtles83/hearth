@@ -16,22 +16,15 @@ Covers:
 from __future__ import annotations
 
 import json
-import sys
-import types
 
 import httpx
 import pytest
 import respx
 
-# ── Stub the memory module so we don't import chromadb in tests ───────────────
-# We only need the get_preference/set_preference interface.
-_memory_stub = types.ModuleType("memory")
-sys.modules.setdefault("memory", _memory_stub)
-
 # ── Import the module under test ──────────────────────────────────────────────
 # tools/__init__.py calls _auto_register() which imports tools.weather;
 # weather.py calls _registry.register() on itself. Import order matters.
-import tools  # noqa: E402  (must be after stub)
+import tools
 import tools.weather as w  # noqa: E402
 
 

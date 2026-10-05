@@ -27,7 +27,8 @@ if "musicpd" not in sys.modules:
     sys.modules["musicpd"] = fake_musicpd
 
 
-if "memory" not in sys.modules:
+_stub_memory = "memory" not in sys.modules
+if _stub_memory:
     memory_stub = types.ModuleType("memory")
 
     class _FakeMemoryStore:
@@ -44,6 +45,11 @@ os.environ["CHROMA_PATH"] = os.path.join(_tmp_dir, "chroma")
 os.environ["AUTH_DB_PATH"] = os.path.join(_tmp_dir, "auth.db")
 
 import main  # noqa: E402
+
+# main has bound the fake MemoryStore; drop the stub so later test files
+# importing the real memory module are not affected.
+if _stub_memory:
+    sys.modules.pop("memory", None)
 
 
 def _route_endpoint(path: str, method: str):

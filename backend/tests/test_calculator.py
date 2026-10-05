@@ -1,11 +1,4 @@
 import pytest
-import sys
-
-class _FakeMemory:
-    pass
-
-# Stub out chromadb / memory loading
-sys.modules["memory"] = _FakeMemory()
 
 from tools.calculator import run, format_calculator_response
 from tools.base import ToolResult
