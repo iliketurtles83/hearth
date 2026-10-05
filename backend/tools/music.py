@@ -83,6 +83,7 @@ Normalized ToolResult.data schemas:
 from __future__ import annotations
 
 import asyncio
+import difflib
 from functools import lru_cache
 import logging
 import os
@@ -94,7 +95,7 @@ from typing import Any
 
 import musicpd
 
-from music_fastpath import parse_music_command
+from music_fastpath import normalize_music_action, parse_music_command
 import tools as _registry
 from tools.base import ToolResult
 
@@ -461,6 +462,103 @@ def _sync_genre_songs(genre: str) -> list[dict[str, Any]]:
         conn.close()
 
 
+def _album_name_variants(name: str) -> list[str]:
+    """Lower-cased album names to try, with and without a leading "the"."""
+    base = name.strip().lower()
+    if base.startswith("the "):
+        return [base, base[4:].strip()]
+    return [base, f"the {base}"]
+
+
+def _sync_album_tracks(
+    name: str,
+    artist: str | None = None,
+    exact: bool = True,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Resolve one album and return (album name, tracks in disc/track order).
+
+    exact=True matches the album name case-insensitively (± a leading "the");
+    exact=False also accepts substring matches. Ranking: the literal name, then
+    the "the"-toggled name, then the shortest name, then the most tracks. An optional artist narrows by track or album artist.
+    Returns ("", []) when nothing matches.
+    Raises sqlite3.OperationalError if the DB is temporarily locked.
+    """
+    columns = _beets_columns()
+    if "album" not in columns or not name.strip():
+        return "", []
+    group_col = "album_id" if "album_id" in columns else "album"
+    variants = _album_name_variants(name)
+    placeholders = ", ".join("?" for _ in variants)
+
+    if exact:
+        where = f"lower(album) IN ({placeholders})"
+        args: list[Any] = list(variants)
+    else:
+        where = f"(lower(album) IN ({placeholders}) OR album LIKE ?)"
+        args = [*variants, f"%{name.strip()}%"]
+    if artist:
+        artist_cols = ["artist"] + (["albumartist"] if "albumartist" in columns else [])
+        where += " AND (" + " OR ".join(f"{c} LIKE ?" for c in artist_cols) + ")"
+        args += [f"%{artist.strip()}%"] * len(artist_cols)
+
+    conn = _open_beets()
+    try:
+        # Column names come from the fixed set above; values are parameterised.
+        pick = conn.execute(
+            f"""
+            SELECT {group_col} AS album_key, album, COUNT(*) AS n,
+                   MAX(CASE WHEN lower(album) = ? THEN 2
+                            WHEN lower(album) IN ({placeholders}) THEN 1 ELSE 0 END) AS is_exact
+            FROM items
+            WHERE {where} AND album IS NOT NULL AND album != ''
+            GROUP BY {group_col}
+            ORDER BY is_exact DESC, length(album) ASC, n DESC
+            LIMIT 1
+            """,  # nosec B608
+            (variants[0], *variants, *args),
+        ).fetchone()
+        if not pick:
+            return "", []
+
+        order_cols = [c for c in ("disc", "track") if c in columns] + ["title"]
+        rows = conn.execute(
+            f"""
+            SELECT id, title, artist, album, path
+            FROM items
+            WHERE {group_col} = ?
+            ORDER BY {", ".join(order_cols)}
+            """,  # nosec B608
+            (pick["album_key"],),
+        ).fetchall()
+        return pick["album"] or "", [_row_to_track(row, 0.95) for row in rows]
+    finally:
+        conn.close()
+
+
+def _sync_is_title_or_artist(name: str, artist: str | None = None) -> bool:
+    """True if `name` is exactly a track title (optionally by `artist`) or an artist.
+
+    Guards implicit album matches: "play Weezer" means the artist, not the
+    self-titled album, and an exact song title beats a same-named album.
+    """
+    conn = _open_beets()
+    try:
+        n = name.strip().lower()
+        if artist:
+            row = conn.execute(
+                "SELECT 1 FROM items WHERE lower(title) = ? AND artist LIKE ? LIMIT 1",
+                (n, f"%{artist.strip()}%"),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM items WHERE lower(title) = ? OR lower(artist) = ? LIMIT 1",
+                (n, n),
+            ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 # ── Artist radio ───────────────────────────────────────────────────────────────
 
 def _playlist_pick_count(pool_size: int, requested_n: int | None = None) -> int:
@@ -770,6 +868,65 @@ def _sync_queue_tracks(tracks: list[dict[str, Any]]) -> dict[str, Any]:
     return _with_mpd(_fn)
 
 
+def _sync_list_playlists() -> list[str]:
+    """Return the names of MPD stored playlists (playlist_directory .m3u files)."""
+    def _fn(c: musicpd.MPDClient) -> list[str]:
+        return [str(p["playlist"]) for p in c.listplaylists() if p.get("playlist")]
+    return _with_mpd(_fn)
+
+
+def _match_playlist(name: str, available: list[str], fuzzy: bool) -> str | None:
+    """Pick the stored playlist `name` refers to, case-insensitively.
+
+    Exact match always counts. With fuzzy=True (the user said "playlist" /
+    "mixtape"), also accept containment and close spellings.
+    """
+    want = name.strip().lower()
+    if not want:
+        return None
+    by_lower = {p.lower(): p for p in available}
+    if want in by_lower:
+        return by_lower[want]
+    if not fuzzy:
+        return None
+    contains = [p for p in available if want in p.lower() or p.lower() in want]
+    if len(contains) == 1:
+        return contains[0]
+    close = difflib.get_close_matches(want, list(by_lower), n=1, cutoff=0.75)
+    return by_lower[close[0]] if close else None
+
+
+def _sync_load_playlist(name: str, replace: bool = True) -> dict[str, Any]:
+    """Load a stored playlist in order. replace=True clears the queue and plays."""
+    def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
+        entries = c.listplaylistinfo(name)
+        if not entries:
+            raise FileNotFoundError(f"Playlist '{name}' is empty")
+        tracks = [
+            {
+                "title": e.get("title") or os.path.basename(str(e.get("file", ""))),
+                "artist": e.get("artist", ""),
+                "album": e.get("album", ""),
+            }
+            for e in entries
+        ]
+        if replace:
+            c.clear()
+        c.load(name)
+        if not replace:
+            return {"queued_tracks": tracks}
+        c.play()
+        status = c.status()
+        return {
+            "state": status.get("state", "stop"),
+            "elapsed": float(status.get("elapsed", 0)),
+            "duration": float(status["duration"]) if "duration" in status else None,
+            "queued_tracks": tracks,
+        }
+
+    return _with_mpd(_fn)
+
+
 def _sync_get_outputs() -> list[dict[str, Any]]:
     """Return all MPD audio outputs and their current status."""
     def _fn(c: musicpd.MPDClient) -> list[dict[str, Any]]:
@@ -969,6 +1126,64 @@ def _extract_search_query(prompt: str) -> str:
     return cleaned
 
 
+_ALBUM_WORD = r"(?:album|record|lp)"
+_WHOLE_WORD = r"(?:whole|full|entire|complete)"
+_PLAYLIST_WORD = r"(?:mix\s*tape|playlist)"
+
+_ALBUM_PREFIX_RE = re.compile(
+    rf"^(?:(?:the|my|that)\s+)?(?:{_WHOLE_WORD}\s+)?{_ALBUM_WORD}\s+(?:called\s+|named\s+)?(?P<name>.+)$",
+    re.IGNORECASE,
+)
+_ALBUM_SUFFIX_RE = re.compile(
+    rf"^(?:(?:the|my|that)\s+)?(?:{_WHOLE_WORD}\s+)?(?P<name>.+?)\s+{_ALBUM_WORD}$",
+    re.IGNORECASE,
+)
+_ALBUM_WHOLE_RE = re.compile(rf"^(?:the\s+)?{_WHOLE_WORD}\s+(?P<name>.+)$", re.IGNORECASE)
+_PLAYLIST_PREFIX_RE = re.compile(
+    rf"^(?:(?:the|my)\s+)?{_PLAYLIST_WORD}\s+(?:called\s+|named\s+)?(?P<name>.+)$",
+    re.IGNORECASE,
+)
+_PLAYLIST_SUFFIX_RE = re.compile(
+    rf"^(?:(?:the|my)\s+)?(?P<name>.+?)\s+{_PLAYLIST_WORD}$", re.IGNORECASE
+)
+# "mix" is a weak cue ("a jazz mix" is genre radio), so only the suffix form counts.
+_MIX_SUFFIX_RE = re.compile(r"^(?:(?:the|my)\s+)?(?P<name>.+?)\s+mix$", re.IGNORECASE)
+_FILLER_NAMES = frozenset({"the", "my", "that", "this", "a", "an", "whole", "full"})
+_BY_ARTIST_RE = re.compile(r"^(?P<name>.+?)\s+by\s+(?P<artist>.+)$", re.IGNORECASE)
+
+
+def _parse_collection_request(query: str) -> dict[str, Any] | None:
+    """Detect an explicit album or stored-playlist request in a cleaned query.
+
+    Returns {"kind": "album", "name", "artist"} or
+    {"kind": "playlist", "name", "weak"} (weak = only the word "mix" was used),
+    or None for ordinary track/artist/genre queries.
+    """
+    q = query.strip().strip("\"' .,!?")
+    if not q:
+        return None
+
+    for rx in (_PLAYLIST_PREFIX_RE, _PLAYLIST_SUFFIX_RE):
+        m = rx.match(q)
+        if m and m.group("name").strip("\"' ").lower() not in _FILLER_NAMES:
+            return {"kind": "playlist", "name": m.group("name").strip("\"' "), "weak": False}
+
+    for rx in (_ALBUM_PREFIX_RE, _ALBUM_SUFFIX_RE, _ALBUM_WHOLE_RE):
+        m = rx.match(q)
+        if m and m.group("name").strip("\"' ").lower() not in _FILLER_NAMES:
+            name = m.group("name").strip("\"' ")
+            artist = None
+            by_m = _BY_ARTIST_RE.match(name)
+            if by_m:
+                name, artist = by_m.group("name").strip("\"' "), by_m.group("artist").strip("\"' ")
+            return {"kind": "album", "name": name, "artist": artist}
+
+    m = _MIX_SUFFIX_RE.match(q)
+    if m and m.group("name").strip("\"' ").lower() not in _FILLER_NAMES:
+        return {"kind": "playlist", "name": m.group("name").strip("\"' "), "weak": True}
+    return None
+
+
 # ── MPD error classification ───────────────────────────────────────────────────
 
 def _is_mpd_connection_error(exc: Exception) -> bool:
@@ -1003,6 +1218,98 @@ def _add_mpd_paths(client: musicpd.MPDClient, paths: list[str]) -> list[str]:
     return added
 
 
+# ── Album / stored playlist playback ───────────────────────────────────────────
+
+async def _start_ordered_tracks(
+    tracks: list[dict[str, Any]],
+    action: str | None,
+    extra: dict[str, Any],
+    log_tag: str,
+) -> ToolResult:
+    """Play (replace queue) or queue `tracks` in the given order."""
+    try:
+        if action == "queue":
+            q_result = await asyncio.to_thread(_sync_queue_tracks, tracks)
+            queued = q_result.get("queued_tracks", tracks)
+            mpd_status: dict[str, Any] = {}
+        else:
+            mpd_status = await asyncio.to_thread(_sync_play_tracks, tracks)
+            queued = mpd_status.pop("queued_tracks", tracks)
+    except FileNotFoundError as exc:
+        log.warning("music.%s | library_miss=%s", log_tag, exc)
+        return ToolResult.failure("No matching tracks are available in the Beets library.", retryable=False)
+    except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+        log.warning("music.%s | mpd_error=%s", log_tag, exc)
+        return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+    return ToolResult(ok=True, data={
+        "action": "queue" if action == "queue" else "play",
+        "track": queued[0],
+        "tracks": queued,
+        "confidence": 0.95,
+        "picked_from": len(queued),
+        **extra,
+        **mpd_status,
+    })
+
+
+async def _play_album(
+    name: str, artist: str | None, action: str | None, exact: bool
+) -> ToolResult | None:
+    """Play/queue a whole album in disc/track order; None if no album matches.
+
+    Raises sqlite3.OperationalError if the DB is temporarily locked.
+    """
+    album_name, tracks = await asyncio.to_thread(_sync_album_tracks, name, artist, exact)
+    if not tracks:
+        return None
+    artists = {t["artist"] for t in tracks if t["artist"]}
+    log.info(
+        "music.album | query=%r artist=%r exact=%s album=%r tracks=%d artists=%d",
+        name, artist, exact, album_name, len(tracks), len(artists),
+    )
+    return await _start_ordered_tracks(
+        tracks,
+        action,
+        {"album": album_name, "album_artist": next(iter(artists)) if len(artists) == 1 else None},
+        "album",
+    )
+
+
+async def _play_playlist(name: str, action: str | None) -> ToolResult:
+    """Play/queue an MPD stored playlist by its exact (canonical) name."""
+    try:
+        result = await asyncio.to_thread(_sync_load_playlist, name, action != "queue")
+    except FileNotFoundError:
+        return ToolResult.failure(f"The playlist '{name}' is empty.", retryable=False)
+    except (musicpd.ConnectionError, ConnectionRefusedError, OSError) as exc:
+        log.warning("music.playlist | name=%r mpd_error=%s", name, exc)
+        return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+    queued = result.pop("queued_tracks")
+    log.info("music.playlist | name=%r action=%s tracks=%d", name, action, len(queued))
+    return ToolResult(ok=True, data={
+        "action": "queue" if action == "queue" else "play",
+        "track": queued[0],
+        "tracks": queued,
+        "playlist": name,
+        "confidence": 1.0,
+        "picked_from": len(queued),
+        **result,
+    })
+
+
+async def _find_playlist(name: str, fuzzy: bool) -> tuple[str | None, list[str]]:
+    """Return (matched stored playlist, all playlist names).
+
+    MPD errors propagate for explicit requests; implicit probes catch them.
+    """
+    available = await asyncio.to_thread(_sync_list_playlists)
+    return _match_playlist(name, available, fuzzy), available
+
+
+def _strip_owner(text: str) -> str:
+    return re.sub(r"^(?:my|the)\s+", "", text.strip(), flags=re.IGNORECASE)
+
+
 # ── Tool entry point ───────────────────────────────────────────────────────────
 
 async def run(params: dict[str, Any]) -> ToolResult:
@@ -1016,7 +1323,10 @@ async def run(params: dict[str, Any]) -> ToolResult:
       control  (str|None)  — explicit control command: pause|resume|next|stop
       song_id  (int|None)  — Phase 8b: direct id lookup, bypass search
       artist   (str|None)  — Phase 8b: trigger artist_radio() directly
+      album    (str|None)  — play/queue a whole album in track order
+      playlist (str|None)  — play/queue an MPD stored playlist ("mixtape")
     """
+    normalize_music_action(params)
     prompt: str = params.get("prompt", "")
     action: str | None = params.get("action")
     query: str | None = params.get("query")
@@ -1026,6 +1336,8 @@ async def run(params: dict[str, Any]) -> ToolResult:
     # Compound search params set by the deterministic pre-router.
     artist_filter: str | None = params.get("artist_filter")  # paired with query
     year_range: tuple | list | None = params.get("year_range")  # (start, end)
+    album_param: str | None = params.get("album")
+    playlist_param: str | None = params.get("playlist")
 
     log.info("music.run | prompt=%r action=%s", prompt[:80], action)
 
@@ -1174,6 +1486,54 @@ async def run(params: dict[str, Any]) -> ToolResult:
             log.warning("music.song_id_play | mpd_error=%s", exc)
             return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
 
+    # ── Explicit album / stored playlist ("mixtape") requests ─────────────────
+    collection: dict[str, Any] | None = None
+    if playlist_param:
+        collection = {"kind": "playlist", "name": playlist_param, "weak": False}
+    elif album_param:
+        collection = {"kind": "album", "name": album_param, "artist": None}
+    elif action in ("play", "queue") and year_range is None:
+        collection = _parse_collection_request(query or _extract_search_query(prompt))
+        # "<title> by <artist>" requests are never stored playlists.
+        if collection and collection["kind"] == "playlist" and artist_filter:
+            collection = None
+
+    if collection and collection["kind"] == "album":
+        album_artist = collection.get("artist") or artist_filter or artist_param
+        try:
+            album_result = await _play_album(collection["name"], album_artist, action, exact=False)
+        except sqlite3.OperationalError:
+            return ToolResult.failure(
+                "Music library database is temporarily unavailable. Please retry.",
+                retryable=True,
+            )
+        if album_result is not None:
+            return album_result
+        by = f" by '{album_artist}'" if album_artist else ""
+        return ToolResult.failure(
+            f"No album matching '{collection['name']}'{by} in the library.", retryable=False
+        )
+
+    if collection and collection["kind"] == "playlist":
+        try:
+            match, available = await _find_playlist(collection["name"], fuzzy=True)
+        except Exception as exc:
+            if not collection["weak"]:
+                log.warning("music.playlist_list | mpd_error=%s", exc)
+                return ToolResult.failure("Could not reach MPD — is it running?", retryable=True)
+            match, available = None, []
+        if match:
+            return await _play_playlist(match, action)
+        if not collection["weak"]:
+            names = ", ".join(sorted(available)) if available else "none saved yet"
+            return ToolResult.failure(
+                f"No playlist called '{collection['name']}'. Available playlists: {names}.",
+                retryable=False,
+            )
+        # Weak "<x> mix" with no such playlist: "a jazz mix" → genre radio for "jazz".
+        if _resolve_genre_query(collection["name"]):
+            query = collection["name"]
+
     # ── Phase 8b: artist radio (called directly from 8b fallback) ─────────────
     if artist_param:
         try:
@@ -1212,6 +1572,15 @@ async def run(params: dict[str, Any]) -> ToolResult:
 
     # ── Compound title + artist search ("title by artist") ────────────────────
     if artist_filter and query:
+        # "Kind of Blue by Miles Davis": an exact album name wins unless a
+        # track by that artist has exactly that title.
+        try:
+            if not await asyncio.to_thread(_sync_is_title_or_artist, query, artist_filter):
+                album_result = await _play_album(query, artist_filter, action, exact=True)
+                if album_result is not None:
+                    return album_result
+        except sqlite3.Error as exc:
+            log.info("music.album_probe_skipped | query=%r error=%s", query, exc)
         try:
             results = await asyncio.to_thread(_sync_search_by_title_artist, query, artist_filter)
         except sqlite3.OperationalError:
@@ -1337,8 +1706,29 @@ async def run(params: dict[str, Any]) -> ToolResult:
     if not q:
         return ToolResult.failure("No track or artist specified.", retryable=False)
 
+    # A bare stored-playlist name ("play chill") beats genre/DB matching.
+    try:
+        playlist_match, _ = await _find_playlist(_strip_owner(q), fuzzy=False)
+    except Exception as exc:
+        log.info("music.playlist_probe_skipped | query=%r error=%s", q, exc)
+        playlist_match = None
+    if playlist_match:
+        return await _play_playlist(playlist_match, action)
+
     # Genre-first resolver path for ambiguous playback requests.
     genre_match = _resolve_genre_query(q)
+
+    # Exact album name ("play Abbey Road") — unless it is also an artist or a
+    # track title, so self-titled albums keep meaning the artist.
+    if not genre_match:
+        try:
+            if not await asyncio.to_thread(_sync_is_title_or_artist, q):
+                album_result = await _play_album(q, None, action, exact=True)
+                if album_result is not None:
+                    return album_result
+        except sqlite3.Error as exc:
+            log.info("music.album_probe_skipped | query=%r error=%s", q, exc)
+
     if not genre_match and action != "queue":
         # Safety-net: if taxonomy matching misses, probe DB genre column directly.
         try:

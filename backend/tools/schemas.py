@@ -50,11 +50,19 @@ HEARTH_TOOLS: list[dict[str, Any]] = [
                     },
                     "query": {
                         "type": "string",
-                        "description": "Track title, album, artist, or genre to search and play/queue",
+                        "description": "Track title, artist, or genre to search and play/queue",
                     },
                     "artist": {
                         "type": "string",
-                        "description": "Specific artist name if requesting songs by an artist",
+                        "description": "Artist name: alone plays a mix of their songs; with query or album it narrows the match",
+                    },
+                    "album": {
+                        "type": "string",
+                        "description": "Album or compilation name when the user asks for a whole album/record; plays it in track order",
+                    },
+                    "playlist": {
+                        "type": "string",
+                        "description": "Name of a saved playlist or mixtape (e.g. 'chill' for 'my chill mixtape')",
                     },
                 },
                 "required": ["action"],

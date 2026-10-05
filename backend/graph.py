@@ -53,7 +53,7 @@ from tools.timer import format_timer_response
 from tools.calculator import format_calculator_response
 from tools.datetime_tool import format_datetime_response
 from tools.schemas import HEARTH_TOOLS
-from music_fastpath import format_music_response
+from music_fastpath import format_music_response, normalize_music_action
 
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
@@ -976,9 +976,16 @@ def build_assistant_graph(
                     "prompt": state["message"],
                     "action": t_args.get("action", "play"),
                     "query": t_args.get("query"),
-                    "artist": t_args.get("artist"),
+                    "album": t_args.get("album"),
+                    "playlist": t_args.get("playlist"),
                     "user_id": state["user_id"],
                 }
+                # artist alone → artist radio; artist + query → "title by artist".
+                if t_args.get("query") and t_args.get("artist"):
+                    t_params["artist_filter"] = t_args.get("artist")
+                else:
+                    t_params["artist"] = t_args.get("artist")
+                normalize_music_action(t_params)
                 tool_result = await deps.tool_dispatch("music", t_params)
                 res = format_music_response(tool_result, t_params)
                 writer({"text": res})
