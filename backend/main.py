@@ -18,6 +18,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -289,6 +290,20 @@ def _beets_db_has_items(db_path: str) -> bool:
             conn.close()
 
 
+def _beet_base_cmd(beet_bin: str, beets_db: str, music_root: str) -> list[str]:
+    """Common ``beet`` prefix: library DB, library directory, and repo config.
+
+    ``-d`` pins the library directory so beets never falls back to ~/Music
+    (which triggers an interactive "continue?" prompt).  ``BEETS_CONFIG_PATH``
+    points at the repo's config.yaml (quiet import, duplicate_action: skip).
+    """
+    cmd = [beet_bin, "-l", beets_db, "-d", music_root]
+    config_path = os.getenv("BEETS_CONFIG_PATH", "").strip()
+    if config_path and os.path.isfile(config_path):
+        cmd += ["-c", config_path]
+    return cmd
+
+
 def _bootstrap_beets_library_if_empty() -> None:
     """Run `beet import -A` once when the Beets library database is empty."""
     beets_db = os.getenv(
@@ -329,7 +344,7 @@ def _bootstrap_beets_library_if_empty() -> None:
         )
         return
 
-    cmd = [beet_bin, "-l", beets_db, "import", "-A", music_root]
+    cmd = _beet_base_cmd(beet_bin, beets_db, music_root) + ["import", "-A", "-q", music_root]
     log.info("beets.bootstrap_start | db=%s music_root=%s", beets_db, music_root)
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -340,10 +355,29 @@ def _bootstrap_beets_library_if_empty() -> None:
         log.warning("beets.bootstrap_failed | db=%s error=%s", beets_db, tail)
 
 
+_BEETS_UPDATE_LOCK = threading.Lock()
+
+
 def run_beets_update() -> dict:
     """Manually sync the Beets library with MUSIC_ROOT (settings-menu action).
 
-    Runs ``beet update`` (re-index moved/renamed files; never autotags) and
+    Only one sync runs at a time; a concurrent request (another tab, a reload)
+    gets ``BEETS_UPDATE_IN_PROGRESS`` instead of a sqlite "database is locked".
+    """
+    if not _BEETS_UPDATE_LOCK.acquire(blocking=False):
+        return {
+            "ok": False,
+            "code": "BEETS_UPDATE_IN_PROGRESS",
+            "error": "A music library update is already running.",
+        }
+    try:
+        return _run_beets_update()
+    finally:
+        _BEETS_UPDATE_LOCK.release()
+
+
+def _run_beets_update() -> dict:
+    """Run ``beet update`` (re-index moved/renamed files; never autotags) and
     then ``beet import -A`` (add new files without autotagging, matching the
     bootstrap import flags).  Returns a JSON-ready dict.
     """
@@ -367,9 +401,10 @@ def run_beets_update() -> dict:
             "error": "beet not found in PATH.",
         }
 
+    base_cmd = _beet_base_cmd(beet_bin, beets_db, music_root)
     commands = [
-        [beet_bin, "-l", beets_db, "update", music_root],
-        [beet_bin, "-l", beets_db, "import", "-A", music_root],
+        base_cmd + ["update"],
+        base_cmd + ["import", "-A", "-q", music_root],
     ]
     log.info("beets.update_start | db=%s music_root=%s", beets_db, music_root)
     last_line = ""
@@ -397,8 +432,37 @@ def run_beets_update() -> dict:
             last_line = out[-1]
             log.info("beets.update_step_done | cmd=%s tail=%s", " ".join(cmd), last_line)
 
+    _stamp_beets_mtimes(beets_db, music_root)
     log.info("beets.update_done | db=%s", beets_db)
     return {"ok": True, "summary": last_line}
+
+
+def _stamp_beets_mtimes(beets_db: str, music_root: str) -> None:
+    """Record each file's current mtime after a successful sync.
+
+    beets 2.x ``update`` only stores media fields, so ``mtime`` stays 0 for
+    unchanged files and every later update re-reads every tag (~1h on a NAS).
+    Stamping lets the next update skip files that haven't changed.
+    """
+    conn: sqlite3.Connection | None = None
+    try:
+        conn = sqlite3.connect(beets_db, timeout=30)
+        rows = conn.execute("SELECT id, path FROM items").fetchall()
+        updates = []
+        for item_id, raw_path in rows:
+            rel = os.fsdecode(raw_path) if isinstance(raw_path, bytes) else str(raw_path or "")
+            try:
+                updates.append((os.path.getmtime(os.path.join(music_root, rel)), item_id))
+            except OSError:
+                continue
+        conn.executemany("UPDATE items SET mtime = ? WHERE id = ?", updates)
+        conn.commit()
+        log.info("beets.mtime_stamp_done | items=%d", len(updates))
+    except sqlite3.Error as exc:
+        log.warning("beets.mtime_stamp_failed | db=%s error=%s", beets_db, exc)
+    finally:
+        if conn is not None:
+            conn.close()
 
 
 def _validate_startup() -> None:

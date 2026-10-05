@@ -70,6 +70,8 @@ services:
       - AUTH_DB_PATH=/tmp/hearth/auth.db
       - MUSIC_ROOT=/music
       - BEETSDIR=/beets
+      # Repo beets config (quiet import, duplicate_action: skip) passed via -c.
+      - BEETS_CONFIG_PATH=/etc/hearth/beets-config.yaml
       - MPD_HOST=mpd
       - TTS_ENGINE=${TTS_ENGINE:-kokoro}
       - TTS_KOKORO_MODEL=${TTS_KOKORO_MODEL:-/app/models/tts/kokoro-v1.0.int8.onnx}
@@ -89,9 +91,11 @@ services:
         target: /music
         bind:
           create_host_path: false
-      # Beets library DB directory — mounted read-only so backend can query items.
+      # Beets library DB directory — read-write: the backend queries items and the
+      # settings-menu library sync runs `beet` and stamps file mtimes into it.
       # Set BEETS_DB_DIR in .env to the directory containing library.db.
       - ${BEETS_DB_DIR}:/beets
+      - ./config.yaml:/etc/hearth/beets-config.yaml:ro
     healthcheck:
       test:
         [
