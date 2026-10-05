@@ -855,3 +855,102 @@ def test_sync_control_clear():
         music._sync_control("clear")
     client.clear.assert_called_once()
 
+
+
+# ── Genre spelling variants + exact-title search ranking ───────────────────────
+
+def _beets_db(tmp_path, rows: list[tuple]) -> str:
+    """Create a minimal Beets items table; rows are (title, artist, album, genres)."""
+    db = tmp_path / "library.db"
+    conn = sqlite3.connect(db)
+    conn.execute(
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, title TEXT, artist TEXT, album TEXT,"
+        " path BLOB, genres TEXT, rating REAL)"
+    )
+    conn.executemany(
+        "INSERT INTO items (title, artist, album, path, genres, rating) VALUES (?, ?, ?, ?, ?, 0)",
+        [(t, a, al, f"/srv/music/{t}.mp3".encode(), g) for t, a, al, g in rows],
+    )
+    conn.commit()
+    conn.close()
+    return str(db)
+
+
+@pytest.fixture
+def real_beets(tmp_path, monkeypatch):
+    def _install(rows: list[tuple]) -> None:
+        path = _beets_db(tmp_path, rows)
+
+        def _open():
+            conn = sqlite3.connect(path)
+            conn.row_factory = sqlite3.Row
+            return conn
+
+        monkeypatch.setattr(music, "_open_beets", _open)
+        monkeypatch.setattr(
+            music, "_beets_columns", lambda: {"id", "title", "artist", "album", "path", "genres", "rating"}
+        )
+
+    return _install
+
+
+@pytest.mark.parametrize("variant", [
+    "drum & bass", "Drum and Bass", "drum n bass", "drum 'n' bass", "drum'n'bass", "drum&bass", "dnb", "D&B",
+])
+def test_canonical_genre_unifies_drum_and_bass(variant):
+    assert music._canonical_genre(variant) == "drum & bass"
+
+
+@pytest.mark.parametrize("variant", ["rock & roll", "rock and roll", "rock n roll", "Rock 'N' Roll", "rock'n'roll"])
+def test_canonical_genre_unifies_rock_and_roll(variant):
+    assert music._canonical_genre(variant) == "rock & roll"
+
+
+def test_canonical_genre_leaves_short_ampersand_names_alone():
+    assert music._canonical_genre("Contemporary R&B") == "contemporary r&b"
+
+
+@pytest.mark.parametrize("query", ["dnb", "drum and bass", "drum n bass", "drum&bass"])
+def test_sync_genre_songs_matches_every_tag_spelling(real_beets, query):
+    real_beets([
+        ("A", "X", "L", "Drum & Bass"),
+        ("B", "X", "L", "Drum And Bass/Electronic"),
+        ("C", "X", "L", "Drum 'n Bass"),
+        ("D", "X", "L", "Drum Kit Bassline Pop"),  # LIKE "%drum%bass%" hit, not drum & bass
+        ("E", "X", "L", "Rock"),
+    ])
+    titles = sorted(t["title"] for t in music._sync_genre_songs(query))
+    assert titles == ["A", "B", "C"]
+
+
+def test_sync_genre_songs_rock_and_roll_variants_share_one_set(real_beets):
+    real_beets([
+        ("A", "X", "L", "Rock & Roll"),
+        ("B", "X", "L", "60s / Rock 'N' Roll"),
+        ("C", "X", "L", "50s / Rock / Rock And Roll"),
+        ("D", "X", "L", "Hard Rock"),
+    ])
+    for query in ("rock and roll", "rock n roll", "rock & roll", "rock'n'roll"):
+        assert sorted(t["title"] for t in music._sync_genre_songs(query)) == ["A", "B", "C"]
+
+
+def test_resolve_genre_query_maps_variants_to_taxonomy_term(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_GENRE_TREE_PATH", "/tmp/genres.txt")
+    music._load_genre_terms.cache_clear()
+    fake_tree = "Rock\nRock & Roll\nDrum & Bass\n"
+    with patch("builtins.open", mock_open(read_data=fake_tree)), patch.object(music.os.path, "isfile", return_value=True):
+        assert music._resolve_genre_query("some dnb") == "drum & bass"
+        assert music._resolve_genre_query("rock n roll music") == "rock & roll"
+        assert music._resolve_genre_query("rock") == "rock"
+    music._load_genre_terms.cache_clear()
+
+
+def test_sync_search_ranks_exact_title_match_first(real_beets):
+    real_beets([
+        ("Bert's Blues", "Donovan", "Sunshine Superman", "Folk"),
+        ("Season Of The Witch", "Donovan", "Sunshine Superman", "Folk"),
+        ("Sunshine Superman", "Donovan", "Sunshine Superman", "Folk"),
+    ])
+    results = music._sync_search("sunshine superman")
+    assert results[0]["title"] == "Sunshine Superman"
+    assert len(results) == 3
