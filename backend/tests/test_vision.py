@@ -150,3 +150,58 @@ class TestVisionTTSSuppression:
         if intent_for_log == "vision":
             voice_meta = None
         assert voice_meta is not None
+
+
+# ── stream_local_vision: crash / error surfacing ──────────────────────────────
+
+import httpx
+
+import main
+from app_schemas import ChatRequest
+
+
+def _patch_vision_upstream(monkeypatch, body: str):
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=body, headers={"content-type": "text/event-stream"})
+
+    real_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        main.httpx,
+        "AsyncClient",
+        lambda **kw: real_client(transport=httpx.MockTransport(handler), **kw),
+    )
+
+
+async def _collect_vision() -> str:
+    out = []
+    async for chunk in main.stream_local_vision(ChatRequest(message="what is this?"), _make_b64(), "image/png"):
+        out.append(chunk)
+    return "".join(out)
+
+
+class TestStreamLocalVision:
+    @pytest.mark.asyncio
+    async def test_yields_content(self, monkeypatch):
+        _patch_vision_upstream(
+            monkeypatch,
+            'data: {"choices":[{"delta":{"content":"a red"}}]}\n\n'
+            'data: {"choices":[{"delta":{"content":" square"}}]}\n\n'
+            "data: [DONE]\n\n",
+        )
+        assert await _collect_vision() == "a red square"
+
+    @pytest.mark.asyncio
+    async def test_empty_stream_raises(self, monkeypatch):
+        # llama-server aborting mid-request (e.g. image > --ubatch-size) yields a 200 with no data.
+        _patch_vision_upstream(monkeypatch, "")
+        with pytest.raises(RuntimeError, match="empty response"):
+            await _collect_vision()
+
+    @pytest.mark.asyncio
+    async def test_error_event_raises(self, monkeypatch):
+        _patch_vision_upstream(
+            monkeypatch,
+            'data: {"error":{"code":500,"message":"failed to process image"}}\n\n',
+        )
+        with pytest.raises(RuntimeError, match="failed to process image"):
+            await _collect_vision()

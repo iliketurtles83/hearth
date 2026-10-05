@@ -634,7 +634,7 @@ async def test_memory_writer_triggers_rolling_summary_on_threshold(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_memory_writer_skips_assistant_when_response_empty():
+async def test_memory_writer_skips_turn_when_response_empty():
     class _CaptureMemoryStore(_FakeMemoryStore):
         def __init__(self):
             super().__init__()
@@ -673,4 +673,70 @@ async def test_memory_writer_skips_assistant_when_response_empty():
     result = await graph.ainvoke(_base_state())
 
     assert result["response_text"] == ""
-    assert store.logged == [("user", "hello")]
+    # No orphan user turn: it would render as back-to-back "User:" lines next prompt.
+    assert store.logged == []
+
+
+@pytest.mark.asyncio
+async def test_vision_failure_shows_notice_and_skips_turn():
+    class _CaptureMemoryStore(_FakeMemoryStore):
+        def __init__(self):
+            super().__init__()
+            self.logged: list[tuple[str, str]] = []
+
+        def log_turn(self, _session_id: str, _user_id: str, role: str, content: str) -> None:
+            self._turn_count += 1
+            self.logged.append((role, content))
+
+    store = _CaptureMemoryStore()
+
+    async def _fake_stream_local(_request, model_name=None):
+        raise AssertionError("text stream should not run for an image turn")
+        yield ""
+
+    async def _failing_vision(_request, _image_b64: str, _image_mime: str):
+        raise RuntimeError("vision model returned an empty response")
+        yield ""
+
+    async def _failing_cloud(_system: str, _messages: list[dict]):
+        raise RuntimeError("Cloud model is unavailable")
+        yield ""
+
+    async def _fake_tool_dispatch(_tool_name: str, _params: dict):
+        raise AssertionError("tool dispatch should not run")
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=store,
+        embedding_router=None,
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_failing_cloud,
+        stream_local_vision=_failing_vision,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+
+    graph = assistant_graph.build_assistant_graph(deps)
+    state = _base_state()
+    state.update({"message": "what is on this picture?", "image_base64": "aW1n", "image_mime": "image/png"})
+    result = await graph.ainvoke(state)
+
+    assert result["intent"] == "vision"
+    assert "can't process this image" in result["response_text"]
+    assert result["response_failed"] is True
+    assert store.logged == []
+
+
+@pytest.mark.asyncio
+async def test_response_failed_flag_resets_on_next_turn():
+    checkpoint_path = os.path.join(_tmp_dir, "graph-checkpoints-failed-reset.sqlite")
+    deps = _deps_for_local_stream(["fine"])
+    config = assistant_graph.checkpoint_config("failed-reset-session")
+
+    async with assistant_graph.create_assistant_graph(deps, checkpoint_path=checkpoint_path) as graph:
+        await graph.aupdate_state(config, {"response_failed": True})
+        result = await graph.ainvoke(_base_state(), config=config)
+
+    assert result["response_text"] == "fine"
+    assert result["response_failed"] is False
