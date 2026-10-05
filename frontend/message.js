@@ -806,10 +806,24 @@
   }
 
   let _currentDuration = 0;
-  let _currentElapsed = 0;
   let _playbackState = 'stop';
   let _lastVolume = 60;
   let _progressTicker = null;
+
+  // MPD's clock as of the last /music/now_playing poll; extrapolated while playing.
+  let _mpdElapsed = 0;
+  let _mpdPolledAt = 0;
+  let _currentTrack = null;
+  let _currentTrackKey = null;
+  // Track MPD already left but whose buffered tail is still audible on the web stream.
+  let _prevTrack = null;
+  let _shownTrackKey = null;
+  let _shownTrack = null;
+  let _lastEndRefreshAt = 0;
+  // performance.now() when the web stream (re)connected; 0 when not streaming.
+  let _streamConnectedAt = 0;
+  // Set when MPD stopped at end of queue while the web stream still had audio buffered.
+  let _stopTail = null;
 
   function _formatTime(seconds) {
     if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
@@ -832,14 +846,80 @@
     }
   }
 
-  function _startProgressTicker() {
-    if (_progressTicker) clearInterval(_progressTicker);
-    _progressTicker = setInterval(() => {
-      if (_playbackState === 'play' && _currentDuration > 0) {
-        _currentElapsed = Math.min(_currentElapsed + 1, _currentDuration);
-        _updateProgressDisplay(_currentElapsed, _currentDuration);
+  // Seconds the web stream audio is behind MPD. The stream is live: audio position t was
+  // emitted by MPD t seconds after connecting, so wall time since connect minus currentTime
+  // is how much MPD has played that this device hasn't (startup buffering + network).
+  function _streamLag() {
+    if (!_streamConnectedAt) return 0;
+    if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return 0;
+    const webPlayer = document.getElementById('hearth-web-player');
+    if (!webPlayer || webPlayer.paused || !webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) return 0;
+    const lag = (performance.now() - _streamConnectedAt) / 1000 - webPlayer.currentTime;
+    return Math.max(0, Math.min(lag, 30));
+  }
+
+  function _mpdElapsedNow() {
+    if (_playbackState !== 'play') return _mpdElapsed;
+    return _mpdElapsed + (performance.now() - _mpdPolledAt) / 1000;
+  }
+
+  function _showTrack(track, key) {
+    if (_shownTrackKey === key) return;
+    _shownTrackKey = key;
+    _shownTrack = track;
+    const titleEl = document.getElementById('music-track-title');
+    const subtitleEl = document.getElementById('music-track-artist-album');
+    const trackTitle = track.title || 'Unknown track';
+    const nowPlayingText = [track.artist, track.title].filter(Boolean).join(' — ') || trackTitle;
+    if (titleEl) {
+      titleEl.textContent = trackTitle;
+      titleEl.classList.remove('now-playing-idle');
+    }
+    if (subtitleEl) subtitleEl.textContent = [track.artist, track.album].filter(Boolean).join(' • ');
+    if (musicCollapsedNowPlayingEl) {
+      musicCollapsedNowPlayingEl.textContent = nowPlayingText;
+      musicCollapsedNowPlayingEl.classList.remove('now-playing-idle');
+    }
+    _updateMediaSession(track, _playbackState === 'play' || !!_stopTail);
+  }
+
+  // Render what this device is hearing: MPD's position minus the stream lag. While the lag
+  // reaches back past the start of the current track, keep showing the previous one.
+  function _renderPlayback() {
+    if (_stopTail) {
+      const remaining = (_stopTail.until - performance.now()) / 1000;
+      if (remaining <= 0) {
+        _stopTail = null;
+        refreshNowPlaying();
+        return;
       }
-    }, 1000);
+      _showTrack(_stopTail.track, _stopTail.key);
+      _updateProgressDisplay(_stopTail.endPos - remaining, _stopTail.duration);
+      return;
+    }
+    if (!_currentTrack) return;
+    const raw = _mpdElapsedNow();
+    const heard = raw - _streamLag();
+    // Small negatives are just request timing around a skip/reconnect, not audible old audio.
+    if (heard < -1 && _prevTrack) {
+      _showTrack(_prevTrack.track, _prevTrack.key);
+      _updateProgressDisplay(_prevTrack.endPos + heard, _prevTrack.duration);
+    } else {
+      if (heard >= 0) _prevTrack = null;
+      _showTrack(_currentTrack, _currentTrackKey);
+      _updateProgressDisplay(Math.max(0, heard), _currentDuration);
+    }
+    // MPD has most likely moved to the next track; poll now rather than waiting for the interval.
+    const now = performance.now();
+    if (_playbackState === 'play' && _currentDuration > 0 && raw > _currentDuration + 0.5 && now - _lastEndRefreshAt > 3000) {
+      _lastEndRefreshAt = now;
+      refreshNowPlaying();
+    }
+  }
+
+  function _startProgressTicker() {
+    if (_progressTicker) return;
+    _progressTicker = setInterval(_renderPlayback, 500);
   }
 
   function _stopProgressTicker() {
@@ -847,6 +927,16 @@
       clearInterval(_progressTicker);
       _progressTicker = null;
     }
+  }
+
+  function _resetTrackTiming() {
+    _currentTrack = null;
+    _currentTrackKey = null;
+    _prevTrack = null;
+    _shownTrackKey = null;
+    _shownTrack = null;
+    _mpdElapsed = 0;
+    _currentDuration = 0;
   }
 
   async function refreshNowPlaying(autoExpand = false) {
@@ -862,27 +952,37 @@
       const data = await resp.json();
       currentQueuePos = Number.isInteger(data.pos) ? data.pos : null;
       const previousState = _playbackState;
-      _playbackState = data.state || 'stop';
       const isPlaying = data.track && data.state !== 'stop';
 
       if (isPlaying) {
+        _stopTail = null;
+        _playbackState = data.state || 'stop';
         const t = data.track;
-        const trackTitle = t.title || 'Unknown track';
-        const subParts = [t.artist, t.album].filter(Boolean);
-        const nowPlayingText = [t.artist, t.title].filter(Boolean).join(' — ') || trackTitle;
-
-        titleEl.textContent = trackTitle;
-        titleEl.classList.remove('now-playing-idle');
-        if (subtitleEl) subtitleEl.textContent = subParts.join(' • ');
-        if (musicCollapsedNowPlayingEl) {
-          musicCollapsedNowPlayingEl.textContent = nowPlayingText;
-          musicCollapsedNowPlayingEl.classList.remove('now-playing-idle');
+        const now = performance.now();
+        const elapsed = Number.isFinite(data.elapsed) ? data.elapsed : 0;
+        const key = [data.pos, t.title, t.artist].join('|');
+        if (_currentTrack && _currentTrackKey !== key && previousState === 'play') {
+          // MPD moved on. Remember where it left the old track (its end, or the skip point)
+          // so the still-buffered tail is shown under the right title.
+          const startedAt = now - elapsed * 1000;
+          let endPos = _mpdElapsed + (startedAt - _mpdPolledAt) / 1000;
+          if (_currentDuration > 0) endPos = Math.min(endPos, _currentDuration);
+          _prevTrack = {
+            track: _currentTrack,
+            key: _currentTrackKey,
+            endPos: Math.max(0, endPos),
+            duration: _currentDuration,
+          };
+        } else if (_currentTrackKey !== key) {
+          _prevTrack = null;
         }
-        if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
-
-        _currentElapsed = Number.isFinite(data.elapsed) ? data.elapsed : 0;
+        _currentTrack = t;
+        _currentTrackKey = key;
+        _mpdElapsed = elapsed;
+        _mpdPolledAt = now;
         _currentDuration = Number.isFinite(data.duration) ? data.duration : 0;
-        _updateProgressDisplay(_currentElapsed, _currentDuration);
+        if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
+        _renderPlayback();
 
         if (data.state === 'play') {
           _startProgressTicker();
@@ -895,31 +995,49 @@
               _ensureWebPlayerPlaying(false);
             }
           }
-          _updateMediaSession(data.track, true);
+          _updateMediaSession(_shownTrack || t, true);
         } else {
           _stopProgressTicker();
           if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
             _pauseWebPlayer();
           }
-          _updateMediaSession(data.track, false);
+          _updateMediaSession(t, false);
         }
       } else {
-        _stopProgressTicker();
-        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-          _pauseWebPlayer();
+        // Queue ran out naturally: the web stream still holds the end of the last track.
+        // Let it play out (and keep the display on it) before tearing the stream down.
+        const tail = previousState === 'play' && !_stopTail ? _streamLag() : 0;
+        if (tail > 1 && _currentTrack) {
+          let endPos = _mpdElapsedNow();
+          if (_currentDuration > 0) endPos = Math.min(endPos, _currentDuration);
+          _stopTail = {
+            track: _currentTrack,
+            key: _currentTrackKey,
+            endPos,
+            duration: _currentDuration,
+            until: performance.now() + tail * 1000,
+          };
+          _playbackState = data.state || 'stop';
+          _startProgressTicker();
+          _renderPlayback();
+        } else if (!_stopTail) {
+          _playbackState = data.state || 'stop';
+          _stopProgressTicker();
+          _resetTrackTiming();
+          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
+            _pauseWebPlayer();
+          }
+          _updateMediaSession(null, false);
+          titleEl.textContent = 'Nothing playing';
+          titleEl.classList.add('now-playing-idle');
+          if (subtitleEl) subtitleEl.textContent = '';
+          if (musicCollapsedNowPlayingEl) {
+            musicCollapsedNowPlayingEl.textContent = 'Nothing playing';
+            musicCollapsedNowPlayingEl.classList.add('now-playing-idle');
+          }
+          if (btn) btn.textContent = '▶';
+          _updateProgressDisplay(0, 0);
         }
-        _updateMediaSession(null, false);
-        titleEl.textContent = 'Nothing playing';
-        titleEl.classList.add('now-playing-idle');
-        if (subtitleEl) subtitleEl.textContent = '';
-        if (musicCollapsedNowPlayingEl) {
-          musicCollapsedNowPlayingEl.textContent = 'Nothing playing';
-          musicCollapsedNowPlayingEl.classList.add('now-playing-idle');
-        }
-        if (btn) btn.textContent = '▶';
-        _currentElapsed = 0;
-        _currentDuration = 0;
-        _updateProgressDisplay(0, 0);
       }
 
       if (volumeInput && Number.isFinite(data.volume)) {
@@ -981,6 +1099,8 @@
 
   function _pauseWebPlayer() {
     const webPlayer = document.getElementById('hearth-web-player');
+    _streamConnectedAt = 0;
+    _stopTail = null;
     if (webPlayer) {
       _isAppPausing = true;
       webPlayer.pause();
@@ -1015,6 +1135,7 @@
     if (forceReconnect || !webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
       webPlayer.src = '/music/stream?t=' + Date.now();
       webPlayer.load();
+      _streamConnectedAt = performance.now();
     }
     const playPromise = webPlayer.play();
     if (playPromise !== undefined) {
