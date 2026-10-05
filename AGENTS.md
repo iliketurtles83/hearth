@@ -24,7 +24,7 @@ Hearth is a local-first personal AI assistant combining:
 - `caddy/` — Caddyfile reverse proxy configuration (TLS termination on :443; host bind via `HEARTH_BIND_IP`/`HEARTH_HTTPS_PORT`).
 - `mpd/` — Music Player Daemon configuration (`mpd.conf`).
 - `.github/` — CI workflows (`.github/workflows/backend-review-gates.yml`).
-- Root configs: `docker-compose.yml`, `README.md`, `config.yaml` (Beets), `genres.txt`.
+- Root configs: `docker-compose.yml`, `README.md`, `config.yaml` (Beets).
 
 ## High-Value Paths
 
@@ -61,7 +61,7 @@ Hearth is a local-first personal AI assistant combining:
 - `scripts/renew-tailscale-cert.sh` — writes a Tailscale cert to `caddy/certs/` and restarts Caddy if it changed.
 - `mpd/` — MPD config directory (mpd.conf).
 - `config.yaml` — Beets config (non-interactive, no MusicBrainz lookups, copy: no, move: no).
-- `genres.txt` — curated genre definitions for music classification.
+- `backend/tools/genres.txt` — genre taxonomy for music genre matching (`MUSIC_GENRE_TREE_PATH` overrides).
 
 ## Commands (Copy-Paste Ready)
 

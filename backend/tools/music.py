@@ -117,7 +117,7 @@ MUSIC_PLAYLIST_MIN_N: int = int(os.getenv("MUSIC_PLAYLIST_MIN_N", "12"))
 MUSIC_PLAYLIST_MAX_N: int = int(os.getenv("MUSIC_PLAYLIST_MAX_N", "24"))
 MUSIC_GENRE_TREE_PATH: str = os.getenv(
     "MUSIC_GENRE_TREE_PATH",
-    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "genres.txt"),
+    os.path.join(os.path.dirname(__file__), "genres.txt"),
 )
 
 
@@ -201,6 +201,9 @@ def _row_to_track(row: sqlite3.Row, score: float = 0.0) -> dict[str, Any]:
 def _sync_search(query: str) -> list[dict[str, Any]]:
     """Search Beets items with LIKE on title/artist/album, ranked by rating.
 
+    An exact title match ranks first, so "Sunshine Superman" picks the title
+    track rather than the alphabetically first song on the same-named album.
+
     Raises sqlite3.OperationalError if the DB is temporarily locked.
     """
     pattern = f"%{query}%"
@@ -212,10 +215,10 @@ def _sync_search(query: str) -> list[dict[str, Any]]:
                 SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
                 FROM items
                 WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
-                ORDER BY rating DESC, title ASC
+                ORDER BY lower(title) = lower(?) DESC, rating DESC, title ASC
                 LIMIT ?
                 """,
-                (pattern, pattern, pattern, MUSIC_SEARCH_LIMIT),
+                (pattern, pattern, pattern, query.strip(), MUSIC_SEARCH_LIMIT),
             )
         else:
             cur = conn.execute(
@@ -223,10 +226,10 @@ def _sync_search(query: str) -> list[dict[str, Any]]:
                 SELECT id, title, artist, album, path, 0.0 AS rating
                 FROM items
                 WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
-                ORDER BY rating DESC, title ASC
+                ORDER BY lower(title) = lower(?) DESC, rating DESC, title ASC
                 LIMIT ?
                 """,
-                (pattern, pattern, pattern, MUSIC_SEARCH_LIMIT),
+                (pattern, pattern, pattern, query.strip(), MUSIC_SEARCH_LIMIT),
             )
         rows = cur.fetchall()
         results = []
@@ -369,12 +372,34 @@ def _sync_search_by_year_range(year_start: int, year_end: int) -> list[dict[str,
         conn.close()
 
 
+# "&", "and", "n" and "'n'" between two words are one connector in genre names:
+# "drum and bass", "drum'n'bass", "Drum 'n Bass" -> "drum & bass". Both sides need
+# 2+ letters so "r&b" stays intact.
+_GENRE_CONNECTOR_RE = re.compile(
+    r"(?<=[a-z]{2})\s*(?:&|'n'|'n\b|\bn'|\band\b|\bn\b)\s*(?=[a-z]{2})"
+)
+_GENRE_ALIAS_RE = re.compile(r"(?<![\w&'])(?:dnb|d&b|d'n'b)(?![\w&'])")
+
+
+def _canonical_genre(text: str) -> str:
+    """Lower-case a genre name and unify spelling variants ("dnb", "rock n roll")."""
+    s = _GENRE_ALIAS_RE.sub("drum & bass", text.lower())
+    return re.sub(r"\s+", " ", _GENRE_CONNECTOR_RE.sub(" & ", s)).strip()
+
+
 def _sync_genre_songs(genre: str) -> list[dict[str, Any]]:
     """Return all songs matching genre LIKE pattern, with rating attached.
 
     Some Beets schemas may omit a genre column. In that case, return an empty
     list so resolver logic can fall back to artist/search paths.
+
+    Spelling variants match the same set: "drum and bass", "dnb" and a
+    "Drum 'n Bass" tag are all "drum & bass".
     """
+    genre = _canonical_genre(genre)
+    # LIKE can't see spelling variants, so "drum & bass" queries "%drum%bass%"
+    # and rows are filtered on their canonical tag below.
+    pattern = f"%{genre.replace(' & ', '%')}%"
     genre_expr = _genre_expr()
     if not genre_expr:
         log.info("music.genre_column_missing | fallback_to_artist_search")
@@ -387,45 +412,47 @@ def _sync_genre_songs(genre: str) -> list[dict[str, Any]]:
             if has_rating:
                 cur = conn.execute(
                     """
-                    SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                    SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating, genre AS genre_tag
                     FROM items
                     WHERE genre LIKE ?
                     ORDER BY rating DESC, title ASC
                     """,
-                    (f"%{genre}%",),
+                    (pattern,),
                 )
             else:
                 cur = conn.execute(
                     """
-                    SELECT id, title, artist, album, path, 0.0 AS rating
+                    SELECT id, title, artist, album, path, 0.0 AS rating, genre AS genre_tag
                     FROM items
                     WHERE genre LIKE ?
                     ORDER BY rating DESC, title ASC
                     """,
-                    (f"%{genre}%",),
+                    (pattern,),
                 )
         else:
             if has_rating:
                 cur = conn.execute(
                     """
-                    SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating
+                    SELECT id, title, artist, album, path, COALESCE(rating, 0.0) AS rating, genres AS genre_tag
                     FROM items
                     WHERE genres LIKE ?
                     ORDER BY rating DESC, title ASC
                     """,
-                    (f"%{genre}%",),
+                    (pattern,),
                 )
             else:
                 cur = conn.execute(
                     """
-                    SELECT id, title, artist, album, path, 0.0 AS rating
+                    SELECT id, title, artist, album, path, 0.0 AS rating, genres AS genre_tag
                     FROM items
                     WHERE genres LIKE ?
                     ORDER BY rating DESC, title ASC
                     """,
-                    (f"%{genre}%",),
+                    (pattern,),
                 )
         rows = cur.fetchall()
+        if " & " in genre:
+            rows = [r for r in rows if genre in _canonical_genre(r["genre_tag"] or "")]
         return [
             {**_row_to_track(row, 0.0), "rating": float(row["rating"] or 0.0)}
             for row in rows
@@ -868,7 +895,7 @@ def _load_genre_terms() -> tuple[str, ...]:
             s = line.strip()
             if not s or s.startswith("#"):
                 continue
-            terms.append(s.lower())
+            terms.append(_canonical_genre(s))
 
     # Longer tokens first so "progressive rock" wins over "rock".
     resolved = tuple(sorted(set(terms), key=len, reverse=True))
@@ -884,7 +911,7 @@ def _normalize_music_query(text: str) -> str:
 
 def _resolve_genre_query(query: str) -> str | None:
     """Return a canonical genre term if query maps to the taxonomy."""
-    q_norm = _normalize_music_query(query)
+    q_norm = _canonical_genre(_normalize_music_query(query))
     if not q_norm:
         return None
     terms = _load_genre_terms()
