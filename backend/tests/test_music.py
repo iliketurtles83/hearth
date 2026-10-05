@@ -84,6 +84,11 @@ class _FakeCommandError(Exception):
 _fake_musicpd.MPDClient = _FakeMPDClient
 _fake_musicpd.ConnectionError = _FakeConnectionError
 _fake_musicpd.CommandError = _FakeCommandError
+
+# The stubs below are only installed for the duration of the `tools.music`
+# import and restored afterwards, so later test files see the real modules.
+_STUBBED_MODULES = ("musicpd", "tools", "tools.base", "tools.music")
+_saved_modules = {name: sys.modules.pop(name, None) for name in _STUBBED_MODULES}
 sys.modules["musicpd"] = _fake_musicpd
 
 # Create a minimal tools registry stub.
@@ -131,7 +136,14 @@ os.environ.setdefault("MPD_HOST", "localhost")
 os.environ.setdefault("MPD_PORT", "6600")
 os.environ.setdefault("MUSIC_ROOT", "/srv/music")
 
-import tools.music as music  # noqa: E402  (must come after stubs)
+try:
+    import tools.music as music  # noqa: E402  (must come after stubs)
+finally:
+    for _name, _module in _saved_modules.items():
+        if _module is None:
+            sys.modules.pop(_name, None)
+        else:
+            sys.modules[_name] = _module
 
 # Patch ToolResult references in the music module.
 music.ToolResult = ToolResult
@@ -469,7 +481,7 @@ async def test_play_prefers_genre_first_when_query_matches_known_genre(monkeypat
 
     with (
         patch.object(music, "genre_radio", return_value=tracks) as genre_radio_mock,
-        patch.object(music, "_sync_play_tracks", return_value=None),
+        patch.object(music, "_sync_play_tracks", return_value={}),
         patch.object(music, "_sync_search", side_effect=AssertionError("_sync_search should not run on genre-first path")),
     ):
         result = await music.run({"action": "play", "query": "metal", "prompt": "play metal"})
@@ -495,7 +507,7 @@ async def test_play_michael_jackson_uses_artist_heuristic_when_not_genre(monkeyp
         patch.object(music, "_sync_search", return_value=search_results),
         patch.object(music, "_sync_genre_songs", return_value=[]),
         patch.object(music, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
-        patch.object(music, "_sync_play_tracks", return_value=None),
+        patch.object(music, "_sync_play_tracks", return_value={}),
     ):
         result = await music.run({"action": "play", "query": "michael jackson", "prompt": "play michael jackson"})
 
@@ -541,8 +553,8 @@ async def test_play_multiword_artist_prefers_artist_matches_even_when_title_hits
         patch.object(music, "_sync_search", return_value=search_results),
         patch.object(music, "_sync_genre_songs", return_value=[]),
         patch.object(music, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
-        patch.object(music, "_sync_play_tracks", return_value=None),
-        patch.object(music, "_sync_play", return_value=None),
+        patch.object(music, "_sync_play_tracks", return_value={}),
+        patch.object(music, "_sync_play", return_value={}),
     ):
         result = await music.run(
             {"action": "play", "query": "michael jackson", "prompt": "play Michael Jackson"}
@@ -594,7 +606,7 @@ async def test_play_falls_back_to_artist_radio():
         patch.object(music, "_sync_search", return_value=[]),
         patch.object(music, "_sync_genre_songs", return_value=[]),
         patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_play_tracks", return_value=None),
+        patch.object(music, "_sync_play_tracks", return_value={}),
     ):
         result = await music.run({"action": "play", "query": "Band", "prompt": "play Band"})
     assert result.ok
@@ -609,7 +621,7 @@ async def test_queue_artist_param_uses_queue_tracks_not_play_tracks():
     ]
     with (
         patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
         patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
         result = await music.run({"action": "queue", "artist": "Band", "prompt": "queue band"})
@@ -627,7 +639,7 @@ async def test_queue_title_artist_miss_falls_back_to_queue_tracks():
     with (
         patch.object(music, "_sync_search_by_title_artist", return_value=[]),
         patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
         patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
         result = await music.run({
@@ -650,7 +662,7 @@ async def test_queue_year_range_uses_queue_tracks_not_play_tracks():
     ]
     with (
         patch.object(music, "_sync_search_by_year_range", return_value=pool),
-        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
         patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
         result = await music.run({"action": "queue", "year_range": (1990, 1999), "prompt": "queue 90s"})
@@ -668,7 +680,7 @@ async def test_queue_no_results_falls_back_to_queue_tracks():
     with (
         patch.object(music, "_sync_search", return_value=[]),
         patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_queue_tracks", return_value=None) as queue_tracks_mock,
+        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
         patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
         result = await music.run({"action": "queue", "query": "Band", "prompt": "queue band"})
@@ -689,7 +701,7 @@ async def test_auto_pick_selects_first_result():
     with (
         patch.object(music, "_sync_search", return_value=results),
         patch.object(music, "_sync_genre_songs", return_value=[]),
-        patch.object(music, "_sync_play", return_value=None),
+        patch.object(music, "_sync_play", return_value={}),
     ):
         result = await music.run({"action": "play", "query": "hit", "prompt": "play hit"})
     assert result.ok
@@ -765,7 +777,7 @@ async def test_song_id_resolution():
     track = {"id": 42, "title": "Direct Track", "artist": "A", "album": "B", "url": "/srv/music/d.mp3", "score": 1.0}
     with (
         patch.object(music, "_sync_get_by_id", return_value=track),
-        patch.object(music, "_sync_play", return_value=None),
+        patch.object(music, "_sync_play", return_value={}),
     ):
         result = await music.run({"action": "play", "song_id": 42, "prompt": ""})
     assert result.ok
