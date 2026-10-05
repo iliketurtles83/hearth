@@ -1131,14 +1131,14 @@ _WHOLE_WORD = r"(?:whole|full|entire|complete)"
 _PLAYLIST_WORD = r"(?:mix\s*tape|playlist)"
 
 _ALBUM_PREFIX_RE = re.compile(
-    rf"^(?:(?:the|my|that)\s+)?(?:{_WHOLE_WORD}\s+)?{_ALBUM_WORD}\s+(?:called\s+|named\s+)?(?P<name>.+)$",
+    rf"^(?:(?:the|my|that)\s+)?(?P<whole>{_WHOLE_WORD}\s+)?{_ALBUM_WORD}\s+(?:called\s+|named\s+)?(?P<name>.+)$",
     re.IGNORECASE,
 )
 _ALBUM_SUFFIX_RE = re.compile(
-    rf"^(?:(?:the|my|that)\s+)?(?:{_WHOLE_WORD}\s+)?(?P<name>.+?)\s+{_ALBUM_WORD}$",
+    rf"^(?:(?:the|my|that)\s+)?(?P<whole>{_WHOLE_WORD}\s+)?(?P<name>.+?)\s+{_ALBUM_WORD}$",
     re.IGNORECASE,
 )
-_ALBUM_WHOLE_RE = re.compile(rf"^(?:the\s+)?{_WHOLE_WORD}\s+(?P<name>.+)$", re.IGNORECASE)
+_ALBUM_WHOLE_RE = re.compile(rf"^(?:the\s+)?(?P<whole>{_WHOLE_WORD})\s+(?P<name>.+)$", re.IGNORECASE)
 _PLAYLIST_PREFIX_RE = re.compile(
     rf"^(?:(?:the|my)\s+)?{_PLAYLIST_WORD}\s+(?:called\s+|named\s+)?(?P<name>.+)$",
     re.IGNORECASE,
@@ -1155,7 +1155,8 @@ _BY_ARTIST_RE = re.compile(r"^(?P<name>.+?)\s+by\s+(?P<artist>.+)$", re.IGNORECA
 def _parse_collection_request(query: str) -> dict[str, Any] | None:
     """Detect an explicit album or stored-playlist request in a cleaned query.
 
-    Returns {"kind": "album", "name", "artist"} or
+    Returns {"kind": "album", "name", "artist", "full"} (full = "the whole/
+    entire …", which opts out of sampling huge compilations) or
     {"kind": "playlist", "name", "weak"} (weak = only the word "mix" was used),
     or None for ordinary track/artist/genre queries.
     """
@@ -1176,7 +1177,7 @@ def _parse_collection_request(query: str) -> dict[str, Any] | None:
             by_m = _BY_ARTIST_RE.match(name)
             if by_m:
                 name, artist = by_m.group("name").strip("\"' "), by_m.group("artist").strip("\"' ")
-            return {"kind": "album", "name": name, "artist": artist}
+            return {"kind": "album", "name": name, "artist": artist, "full": bool(m.group("whole"))}
 
     m = _MIX_SUFFIX_RE.match(q)
     if m and m.group("name").strip("\"' ").lower() not in _FILLER_NAMES:
@@ -1252,25 +1253,57 @@ async def _start_ordered_tracks(
     })
 
 
-async def _play_album(
-    name: str, artist: str | None, action: str | None, exact: bool
-) -> ToolResult | None:
-    """Play/queue a whole album in disc/track order; None if no album matches.
+def _sample_large_compilation(
+    tracks: list[dict[str, Any]], rng: random.Random
+) -> list[dict[str, Any]]:
+    """Cap multi-artist albums over MUSIC_PLAYLIST_MAX_N to a random sample.
 
+    The sample keeps album order, so chronological lists (e.g. "The Pitchfork
+    500") still play oldest → newest. Single-artist albums are never sampled:
+    a long double album is still one work.
+    """
+    limit = max(1, MUSIC_PLAYLIST_MAX_N)
+    artists = {t["artist"] for t in tracks if t["artist"]}
+    if len(tracks) <= limit or len(artists) <= 1:
+        return tracks
+    keep = sorted(rng.sample(range(len(tracks)), limit))
+    return [tracks[i] for i in keep]
+
+
+async def _play_album(
+    name: str,
+    artist: str | None,
+    action: str | None,
+    exact: bool,
+    full: bool = False,
+    seed: int | None = None,
+) -> ToolResult | None:
+    """Play/queue an album in disc/track order; None if no album matches.
+
+    Huge multi-artist compilations are sampled down to MUSIC_PLAYLIST_MAX_N
+    tracks unless full=True ("play the whole …").
     Raises sqlite3.OperationalError if the DB is temporarily locked.
     """
     album_name, tracks = await asyncio.to_thread(_sync_album_tracks, name, artist, exact)
     if not tracks:
         return None
+    total = len(tracks)
     artists = {t["artist"] for t in tracks if t["artist"]}
+    if not full:
+        rng = random.Random(seed if seed is not None else int(time.time()))
+        tracks = _sample_large_compilation(tracks, rng)
     log.info(
-        "music.album | query=%r artist=%r exact=%s album=%r tracks=%d artists=%d",
-        name, artist, exact, album_name, len(tracks), len(artists),
+        "music.album | query=%r artist=%r exact=%s full=%s album=%r tracks=%d/%d artists=%d",
+        name, artist, exact, full, album_name, len(tracks), total, len(artists),
     )
     return await _start_ordered_tracks(
         tracks,
         action,
-        {"album": album_name, "album_artist": next(iter(artists)) if len(artists) == 1 else None},
+        {
+            "album": album_name,
+            "album_artist": next(iter(artists)) if len(artists) == 1 else None,
+            "album_total": total,
+        },
         "album",
     )
 
@@ -1491,7 +1524,8 @@ async def run(params: dict[str, Any]) -> ToolResult:
     if playlist_param:
         collection = {"kind": "playlist", "name": playlist_param, "weak": False}
     elif album_param:
-        collection = {"kind": "album", "name": album_param, "artist": None}
+        full = bool(re.search(rf"\b{_WHOLE_WORD}\b", prompt, re.IGNORECASE))
+        collection = {"kind": "album", "name": album_param, "artist": None, "full": full}
     elif action in ("play", "queue") and year_range is None:
         collection = _parse_collection_request(query or _extract_search_query(prompt))
         # "<title> by <artist>" requests are never stored playlists.
@@ -1501,7 +1535,9 @@ async def run(params: dict[str, Any]) -> ToolResult:
     if collection and collection["kind"] == "album":
         album_artist = collection.get("artist") or artist_filter or artist_param
         try:
-            album_result = await _play_album(collection["name"], album_artist, action, exact=False)
+            album_result = await _play_album(
+                collection["name"], album_artist, action, exact=False, full=collection.get("full", False)
+            )
         except sqlite3.OperationalError:
             return ToolResult.failure(
                 "Music library database is temporarily unavailable. Please retry.",

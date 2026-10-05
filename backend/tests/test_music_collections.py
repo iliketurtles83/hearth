@@ -7,6 +7,7 @@ resolver order (playlist → genre → album → track/artist) is exercised end 
 from __future__ import annotations
 
 import asyncio
+import random
 import sqlite3
 from typing import Any
 from unittest.mock import patch
@@ -99,10 +100,10 @@ def _added_titles(mpd: _FakeMPD) -> list[str]:
 @pytest.mark.parametrize(
     ("prompt", "expected"),
     [
-        ("play the album Kind of Blue", {"kind": "album", "name": "Kind of Blue", "artist": None}),
-        ("play the whole album OK Computer", {"kind": "album", "name": "OK Computer", "artist": None}),
-        ("play the Kind of Blue album", {"kind": "album", "name": "Kind of Blue", "artist": None}),
-        ("play the whole Pitchfork 500", {"kind": "album", "name": "Pitchfork 500", "artist": None}),
+        ("play the album Kind of Blue", {"kind": "album", "name": "Kind of Blue", "artist": None, "full": False}),
+        ("play the whole album OK Computer", {"kind": "album", "name": "OK Computer", "artist": None, "full": True}),
+        ("play the Kind of Blue album", {"kind": "album", "name": "Kind of Blue", "artist": None, "full": False}),
+        ("play the whole Pitchfork 500", {"kind": "album", "name": "Pitchfork 500", "artist": None, "full": True}),
         ("play my chill mixtape", {"kind": "playlist", "name": "chill", "weak": False}),
         ("play the playlist called road trip", {"kind": "playlist", "name": "road trip", "weak": False}),
         ("play my new mix tape", {"kind": "playlist", "name": "new", "weak": False}),
@@ -118,7 +119,7 @@ def test_parse_collection_request(prompt, expected):
 
 def test_parse_album_splits_trailing_artist():
     assert music._parse_collection_request("the record Blue by Joni Mitchell") == {
-        "kind": "album", "name": "Blue", "artist": "Joni Mitchell",
+        "kind": "album", "name": "Blue", "artist": "Joni Mitchell", "full": False,
     }
 
 
@@ -181,6 +182,47 @@ def test_album_lookup_prefers_literal_name_over_the_variant(beets_db, name, albu
     resolved, tracks = music._sync_album_tracks(name)
 
     assert (resolved, len(tracks)) == (album, count)
+
+
+def test_sample_large_compilation_caps_and_keeps_album_order(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    tracks = [{"title": f"t{i:03}", "artist": f"a{i}"} for i in range(500)]
+
+    sample = music._sample_large_compilation(tracks, random.Random(7))
+
+    assert len(sample) == 24
+    assert sample == sorted(sample, key=lambda t: t["title"])
+
+
+def test_sample_large_compilation_never_trims_single_artist_album(monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    tracks = [{"title": f"t{i}", "artist": "The Beatles"} for i in range(30)]
+
+    assert music._sample_large_compilation(tracks, random.Random(7)) == tracks
+
+
+def test_huge_compilation_is_sampled_unless_whole_requested(beets_db, monkeypatch):
+    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 1)
+
+    sampled = _run({"prompt": "play the Pitchfork 500"}, _FakeMPD())
+    assert sampled.ok
+    assert len(sampled.data["tracks"]) == 1
+    assert format_music_response(sampled, {"action": "play"}) == (
+        'Now playing 1 of 2 tracks from "The Pitchfork 500".'
+    )
+
+    whole = _run({"prompt": "play the whole Pitchfork 500"}, _FakeMPD())
+    assert len(whole.data["tracks"]) == 2
+
+    llm_whole = _run(
+        {"action": "play", "album": "The Pitchfork 500", "prompt": "play the entire pitchfork 500"},
+        _FakeMPD(),
+    )
+    assert len(llm_whole.data["tracks"]) == 2
+
+    # Single-artist albums over the limit still play in full.
+    album = _run({"prompt": "play the album Kind of Blue"}, _FakeMPD())
+    assert len(album.data["tracks"]) == 3
 
 
 def test_queue_album_appends_without_clearing(beets_db):

@@ -107,6 +107,9 @@ def format_music_response(tool_result: "ToolResult", music_cmd: dict) -> str:
         album = data.get("album")
         if isinstance(album, str) and album and count:
             by = f' by {data["album_artist"]}' if data.get("album_artist") else ""
+            total = data.get("album_total")
+            if isinstance(total, int) and total > count:
+                return f'{verb} {count} of {total} tracks from "{album}"{by}.'
             return f'{verb} the album "{album}"{by} ({count} {noun}).'
         if tracks and len(tracks) > 1:
             genre = data.get("genre")
