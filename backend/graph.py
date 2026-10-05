@@ -98,6 +98,7 @@ class AssistantState(TypedDict, total=False):
     # Vision input
     image_base64: str | None          # raw base64 image (ephemeral, not persisted)
     image_mime: str | None            # "image/png" | "image/jpeg" | "image/webp"
+    response_failed: bool             # responder produced only an error notice; turn is not persisted
 
 
 @dataclass
@@ -776,7 +777,7 @@ def build_assistant_graph(
         session_id = str(state.get("session_id", ""))
         user_id = str(state.get("user_id", ""))
         if not session_id or not user_id:
-            return {"history": [], "session_summary": ""}
+            return {"history": [], "session_summary": "", "response_failed": False}
 
         turns = await asyncio.to_thread(
             deps.memory_store.get_session_turns,
@@ -796,7 +797,8 @@ def build_assistant_graph(
             }
             for turn in turns
         ]
-        return {"history": history, "session_summary": str(session_summary or "")}
+        # response_failed is checkpointed per thread; reset it so a failed turn doesn't leak forward.
+        return {"history": history, "session_summary": str(session_summary or ""), "response_failed": False}
 
     async def memory_retrieval(state: AssistantState) -> dict[str, Any]:
         history = list(state.get("history", []))
@@ -1030,6 +1032,7 @@ def build_assistant_graph(
                 system=effective_system,
             )
             local_vision_ok = False
+            vision_failed = False
             if deps.stream_local_vision is not None:
                 try:
                     response_text, _ = await _emit_response_chunks(
@@ -1061,8 +1064,13 @@ def build_assistant_graph(
                         "Run `llama-server` with the vision-capable model to enable local image understanding."
                     )
                     writer({"text": response_text})
+                    vision_failed = True
 
-            return {"response_text": response_text.strip(), "response_model": response_model}
+            return {
+                "response_text": response_text.strip(),
+                "response_model": response_model,
+                "response_failed": vision_failed,
+            }
         # ── End vision path ──────────────────────────────────────────────────
 
         if state.get("tool"):
@@ -1144,21 +1152,30 @@ def build_assistant_graph(
         if not user_id or not session_id:
             return {"memory_result": {}}
 
-        # 1) Persist the turn in conversation_log.
-        await asyncio.to_thread(
-            deps.memory_store.log_turn,
-            session_id,
-            user_id,
-            "user",
-            message,
-        )
-        if response_text:
+        # 1) Persist the turn in conversation_log. A failed or empty response skips the
+        # whole turn: an orphan user message would show up as back-to-back "User:" lines
+        # in the next prompt, and an error notice isn't conversation.
+        if response_text and not state.get("response_failed"):
+            await asyncio.to_thread(
+                deps.memory_store.log_turn,
+                session_id,
+                user_id,
+                "user",
+                message,
+            )
             await asyncio.to_thread(
                 deps.memory_store.log_turn,
                 session_id,
                 user_id,
                 "assistant",
                 response_text,
+            )
+        else:
+            log.warning(
+                "graph.memory_writer | turn_not_persisted | session=%s failed=%s empty=%s",
+                session_id,
+                bool(state.get("response_failed")),
+                not response_text,
             )
 
         # 2) Extract explicit/inline memory from the user message.

@@ -1004,6 +1004,7 @@ async def stream_local_vision(
         "stream": True,
         "max_tokens": 4096,
     }
+    got_content = False
     async with httpx.AsyncClient(timeout=120) as client:
         async with client.stream("POST", f"{OPENAI_BASE_URL}/chat/completions", json=payload) as resp:
             resp.raise_for_status()
@@ -1016,10 +1017,19 @@ async def stream_local_vision(
                         data = json.loads(data_str)
                     except json.JSONDecodeError:
                         continue
-                    delta = data.get("choices", [{}])[0].get("delta", {})
+                    if data.get("error"):
+                        err = data["error"]
+                        msg = err.get("message", err) if isinstance(err, dict) else err
+                        raise RuntimeError(f"vision model stream error: {msg}")
+                    delta = (data.get("choices") or [{}])[0].get("delta", {})
                     chunk = delta.get("content", "")
                     if chunk:
+                        got_content = True
                         yield chunk
+    # A llama-server crash mid-request (e.g. image larger than --ubatch-size) ends the
+    # stream with a 200 and no content; surface it instead of returning a blank reply.
+    if not got_content:
+        raise RuntimeError("vision model returned an empty response")
 
 async def stream_cloud(system: str, messages: list[dict]):  # type: ignore[override]
     api_key = os.getenv("ANTHROPIC_API_KEY")
