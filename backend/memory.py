@@ -808,6 +808,8 @@ class MemoryStore:
             "response_format": {"type": "json_object"},
             "max_tokens": 2048,
             "temperature": 0.1,
+            # Extraction never needs thinking; it would eat the token budget.
+            "chat_template_kwargs": {"enable_thinking": False},
         }
 
         try:
