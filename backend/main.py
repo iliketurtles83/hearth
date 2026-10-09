@@ -51,7 +51,7 @@ from graph import (
     default_checkpoint_path,
 )
 from auth import AuthService
-from music_fastpath import parse_music_command, format_music_response
+from music.commands import parse_music_command, format_music_response
 from routes.auth_routes import create_auth_router
 from routes.memory_tool_routes import create_memory_tool_router
 from routes.chat_routes import create_chat_router

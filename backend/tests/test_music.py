@@ -1,5 +1,5 @@
 """
-Tests for backend/tools/music.py — Phase 8.
+Tests for the backend/music package (Beets search + MPD playback) — Phase 8.
 
 Covers:
   - Beets DB lock handling (sqlite3.OperationalError → retryable ToolResult)
@@ -87,7 +87,12 @@ _fake_musicpd.CommandError = _FakeCommandError
 
 # The stubs below are only installed for the duration of the `tools.music`
 # import and restored afterwards, so later test files see the real modules.
-_STUBBED_MODULES = ("musicpd", "tools", "tools.base", "tools.music")
+# The music package is popped too: its modules bind musicpd/ToolResult at import.
+_STUBBED_MODULES = (
+    "musicpd", "tools", "tools.base", "tools.music",
+    "music", "music.commands", "music.library", "music.radio", "music.resolve",
+    "music.tool", "music.players", "music.players.mpd",
+)
 _saved_modules = {name: sys.modules.pop(name, None) for name in _STUBBED_MODULES}
 sys.modules["musicpd"] = _fake_musicpd
 
@@ -137,7 +142,12 @@ os.environ.setdefault("MPD_PORT", "6600")
 os.environ.setdefault("MUSIC_ROOT", "/srv/music")
 
 try:
-    import tools.music as music  # noqa: E402  (must come after stubs)
+    import tools.music  # noqa: E402,F401  (must come after stubs; registers the tool)
+    from music import library as music_library  # noqa: E402
+    from music import radio as music_radio  # noqa: E402
+    from music import resolve as music_resolve  # noqa: E402
+    from music import tool as music_tool  # noqa: E402
+    from music.players import mpd as music_mpd  # noqa: E402
 finally:
     for _name, _module in _saved_modules.items():
         if _module is None:
@@ -145,10 +155,11 @@ finally:
         else:
             sys.modules[_name] = _module
 
-# Patch ToolResult references in the music module.
-music.ToolResult = ToolResult
-music.MUSIC_ROOT = "/srv/music"
-music.musicpd = _fake_musicpd
+# Patch ToolResult and musicpd references in the music modules.
+music_tool.ToolResult = ToolResult
+music_mpd.MUSIC_ROOT = "/srv/music"
+music_mpd.musicpd = _fake_musicpd
+music_tool.musicpd = _fake_musicpd
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -165,35 +176,35 @@ def _make_rows(records: list[dict]) -> list[sqlite3.Row]:
 
 def test_url_to_mpd_path_standard():
     url = "/srv/music/rock/artist/song.mp3"
-    assert music._url_to_mpd_path(url) == "rock/artist/song.mp3"
+    assert music_mpd._url_to_mpd_path(url) == "rock/artist/song.mp3"
 
 
 def test_url_to_mpd_path_bytes_path():
     """Beets items.path may be stored as bytes; decoded path strips MUSIC_ROOT."""
     path_bytes = b"/srv/music/rock/The Band/My Song.mp3"
-    assert music._url_to_mpd_path(path_bytes) == "rock/The Band/My Song.mp3"
+    assert music_mpd._url_to_mpd_path(path_bytes) == "rock/The Band/My Song.mp3"
 
 
 def test_url_to_mpd_path_no_prefix_match():
     """Paths that don't match MUSIC_ROOT are returned stripped of leading slash."""
     path = "/other/root/song.mp3"
-    result = music._url_to_mpd_path(path)
+    result = music_mpd._url_to_mpd_path(path)
     assert result == "other/root/song.mp3"
 
 
 def test_url_to_mpd_path_no_file_prefix():
     """Non-file:// URLs fall through the decode branch."""
     url = "/srv/music/song.mp3"
-    result = music._url_to_mpd_path(url)
+    result = music_mpd._url_to_mpd_path(url)
     assert result == "song.mp3"
 
 
 def test_url_to_mpd_path_strips_host_root_when_container_root_differs(monkeypatch):
     """When Beets stores host paths, strip MUSIC_PATH_HOST if MUSIC_ROOT does not match."""
-    monkeypatch.setattr(music, "MUSIC_ROOT", "/music")
-    monkeypatch.setattr(music, "MUSIC_PATH_HOST", "/srv/music")
+    monkeypatch.setattr(music_mpd, "MUSIC_ROOT", "/music")
+    monkeypatch.setattr(music_mpd, "MUSIC_PATH_HOST", "/srv/music")
     url = "/srv/music/metal/Metallica/Battery.mp3"
-    assert music._url_to_mpd_path(url) == "metal/Metallica/Battery.mp3"
+    assert music_mpd._url_to_mpd_path(url) == "metal/Metallica/Battery.mp3"
 
 
 # ── DB lock handling ──────────────────────────────────────────────────────────
@@ -201,8 +212,8 @@ def test_url_to_mpd_path_strips_host_root_when_container_root_differs(monkeypatc
 @pytest.mark.asyncio
 async def test_search_db_locked_returns_retryable():
     """sqlite3.OperationalError during search → retryable ToolResult.failure."""
-    with patch.object(music, "_sync_search", side_effect=sqlite3.OperationalError("database is locked")):
-        result = await music.run({"action": "search", "query": "test", "prompt": "test"})
+    with patch.object(music_library, "_sync_search", side_effect=sqlite3.OperationalError("database is locked")):
+        result = await music_tool.run({"action": "search", "query": "test", "prompt": "test"})
     assert not result.ok
     assert result.retryable
     assert "unavailable" in result.error.lower() or "retry" in result.error.lower()
@@ -211,8 +222,8 @@ async def test_search_db_locked_returns_retryable():
 @pytest.mark.asyncio
 async def test_play_db_locked_returns_retryable():
     """sqlite3.OperationalError during play search → retryable ToolResult.failure."""
-    with patch.object(music, "_sync_search", side_effect=sqlite3.OperationalError("database is locked")):
-        result = await music.run({"action": "play", "query": "song", "prompt": "play song"})
+    with patch.object(music_library, "_sync_search", side_effect=sqlite3.OperationalError("database is locked")):
+        result = await music_tool.run({"action": "play", "query": "song", "prompt": "play song"})
     assert not result.ok
     assert result.retryable
 
@@ -232,8 +243,8 @@ def test_mpd_connect_retries_once_on_failure():
             # second attempt succeeds
             self._connected = True
 
-    with patch.object(music.musicpd, "MPDClient", FlakyClient):
-        client = music._mpd_connect()
+    with patch.object(music_mpd.musicpd, "MPDClient", FlakyClient):
+        client = music_mpd._mpd_connect()
     assert call_count == 2
     assert client._connected
 
@@ -244,9 +255,9 @@ def test_mpd_connect_raises_after_two_failures():
         def connect(self, host, port):
             raise _FakeConnectionError("always refused")
 
-    with patch.object(music.musicpd, "MPDClient", AlwaysFailClient):
+    with patch.object(music_mpd.musicpd, "MPDClient", AlwaysFailClient):
         with pytest.raises(_FakeConnectionError):
-            music._mpd_connect()
+            music_mpd._mpd_connect()
 
 
 @pytest.mark.asyncio
@@ -254,10 +265,10 @@ async def test_play_mpd_total_failure_returns_retryable():
     """MPD connection failure during play → retryable ToolResult."""
     fake_track = {"id": 1, "title": "T", "artist": "A", "album": "B", "url": "/srv/music/t.mp3", "score": 0.9}
     with (
-        patch.object(music, "_sync_search", return_value=[fake_track]),
-        patch.object(music, "_sync_play", side_effect=ConnectionRefusedError("mpd down")),
+        patch.object(music_library, "_sync_search", return_value=[fake_track]),
+        patch.object(music_mpd, "_sync_play", side_effect=ConnectionRefusedError("mpd down")),
     ):
-        result = await music.run({"action": "play", "query": "T", "prompt": "play T"})
+        result = await music_tool.run({"action": "play", "query": "T", "prompt": "play T"})
     assert not result.ok
     assert result.retryable
 
@@ -271,8 +282,8 @@ async def test_search_returns_ranked_results():
         {"id": 1, "title": "Popular Song", "artist": "Artist", "album": "Album", "url": "/srv/music/a.mp3", "score": 0.9},
         {"id": 2, "title": "Obscure Song", "artist": "Artist", "album": "Album", "url": "/srv/music/b.mp3", "score": 0.76},
     ]
-    with patch.object(music, "_sync_search", return_value=ranked):
-        result = await music.run({"action": "search", "query": "artist", "prompt": "artist"})
+    with patch.object(music_library, "_sync_search", return_value=ranked):
+        result = await music_tool.run({"action": "search", "query": "artist", "prompt": "artist"})
     assert result.ok
     assert result.data["results"][0]["id"] == 1
     assert result.data["total"] == 2
@@ -287,9 +298,9 @@ def test_artist_radio_seeded_determinism():
          "url": f"/srv/music/s{i}.mp3", "score": 0.0, "rating": i * 10}
         for i in range(1, 20)
     ]
-    with patch.object(music, "_sync_artist_songs", return_value=songs):
-        result_a = music.artist_radio("TestBand", n=5, seed=42)
-        result_b = music.artist_radio("TestBand", n=5, seed=42)
+    with patch.object(music_library, "_sync_artist_songs", return_value=songs):
+        result_a = music_radio.artist_radio("TestBand", n=5, seed=42)
+        result_b = music_radio.artist_radio("TestBand", n=5, seed=42)
     assert result_a == result_b
     assert len(result_a) == 5
 
@@ -301,33 +312,33 @@ def test_artist_radio_no_duplicates():
          "url": f"/srv/music/s{i}.mp3", "score": 0.0, "rating": 1}
         for i in range(1, 8)
     ]
-    with patch.object(music, "_sync_artist_songs", return_value=songs):
-        result = music.artist_radio("Band", n=6, seed=99)
+    with patch.object(music_library, "_sync_artist_songs", return_value=songs):
+        result = music_radio.artist_radio("Band", n=6, seed=99)
     ids = [t["id"] for t in result]
     assert len(ids) == len(set(ids)), "Duplicate tracks returned by artist_radio"
 
 
 def test_playlist_pick_count_adaptive_bounds(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 6)
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 12)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MIN_N", 6)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MAX_N", 12)
 
-    assert music._playlist_pick_count(0) == 0
-    assert music._playlist_pick_count(4) == 4
-    assert music._playlist_pick_count(20) == 10
-    assert music._playlist_pick_count(100) == 12
-    assert music._playlist_pick_count(100, requested_n=5) == 5
+    assert music_radio._playlist_pick_count(0) == 0
+    assert music_radio._playlist_pick_count(4) == 4
+    assert music_radio._playlist_pick_count(20) == 10
+    assert music_radio._playlist_pick_count(100) == 12
+    assert music_radio._playlist_pick_count(100, requested_n=5) == 5
 
 
 def test_artist_radio_default_target_is_adaptive(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 12)
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MIN_N", 12)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MAX_N", 24)
     songs = [
         {"id": i, "title": f"Song {i}", "artist": "Band", "album": "A",
          "url": f"/srv/music/s{i}.mp3", "score": 0.0, "rating": i}
         for i in range(1, 41)
     ]
-    with patch.object(music, "_sync_artist_songs", return_value=songs):
-        result = music.artist_radio("Band", seed=7)
+    with patch.object(music_library, "_sync_artist_songs", return_value=songs):
+        result = music_radio.artist_radio("Band", seed=7)
     # pool=40 -> adaptive pick count = min(max_n=24, max(min_n=12, pool//2=20)) => 20
     assert len(result) == 20
 
@@ -347,11 +358,11 @@ def test_weighted_unique_sample_never_underfills_target_under_skew():
     ]
     weights = [max(float(s.get("rating", 0.0)), 0.01) for s in songs]
 
-    picked = music._weighted_unique_sample(
+    picked = music_radio._weighted_unique_sample(
         songs,
         weights,
         pick_count=20,
-        rng=music.random.Random(7),
+        rng=music_radio.random.Random(7),
     )
 
     assert len(picked) == 20
@@ -360,8 +371,8 @@ def test_weighted_unique_sample_never_underfills_target_under_skew():
 
 
 def test_artist_radio_default_target_not_underfilled_with_skew(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 12)
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MIN_N", 12)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MAX_N", 24)
     songs = [
         {
             "id": i,
@@ -375,8 +386,8 @@ def test_artist_radio_default_target_not_underfilled_with_skew(monkeypatch):
         for i in range(1, 41)
     ]
 
-    with patch.object(music, "_sync_artist_songs", return_value=songs):
-        result = music.artist_radio("Band", seed=13)
+    with patch.object(music_library, "_sync_artist_songs", return_value=songs):
+        result = music_radio.artist_radio("Band", seed=13)
 
     assert len(result) == 20
     ids = [t["id"] for t in result]
@@ -384,8 +395,8 @@ def test_artist_radio_default_target_not_underfilled_with_skew(monkeypatch):
 
 
 def test_genre_radio_default_target_not_underfilled_with_skew(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MIN_N", 12)
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MIN_N", 12)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MAX_N", 24)
     songs = [
         {
             "id": i,
@@ -399,8 +410,8 @@ def test_genre_radio_default_target_not_underfilled_with_skew(monkeypatch):
         for i in range(1, 41)
     ]
 
-    with patch.object(music, "_sync_genre_songs", return_value=songs):
-        result = music.genre_radio("metal", seed=17)
+    with patch.object(music_library, "_sync_genre_songs", return_value=songs):
+        result = music_radio.genre_radio("metal", seed=17)
 
     assert len(result) == 20
     ids = [t["id"] for t in result]
@@ -442,10 +453,10 @@ def test_sync_genre_songs_uses_genres_column_when_genre_missing(monkeypatch):
     ]
     fake_conn = _FakeConn(_make_rows(rows))
 
-    monkeypatch.setattr(music, "_beets_columns", lambda: {"id", "title", "artist", "album", "path", "genres", "rating"})
-    monkeypatch.setattr(music, "_open_beets", lambda: fake_conn)
+    monkeypatch.setattr(music_library, "_beets_columns", lambda: {"id", "title", "artist", "album", "path", "genres", "rating"})
+    monkeypatch.setattr(music_library, "_open_beets", lambda: fake_conn)
 
-    result = music._sync_genre_songs("reggae")
+    result = music_library._sync_genre_songs("reggae")
 
     assert len(result) == 1
     assert "WHERE genres LIKE ?" in fake_conn.last_sql
@@ -455,18 +466,18 @@ def test_sync_genre_songs_uses_genres_column_when_genre_missing(monkeypatch):
 
 def test_artist_radio_empty_when_no_artist():
     """Returns empty list when artist is not in the library."""
-    with patch.object(music, "_sync_artist_songs", return_value=[]):
-        result = music.artist_radio("NonExistentArtist")
+    with patch.object(music_library, "_sync_artist_songs", return_value=[]):
+        result = music_radio.artist_radio("NonExistentArtist")
     assert result == []
 
 
 def test_resolve_genre_query_matches_taxonomy_term(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_GENRE_TREE_PATH", "/tmp/genres.txt")
-    music._load_genre_terms.cache_clear()
+    monkeypatch.setattr(music_resolve, "MUSIC_GENRE_TREE_PATH", "/tmp/genres.txt")
+    music_resolve._load_genre_terms.cache_clear()
 
     fake_tree = "Rock\n  Progressive Rock\n# comment\n"
-    with patch("builtins.open", mock_open(read_data=fake_tree)), patch.object(music.os.path, "isfile", return_value=True):
-        matched = music._resolve_genre_query("play progressive rock")
+    with patch("builtins.open", mock_open(read_data=fake_tree)), patch.object(music_resolve.os.path, "isfile", return_value=True):
+        matched = music_resolve._resolve_genre_query("play progressive rock")
 
     assert matched == "progressive rock"
 
@@ -477,14 +488,14 @@ async def test_play_prefers_genre_first_when_query_matches_known_genre(monkeypat
         {"id": 1, "title": "Track 1", "artist": "Band", "album": "A", "url": "/srv/music/t1.mp3", "score": 0.0, "rating": 10},
         {"id": 2, "title": "Track 2", "artist": "Band", "album": "A", "url": "/srv/music/t2.mp3", "score": 0.0, "rating": 8},
     ]
-    monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: "metal")
+    monkeypatch.setattr(music_resolve, "_resolve_genre_query", lambda _q: "metal")
 
     with (
-        patch.object(music, "genre_radio", return_value=tracks) as genre_radio_mock,
-        patch.object(music, "_sync_play_tracks", return_value={}),
-        patch.object(music, "_sync_search", side_effect=AssertionError("_sync_search should not run on genre-first path")),
+        patch.object(music_radio, "genre_radio", return_value=tracks) as genre_radio_mock,
+        patch.object(music_mpd, "_sync_play_tracks", return_value={}),
+        patch.object(music_library, "_sync_search", side_effect=AssertionError("_sync_search should not run on genre-first path")),
     ):
-        result = await music.run({"action": "play", "query": "metal", "prompt": "play metal"})
+        result = await music_tool.run({"action": "play", "query": "metal", "prompt": "play metal"})
 
     assert result.ok
     assert result.data["action"] == "play"
@@ -501,15 +512,15 @@ async def test_play_michael_jackson_uses_artist_heuristic_when_not_genre(monkeyp
     radio_tracks = [
         {"id": 10, "title": "Billie Jean", "artist": "Michael Jackson", "album": "Thriller", "url": "/srv/music/bj.mp3", "score": 0.0, "rating": 100},
     ]
-    monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: None)
+    monkeypatch.setattr(music_resolve, "_resolve_genre_query", lambda _q: None)
 
     with (
-        patch.object(music, "_sync_search", return_value=search_results),
-        patch.object(music, "_sync_genre_songs", return_value=[]),
-        patch.object(music, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
-        patch.object(music, "_sync_play_tracks", return_value={}),
+        patch.object(music_library, "_sync_search", return_value=search_results),
+        patch.object(music_library, "_sync_genre_songs", return_value=[]),
+        patch.object(music_radio, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
+        patch.object(music_mpd, "_sync_play_tracks", return_value={}),
     ):
-        result = await music.run({"action": "play", "query": "michael jackson", "prompt": "play michael jackson"})
+        result = await music_tool.run({"action": "play", "query": "michael jackson", "prompt": "play michael jackson"})
 
     assert result.ok
     assert result.data["tracks"][0]["artist"] == "Michael Jackson"
@@ -547,16 +558,16 @@ async def test_play_multiword_artist_prefers_artist_matches_even_when_title_hits
             "rating": 100,
         }
     ]
-    monkeypatch.setattr(music, "_resolve_genre_query", lambda _q: None)
+    monkeypatch.setattr(music_resolve, "_resolve_genre_query", lambda _q: None)
 
     with (
-        patch.object(music, "_sync_search", return_value=search_results),
-        patch.object(music, "_sync_genre_songs", return_value=[]),
-        patch.object(music, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
-        patch.object(music, "_sync_play_tracks", return_value={}),
-        patch.object(music, "_sync_play", return_value={}),
+        patch.object(music_library, "_sync_search", return_value=search_results),
+        patch.object(music_library, "_sync_genre_songs", return_value=[]),
+        patch.object(music_radio, "artist_radio", return_value=radio_tracks) as artist_radio_mock,
+        patch.object(music_mpd, "_sync_play_tracks", return_value={}),
+        patch.object(music_mpd, "_sync_play", return_value={}),
     ):
-        result = await music.run(
+        result = await music_tool.run(
             {"action": "play", "query": "michael jackson", "prompt": "play Michael Jackson"}
         )
 
@@ -588,8 +599,8 @@ def test_sync_play_tracks_skips_missing_mpd_paths():
         {"url": "/srv/music/ok/song2.mp3"},
     ]
 
-    with patch.object(music, "_mpd_connect", return_value=client):
-        music._sync_play_tracks(tracks)
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        music_mpd._sync_play_tracks(tracks)
 
     assert client.added == ["ok/song1.mp3", "ok/song2.mp3"]
     assert client.play_called is True
@@ -603,12 +614,12 @@ async def test_play_falls_back_to_artist_radio():
          "url": "/srv/music/s.mp3", "score": 0.0, "rating": 1}
     ]
     with (
-        patch.object(music, "_sync_search", return_value=[]),
-        patch.object(music, "_sync_genre_songs", return_value=[]),
-        patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_play_tracks", return_value={}),
+        patch.object(music_library, "_sync_search", return_value=[]),
+        patch.object(music_library, "_sync_genre_songs", return_value=[]),
+        patch.object(music_radio, "artist_radio", return_value=tracks),
+        patch.object(music_mpd, "_sync_play_tracks", return_value={}),
     ):
-        result = await music.run({"action": "play", "query": "Band", "prompt": "play Band"})
+        result = await music_tool.run({"action": "play", "query": "Band", "prompt": "play Band"})
     assert result.ok
     assert result.data["action"] == "play"
 
@@ -620,11 +631,11 @@ async def test_queue_artist_param_uses_queue_tracks_not_play_tracks():
          "url": "/srv/music/s.mp3", "score": 0.0, "rating": 1}
     ]
     with (
-        patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
-        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+        patch.object(music_radio, "artist_radio", return_value=tracks),
+        patch.object(music_mpd, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
+        patch.object(music_mpd, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
-        result = await music.run({"action": "queue", "artist": "Band", "prompt": "queue band"})
+        result = await music_tool.run({"action": "queue", "artist": "Band", "prompt": "queue band"})
     assert result.ok
     assert result.data["action"] == "queue"
     queue_tracks_mock.assert_called_once_with(tracks)
@@ -637,12 +648,12 @@ async def test_queue_title_artist_miss_falls_back_to_queue_tracks():
          "url": "/srv/music/s3.mp3", "score": 0.0, "rating": 1}
     ]
     with (
-        patch.object(music, "_sync_search_by_title_artist", return_value=[]),
-        patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
-        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+        patch.object(music_library, "_sync_search_by_title_artist", return_value=[]),
+        patch.object(music_radio, "artist_radio", return_value=tracks),
+        patch.object(music_mpd, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
+        patch.object(music_mpd, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
-        result = await music.run({
+        result = await music_tool.run({
             "action": "queue",
             "query": "missing title",
             "artist_filter": "Band",
@@ -661,11 +672,11 @@ async def test_queue_year_range_uses_queue_tracks_not_play_tracks():
         for i in range(1, 7)
     ]
     with (
-        patch.object(music, "_sync_search_by_year_range", return_value=pool),
-        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
-        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+        patch.object(music_library, "_sync_search_by_year_range", return_value=pool),
+        patch.object(music_mpd, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
+        patch.object(music_mpd, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
-        result = await music.run({"action": "queue", "year_range": (1990, 1999), "prompt": "queue 90s"})
+        result = await music_tool.run({"action": "queue", "year_range": (1990, 1999), "prompt": "queue 90s"})
     assert result.ok
     assert result.data["action"] == "queue"
     assert queue_tracks_mock.called
@@ -678,12 +689,12 @@ async def test_queue_no_results_falls_back_to_queue_tracks():
          "url": "/srv/music/s2.mp3", "score": 0.0, "rating": 1}
     ]
     with (
-        patch.object(music, "_sync_search", return_value=[]),
-        patch.object(music, "artist_radio", return_value=tracks),
-        patch.object(music, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
-        patch.object(music, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
+        patch.object(music_library, "_sync_search", return_value=[]),
+        patch.object(music_radio, "artist_radio", return_value=tracks),
+        patch.object(music_mpd, "_sync_queue_tracks", return_value={}) as queue_tracks_mock,
+        patch.object(music_mpd, "_sync_play_tracks", side_effect=AssertionError("_sync_play_tracks should not run for queue")),
     ):
-        result = await music.run({"action": "queue", "query": "Band", "prompt": "queue band"})
+        result = await music_tool.run({"action": "queue", "query": "Band", "prompt": "queue band"})
     assert result.ok
     assert result.data["action"] == "queue"
     queue_tracks_mock.assert_called_once_with(tracks)
@@ -699,11 +710,11 @@ async def test_auto_pick_selects_first_result():
         {"id": 11, "title": "Other Song", "artist": "A", "album": "B", "url": "/srv/music/other.mp3", "score": 0.76},
     ]
     with (
-        patch.object(music, "_sync_search", return_value=results),
-        patch.object(music, "_sync_genre_songs", return_value=[]),
-        patch.object(music, "_sync_play", return_value={}),
+        patch.object(music_library, "_sync_search", return_value=results),
+        patch.object(music_library, "_sync_genre_songs", return_value=[]),
+        patch.object(music_mpd, "_sync_play", return_value={}),
     ):
-        result = await music.run({"action": "play", "query": "hit", "prompt": "play hit"})
+        result = await music_tool.run({"action": "play", "query": "hit", "prompt": "play hit"})
     assert result.ok
     assert result.data["track"]["id"] == 10
     assert result.data["picked_from"] == 2
@@ -714,7 +725,7 @@ async def test_auto_pick_selects_first_result():
 @pytest.mark.asyncio
 async def test_control_invalid_action():
     """Invalid control action returns retryable=False error."""
-    result = await music.run({"action": "control", "control": "INVALID", "prompt": ""})
+    result = await music_tool.run({"action": "control", "control": "INVALID", "prompt": ""})
     assert not result.ok
     assert not result.retryable
 
@@ -722,8 +733,8 @@ async def test_control_invalid_action():
 @pytest.mark.asyncio
 async def test_now_playing_mpd_down():
     """MPD ConnectionError during now_playing → retryable error."""
-    with patch.object(music, "_sync_now_playing", side_effect=ConnectionRefusedError("down")):
-        result = await music.run({"action": "now_playing", "prompt": ""})
+    with patch.object(music_mpd, "_sync_now_playing", side_effect=ConnectionRefusedError("down")):
+        result = await music_tool.run({"action": "now_playing", "prompt": ""})
     assert not result.ok
     assert result.retryable
 
@@ -731,16 +742,16 @@ async def test_now_playing_mpd_down():
 @pytest.mark.asyncio
 async def test_queue_view_mpd_down():
     """MPD ConnectionError during queue_view → retryable error."""
-    with patch.object(music, "_sync_queue_view", side_effect=ConnectionRefusedError("down")):
-        result = await music.run({"action": "queue_view", "prompt": ""})
+    with patch.object(music_mpd, "_sync_queue_view", side_effect=ConnectionRefusedError("down")):
+        result = await music_tool.run({"action": "queue_view", "prompt": ""})
     assert not result.ok
     assert result.retryable
 
 
 @pytest.mark.asyncio
 async def test_control_set_volume_applies_and_returns_level():
-    with patch.object(music, "_sync_set_volume", return_value=37):
-        result = await music.run({"action": "control", "control": "set_volume", "volume": 37, "prompt": ""})
+    with patch.object(music_mpd, "_sync_set_volume", return_value=37):
+        result = await music_tool.run({"action": "control", "control": "set_volume", "volume": 37, "prompt": ""})
     assert result.ok
     assert result.data["action"] == "set_volume"
     assert result.data["volume"] == 37
@@ -748,7 +759,7 @@ async def test_control_set_volume_applies_and_returns_level():
 
 @pytest.mark.asyncio
 async def test_control_set_volume_requires_value():
-    result = await music.run({"action": "control", "control": "set_volume", "prompt": ""})
+    result = await music_tool.run({"action": "control", "control": "set_volume", "prompt": ""})
     assert not result.ok
     assert not result.retryable
 
@@ -762,8 +773,8 @@ def test_sync_now_playing_includes_pos_and_volume():
             return {"title": "Track", "artist": "Band", "album": "Album"}
 
     client = StatusClient()
-    with patch.object(music, "_mpd_connect", return_value=client):
-        data = music._sync_now_playing()
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        data = music_mpd._sync_now_playing()
 
     assert data["pos"] == 3
     assert data["volume"] == 64
@@ -776,10 +787,10 @@ async def test_song_id_resolution():
     """Direct song_id lookup bypasses search and plays by id."""
     track = {"id": 42, "title": "Direct Track", "artist": "A", "album": "B", "url": "/srv/music/d.mp3", "score": 1.0}
     with (
-        patch.object(music, "_sync_get_by_id", return_value=track),
-        patch.object(music, "_sync_play", return_value={}),
+        patch.object(music_library, "_sync_get_by_id", return_value=track),
+        patch.object(music_mpd, "_sync_play", return_value={}),
     ):
-        result = await music.run({"action": "play", "song_id": 42, "prompt": ""})
+        result = await music_tool.run({"action": "play", "song_id": 42, "prompt": ""})
     assert result.ok
     assert result.data["track"]["id"] == 42
     assert result.data["confidence"] == 1.0
@@ -788,8 +799,8 @@ async def test_song_id_resolution():
 @pytest.mark.asyncio
 async def test_song_id_not_found():
     """Missing id → non-retryable error."""
-    with patch.object(music, "_sync_get_by_id", return_value=None):
-        result = await music.run({"action": "play", "song_id": 9999, "prompt": ""})
+    with patch.object(music_library, "_sync_get_by_id", return_value=None):
+        result = await music_tool.run({"action": "play", "song_id": 9999, "prompt": ""})
     assert not result.ok
     assert not result.retryable
 
@@ -797,23 +808,23 @@ async def test_song_id_not_found():
 def test_sync_control_shuffle_empty_queue():
     client = MagicMock()
     client.status.return_value = {"playlistlength": "0"}
-    with patch.object(music, "_mpd_connect", return_value=client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
         with pytest.raises(ValueError, match="The queue is empty."):
-            music._sync_control("shuffle")
+            music_mpd._sync_control("shuffle")
 
 
 def test_sync_control_shuffle_non_empty_queue():
     client = MagicMock()
     client.status.return_value = {"playlistlength": "5"}
-    with patch.object(music, "_mpd_connect", return_value=client):
-        music._sync_control("shuffle")
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        music_mpd._sync_control("shuffle")
     client.shuffle.assert_called_once()
 
 
 @pytest.mark.asyncio
 async def test_run_shuffle_prompt_infers_control():
-    with patch.object(music, "_sync_control") as mock_ctrl:
-        result = await music.run({"prompt": "shuffle my playlist"})
+    with patch.object(music_mpd, "_sync_control") as mock_ctrl:
+        result = await music_tool.run({"prompt": "shuffle my playlist"})
     assert result.ok
     assert result.data["action"] == "shuffle"
     mock_ctrl.assert_called_once_with("shuffle")
@@ -823,8 +834,8 @@ async def test_run_shuffle_prompt_infers_control():
 async def test_run_shuffle_prompt_empty_queue_error():
     client = MagicMock()
     client.status.return_value = {"playlistlength": "0"}
-    with patch.object(music, "_mpd_connect", return_value=client):
-        result = await music.run({"prompt": "shuffle the queue"})
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        result = await music_tool.run({"prompt": "shuffle the queue"})
     assert not result.ok
     assert result.error == "The queue is empty."
     assert not result.retryable
@@ -833,10 +844,10 @@ async def test_run_shuffle_prompt_empty_queue_error():
 @pytest.mark.asyncio
 async def test_run_add_to_the_queue_prompt_infers_queue_action():
     with (
-        patch.object(music, "_sync_search_by_title_artist", return_value=[{"title": "Creep", "artist": "Radiohead", "url": "/music/creep.mp3", "score": 1.0}]),
-        patch.object(music, "_sync_queue") as mock_q,
+        patch.object(music_library, "_sync_search_by_title_artist", return_value=[{"title": "Creep", "artist": "Radiohead", "url": "/music/creep.mp3", "score": 1.0}]),
+        patch.object(music_mpd, "_sync_queue") as mock_q,
     ):
-        result = await music.run({"prompt": "add to the queue Creep by Radiohead"})
+        result = await music_tool.run({"prompt": "add to the queue Creep by Radiohead"})
     assert result.ok
     assert result.data["action"] == "queue"
     mock_q.assert_called_once_with("/music/creep.mp3")
@@ -844,15 +855,15 @@ async def test_run_add_to_the_queue_prompt_infers_queue_action():
 
 def test_sync_control_previous():
     client = MagicMock()
-    with patch.object(music, "_mpd_connect", return_value=client):
-        music._sync_control("previous")
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        music_mpd._sync_control("previous")
     client.previous.assert_called_once()
 
 
 def test_sync_control_clear():
     client = MagicMock()
-    with patch.object(music, "_mpd_connect", return_value=client):
-        music._sync_control("clear")
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        music_mpd._sync_control("clear")
     client.clear.assert_called_once()
 
 
@@ -886,9 +897,9 @@ def real_beets(tmp_path, monkeypatch):
             conn.row_factory = sqlite3.Row
             return conn
 
-        monkeypatch.setattr(music, "_open_beets", _open)
+        monkeypatch.setattr(music_library, "_open_beets", _open)
         monkeypatch.setattr(
-            music, "_beets_columns", lambda: {"id", "title", "artist", "album", "path", "genres", "rating"}
+            music_library, "_beets_columns", lambda: {"id", "title", "artist", "album", "path", "genres", "rating"}
         )
 
     return _install
@@ -898,16 +909,16 @@ def real_beets(tmp_path, monkeypatch):
     "drum & bass", "Drum and Bass", "drum n bass", "drum 'n' bass", "drum'n'bass", "drum&bass", "dnb", "D&B",
 ])
 def test_canonical_genre_unifies_drum_and_bass(variant):
-    assert music._canonical_genre(variant) == "drum & bass"
+    assert music_library._canonical_genre(variant) == "drum & bass"
 
 
 @pytest.mark.parametrize("variant", ["rock & roll", "rock and roll", "rock n roll", "Rock 'N' Roll", "rock'n'roll"])
 def test_canonical_genre_unifies_rock_and_roll(variant):
-    assert music._canonical_genre(variant) == "rock & roll"
+    assert music_library._canonical_genre(variant) == "rock & roll"
 
 
 def test_canonical_genre_leaves_short_ampersand_names_alone():
-    assert music._canonical_genre("Contemporary R&B") == "contemporary r&b"
+    assert music_library._canonical_genre("Contemporary R&B") == "contemporary r&b"
 
 
 @pytest.mark.parametrize("query", ["dnb", "drum and bass", "drum n bass", "drum&bass"])
@@ -919,7 +930,7 @@ def test_sync_genre_songs_matches_every_tag_spelling(real_beets, query):
         ("D", "X", "L", "Drum Kit Bassline Pop"),  # LIKE "%drum%bass%" hit, not drum & bass
         ("E", "X", "L", "Rock"),
     ])
-    titles = sorted(t["title"] for t in music._sync_genre_songs(query))
+    titles = sorted(t["title"] for t in music_library._sync_genre_songs(query))
     assert titles == ["A", "B", "C"]
 
 
@@ -931,18 +942,18 @@ def test_sync_genre_songs_rock_and_roll_variants_share_one_set(real_beets):
         ("D", "X", "L", "Hard Rock"),
     ])
     for query in ("rock and roll", "rock n roll", "rock & roll", "rock'n'roll"):
-        assert sorted(t["title"] for t in music._sync_genre_songs(query)) == ["A", "B", "C"]
+        assert sorted(t["title"] for t in music_library._sync_genre_songs(query)) == ["A", "B", "C"]
 
 
 def test_resolve_genre_query_maps_variants_to_taxonomy_term(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_GENRE_TREE_PATH", "/tmp/genres.txt")
-    music._load_genre_terms.cache_clear()
+    monkeypatch.setattr(music_resolve, "MUSIC_GENRE_TREE_PATH", "/tmp/genres.txt")
+    music_resolve._load_genre_terms.cache_clear()
     fake_tree = "Rock\nRock & Roll\nDrum & Bass\n"
-    with patch("builtins.open", mock_open(read_data=fake_tree)), patch.object(music.os.path, "isfile", return_value=True):
-        assert music._resolve_genre_query("some dnb") == "drum & bass"
-        assert music._resolve_genre_query("rock n roll music") == "rock & roll"
-        assert music._resolve_genre_query("rock") == "rock"
-    music._load_genre_terms.cache_clear()
+    with patch("builtins.open", mock_open(read_data=fake_tree)), patch.object(music_resolve.os.path, "isfile", return_value=True):
+        assert music_resolve._resolve_genre_query("some dnb") == "drum & bass"
+        assert music_resolve._resolve_genre_query("rock n roll music") == "rock & roll"
+        assert music_resolve._resolve_genre_query("rock") == "rock"
+    music_resolve._load_genre_terms.cache_clear()
 
 
 def test_sync_search_ranks_exact_title_match_first(real_beets):
@@ -951,6 +962,6 @@ def test_sync_search_ranks_exact_title_match_first(real_beets):
         ("Season Of The Witch", "Donovan", "Sunshine Superman", "Folk"),
         ("Sunshine Superman", "Donovan", "Sunshine Superman", "Folk"),
     ])
-    results = music._sync_search("sunshine superman")
+    results = music_library._sync_search("sunshine superman")
     assert results[0]["title"] == "Sunshine Superman"
     assert len(results) == 3

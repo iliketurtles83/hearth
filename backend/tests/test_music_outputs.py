@@ -15,7 +15,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import tools
-import tools.music as music_mod
+import tools.music  # noqa: F401  (registers the tool)
+from music.players import mpd as music_mpd
 
 
 _SAMPLE_OUTPUTS = [
@@ -51,8 +52,8 @@ class _MockMPDClient:
 
 def test_sync_get_outputs():
     mock_client = _MockMPDClient()
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
-        res = music_mod._sync_get_outputs()
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
+        res = music_mpd._sync_get_outputs()
         assert len(res) == 2
         assert res[0] == {"id": "0", "name": "Host Speakers", "enabled": True, "plugin": "pulse"}
         assert res[1] == {"id": "1", "name": "Web Stream", "enabled": False, "plugin": "httpd"}
@@ -60,23 +61,23 @@ def test_sync_get_outputs():
 
 def test_sync_set_output_exclusive():
     mock_client = _MockMPDClient()
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
         # Switch exclusively to output 1
-        res = music_mod._sync_set_output("1", mode="exclusive")
+        res = music_mpd._sync_set_output("1", mode="exclusive")
         assert res[0]["enabled"] is False  # Host Speakers disabled
         assert res[1]["enabled"] is True   # Web Stream enabled
 
         # Switch exclusively back to output 0
-        res = music_mod._sync_set_output("0", mode="exclusive")
+        res = music_mpd._sync_set_output("0", mode="exclusive")
         assert res[0]["enabled"] is True   # Host Speakers enabled
         assert res[1]["enabled"] is False  # Web Stream disabled
 
 
 def test_sync_set_output_mirror():
     mock_client = _MockMPDClient()
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
         # In mirror mode, both should be enabled
-        res = music_mod._sync_set_output("1", mode="mirror")
+        res = music_mpd._sync_set_output("1", mode="mirror")
         assert res[0]["enabled"] is True
         assert res[1]["enabled"] is True
 
@@ -86,33 +87,33 @@ def test_sync_set_output_both():
         {"outputid": "0", "outputname": "Host Speakers", "outputenabled": "0", "plugin": "pulse"},
         {"outputid": "1", "outputname": "Web Stream", "outputenabled": "0", "plugin": "httpd"},
     ])
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
         # In both/all mode, all outputs should be enabled
-        res = music_mod._sync_set_output("all", mode="both")
+        res = music_mpd._sync_set_output("all", mode="both")
         assert res[0]["enabled"] is True
         assert res[1]["enabled"] is True
 
 
 def test_sync_set_output_toggle_and_disable():
     mock_client = _MockMPDClient()
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
         # Toggle output 1 from disabled to enabled
-        res = music_mod._sync_set_output("1", mode="toggle")
+        res = music_mpd._sync_set_output("1", mode="toggle")
         assert res[1]["enabled"] is True
 
         # Toggle output 1 from enabled to disabled
-        res = music_mod._sync_set_output("1", mode="toggle")
+        res = music_mpd._sync_set_output("1", mode="toggle")
         assert res[1]["enabled"] is False
 
         # Explicit disable
-        res = music_mod._sync_set_output("0", mode="disable")
+        res = music_mpd._sync_set_output("0", mode="disable")
         assert res[0]["enabled"] is False
 
 
 @pytest.mark.asyncio
 async def test_tool_dispatch_outputs():
     mock_client = _MockMPDClient()
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
         result = await tools.dispatch("music", {"action": "outputs"})
         assert result.ok is True
         assert "outputs" in result.data
@@ -122,7 +123,7 @@ async def test_tool_dispatch_outputs():
 @pytest.mark.asyncio
 async def test_tool_dispatch_select_output():
     mock_client = _MockMPDClient()
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
         result = await tools.dispatch("music", {"action": "select_output", "output_id": "1", "mode": "exclusive"})
         assert result.ok is True
         assert result.data["action"] == "select_output"
@@ -156,7 +157,7 @@ def test_api_music_outputs_and_select():
     client = TestClient(app)
 
     mock_client = _MockMPDClient()
-    with patch.object(music_mod, "_mpd_connect", return_value=mock_client):
+    with patch.object(music_mpd, "_mpd_connect", return_value=mock_client):
         resp = client.get("/music/outputs")
         assert resp.status_code == 200
         data = resp.json()

@@ -39,7 +39,7 @@ Hearth is a local-first personal AI assistant combining:
 - `backend/embedding_router.py` — embedding-based intent router (exemplar index + dual classifier: tool + dialogue). `backend/router.py` does NOT exist.
 - `backend/memory.py` — SQLite + ChromaDB hybrid memory (MemoryStore). LLM extraction/consolidation call Ollama `/api/chat` — never `/api/generate`, which ignores the `system` prompt.
 - `backend/hearth_prompt.txt` — persona/system prompt, loaded via `_load_hearth_prompt` (env var override + hardcoded fallback in `main.py`).
-- `backend/music_fastpath.py` — deterministic pre-graph music routing (bypasses LLM entirely). Don't route music through the graph.
+- `backend/music/` — music package: `commands.py` (deterministic control parsing, `is_direct_play_request`, reply text), `library.py` (read-only Beets queries), `resolve.py` (request → query/genre/album/playlist), `radio.py` (track sampling), `players/mpd.py` (MPD), `tool.py` (`run()`). `backend/tools/music.py` only registers `music.tool`. Tests patch the module that defines a name (e.g. `music.players.mpd._mpd_connect`). Track metadata is fixed upstream in the separate cratedigger project — don't add tag-repair logic here.
 - `backend/auth.py` — scrypt-hashed auth with SQLite token store. Token format: 64-char hex.
 - `backend/app_schemas.py` — Pydantic request/response schemas (ChatRequest, TTSRequest, CodeRequest, SessionSelectRequest).
 - `backend/tools/` — weather, music, timer, calculator, datetime, and base tool modules. Dispatched via `tools.dispatch(tool_name, params)`.
@@ -61,7 +61,7 @@ Hearth is a local-first personal AI assistant combining:
 - `scripts/renew-tailscale-cert.sh` — writes a Tailscale cert to `caddy/certs/` and restarts Caddy if it changed.
 - `mpd/` — MPD config directory (mpd.conf).
 - `config.yaml` — Beets config (non-interactive, no MusicBrainz lookups, copy: no, move: no).
-- `backend/tools/genres.txt` — genre taxonomy for music genre matching (`MUSIC_GENRE_TREE_PATH` overrides).
+- `backend/music/genres.txt` — genre taxonomy for music genre matching (`MUSIC_GENRE_TREE_PATH` overrides).
 
 ## Commands (Copy-Paste Ready)
 
@@ -125,7 +125,7 @@ docker compose build backend
 ## Architecture Constraints
 
 - Frontend always uses relative API paths — single-origin contract with FastAPI. Never serve UI from a separate dev server in production.
-- `music_fastpath.py` sits in front of the graph for deterministic music commands. Don't route music through the graph.
+- `music/commands.py` sits in front of the graph for deterministic music commands (controls, volume, now playing), and self-contained "play/queue X" requests are routed straight to the music tool (`is_direct_play_request`) without the LLM. Don't route those through the LLM.
 - Preserve auth boundary behavior in `backend/main.py`.
 - Code tool is code-question-only: the confirmation-gated file-write nodes were removed (see comment in `graph.py`). `/code` forces the code-question intent; there is no file-write path — don't reintroduce workspace path resolution.
 - Session state is in-memory + cookie-scoped — lost on restart.
