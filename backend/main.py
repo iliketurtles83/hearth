@@ -153,6 +153,9 @@ OPENAI_VISION_MODEL: str = (
     os.getenv("OPENAI_VISION_MODEL")
     or CHAT_MODEL
 )
+# Qwen3-class chat models think by default; for voice that adds ~5 s before the first
+# spoken word (35B-A3B: 5.7 s vs 1.05 s). Sent as chat_template_kwargs on chat turns.
+CHAT_ENABLE_THINKING = os.getenv("CHAT_ENABLE_THINKING", "false").strip().lower() == "true"
 # Startup chat-model warmup: pre-loads the (large) chat model into VRAM so the
 # first /chat doesn't pay the one-time model-load.
 CHAT_MODEL_WARMUP = os.getenv("CHAT_MODEL_WARMUP", "true").strip().lower() == "true"
@@ -992,6 +995,7 @@ async def stream_local(request: Any, model_name: str = CHAT_MODEL):
             "messages": messages,
             "stream": True,
             "max_tokens": 4096,
+            "chat_template_kwargs": {"enable_thinking": CHAT_ENABLE_THINKING},
         }
         tools = getattr(request, "tools", None)
         if tools:

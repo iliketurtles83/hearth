@@ -53,7 +53,7 @@ from tools.timer import format_timer_response
 from tools.calculator import format_calculator_response
 from tools.datetime_tool import format_datetime_response
 from tools.schemas import HEARTH_TOOLS
-from music_fastpath import format_music_response, normalize_music_action
+from music_fastpath import format_music_response, is_direct_play_request, normalize_music_action
 
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns
@@ -555,6 +555,19 @@ def _forced_code_decision(chat_model: str) -> RouteDecision:
     )
 
 
+def _direct_music_decision(chat_model: str) -> RouteDecision:
+    return RouteDecision(
+        intent="external-data-needed",
+        confidence=1.0,
+        use_cloud=False,
+        model=chat_model,
+        tool="music",
+        planner_status="music_direct",
+        reasoning_summary="",
+        needs_memory=False,
+    )
+
+
 def _deterministic_vision_decision(vision_model: str) -> RouteDecision:
     return RouteDecision(
         intent="vision",
@@ -668,6 +681,14 @@ def build_assistant_graph(
         if state.get("image_base64"):
             decision = _deterministic_vision_decision(vision_model)
             route_type = "vision"
+            writer({"meta": _decision_meta(decision, route_type)})
+            return _decision_state_update(decision, route_type)
+
+        # Self-contained "play <thing>" goes straight to the music tool: the
+        # LLM too often claims playback in prose without calling it.
+        if is_direct_play_request(state["message"]):
+            decision = _direct_music_decision(deps.chat_model)
+            route_type = _route_type_for_decision(decision)
             writer({"meta": _decision_meta(decision, route_type)})
             return _decision_state_update(decision, route_type)
 

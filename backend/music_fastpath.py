@@ -32,6 +32,35 @@ def normalize_music_action(params: dict) -> dict:
         params["action"] = "control"
     return params
 
+_DIRECT_PLAY_RE = re.compile(r"^(?:please\s+)?(?:play|queue)\s+(?P<obj>\S.*?)(?:\s+please)?$")
+# Objects that lean on conversation context ("play that again", "play something
+# like it") need the LLM to resolve them.
+_CONTEXT_REF_RE = re.compile(
+    r"\b(it|that|this|those|these|them|again|same|more|another|else|something|anything|similar|like)\b"
+)
+# "play" in a non-music sense.
+_NON_MUSIC_RE = re.compile(
+    r"^(?:a\s+|some\s+|the\s+)?(?:games?|chess|cards|poker|along|dead|fair|nice|dumb|safe|"
+    r"devil'?s\s+advocate|roles?|pretend|with|around|tricks?|jokes?|catch|tag)\b"
+)
+
+
+def is_direct_play_request(prompt: str) -> bool:
+    """True for self-contained "play/queue <thing>" imperatives.
+
+    These skip the LLM and go straight to the music tool, which parses the
+    query itself (genre, artist, album, playlist, "X by Y"). Left to the LLM,
+    the model often answers in prose ("Playing heavy metal now.") without
+    calling the tool, copying earlier "Now playing" turns from the history.
+    """
+    pl = prompt.strip().lower().rstrip(".,!?")
+    m = _DIRECT_PLAY_RE.match(pl)
+    if not m:
+        return False
+    obj = m.group("obj")
+    return not (_CONTEXT_REF_RE.search(obj) or _NON_MUSIC_RE.match(obj))
+
+
 def parse_music_command(prompt: str, allow_vague: bool = False) -> dict | None:
     """Deterministically parse literal machine playback controls.
 
