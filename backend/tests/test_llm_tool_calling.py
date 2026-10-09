@@ -203,6 +203,58 @@ async def test_llm_native_music_tool_calling():
 
 
 @pytest.mark.asyncio
+async def test_direct_play_request_skips_llm():
+    """A self-contained "play <thing>" dispatches music without asking the LLM,
+    even when history invites a prose "Now playing" imitation."""
+    dispatched = []
+    llm_calls = []
+
+    async def _fake_stream_local(req, model_name=None):
+        llm_calls.append(req)
+        yield {"text": "Shifting gears now. Playing a heavier selection of metal."}
+
+    async def _fake_stream_cloud(_s, _m):
+        yield "cloud"
+
+    async def _fake_tool_dispatch(tool_name: str, params: dict):
+        dispatched.append((tool_name, params))
+        return ToolResult(
+            ok=True,
+            data={
+                "action": "play",
+                "genre": "heavy metal",
+                "tracks": [{"title": "A", "artist": "X"}, {"title": "B", "artist": "Y"}],
+            },
+        )
+
+    deps = assistant_graph.AssistantGraphDependencies(
+        memory_store=_FakeMemoryStore(),
+        embedding_router=None,
+        router_route=lambda _m: None,
+        stream_local=_fake_stream_local,
+        stream_cloud=_fake_stream_cloud,
+        tool_dispatch=_fake_tool_dispatch,
+        chat_model=TEST_CHAT_MODEL,
+        cloud_model=TEST_CLOUD_MODEL,
+    )
+    graph = assistant_graph.build_assistant_graph(deps)
+
+    state = _base_state()
+    state["history"] = [
+        {"role": "user", "content": "Play metal"},
+        {"role": "assistant", "content": "Now playing: 3 Metal tracks."},
+    ]
+    state["message"] = "Play heavy metal"
+    result = await graph.ainvoke(state)
+
+    assert llm_calls == []
+    assert [name for name, _ in dispatched] == ["music"]
+    assert dispatched[0][1]["prompt"] == "Play heavy metal"
+    assert result["tool"] == "music"
+    assert result["response_text"] == "Now playing: 2 Heavy Metal tracks."
+
+
+@pytest.mark.asyncio
 async def test_llm_native_timer_tool_calling():
     """Graph responder executes timer tool call when the local model yields tool_calls."""
     dispatched = []
