@@ -136,7 +136,9 @@ def test_explicit_album_plays_whole_album_in_track_order(beets_db):
 
     assert result.ok
     assert _added_titles(mpd) == ["So What", "Freddie Freeloader", "Blue in Green"]
-    assert mpd.names()[0] == "clear"
+    # The album replaces the 3-entry queue: appended first, old entries dropped after.
+    assert mpd.names() == ["add", "add", "add", "delete", "play"]
+    assert ("delete", (0, 3)) in mpd.calls and ("play", 0) in mpd.calls
     assert result.data["album"] == "Kind of Blue"
     assert format_music_response(result, {"action": "play"}) == (
         'Now playing the album "Kind of Blue" by Miles Davis (3 tracks).'

@@ -965,3 +965,35 @@ def test_sync_search_ranks_exact_title_match_first(real_beets):
     results = music_library._sync_search("sunshine superman")
     assert results[0]["title"] == "Sunshine Superman"
     assert len(results) == 3
+
+
+def test_play_keeps_existing_queue_when_no_track_is_in_mpd():
+    """A stale MPD index must not wipe the queue: old entries go only once new ones are in."""
+
+    class StaleIndexClient(_FakeMPDClient):
+        def __init__(self):
+            self.queue = ["old/a.mp3", "old/b.mp3"]
+
+        def status(self) -> dict:
+            return {"state": "play", "playlistlength": str(len(self.queue))}
+
+        def add(self, path: str) -> None:
+            if path.startswith("renamed/"):
+                raise _FakeCommandError("[50@0] {add} No such directory")
+            self.queue.append(path)
+
+        def delete(self, span) -> None:
+            start, end = span
+            del self.queue[start:end]
+
+        def clear(self) -> None:
+            self.queue = []
+
+    client = StaleIndexClient()
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        with pytest.raises(FileNotFoundError):
+            music_mpd._sync_play_tracks([{"url": "/srv/music/renamed/x.mp3"}, {"url": "/srv/music/renamed/y.mp3"}])
+        assert client.queue == ["old/a.mp3", "old/b.mp3"]
+
+        music_mpd._sync_play_tracks([{"url": "/srv/music/renamed/x.mp3"}, {"url": "/srv/music/new/z.mp3"}])
+        assert client.queue == ["new/z.mp3"]

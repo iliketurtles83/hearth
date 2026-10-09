@@ -77,11 +77,10 @@ def _sync_play(url: str) -> dict[str, Any]:
     log.debug("mpd.play | path=%s", path)
 
     def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
-        c.clear()
-        added = _add_mpd_paths(c, [path])
+        added = _replace_queue(c, [path])
         if not added:
             raise FileNotFoundError(f"Track not available in MPD library: {path}")
-        c.play()
+        c.play(0)
         # Confirm MPD transitioned to play and capture timing for UI sync.
         status = c.status()
         return {
@@ -215,11 +214,10 @@ def _sync_play_tracks(tracks: list[dict[str, Any]]) -> dict[str, Any]:
     paths = [_url_to_mpd_path(t["url"]) for t in tracks]
 
     def _fn(c: musicpd.MPDClient) -> dict[str, Any]:
-        c.clear()
-        added_paths = _add_mpd_paths(c, paths)
+        added_paths = _replace_queue(c, paths)
         if not added_paths:
             raise FileNotFoundError("No selected tracks are available in the MPD library")
-        c.play()
+        c.play(0)
         status = c.status()
         added_set = set(added_paths)
         queued_tracks = [t for t, p in zip(tracks, paths) if p in added_set]
@@ -399,6 +397,28 @@ def _is_mpd_missing_path_error(exc: Exception) -> bool:
         return "No such directory" in str(exc)
     # Test stubs may not expose CommandError; keep classification behavior via message.
     return "No such directory" in str(exc)
+
+
+def _replace_queue(client: musicpd.MPDClient, paths: list[str]) -> list[str]:
+    """Swap the queue for *paths*, keeping the old queue if none can be added.
+
+    New tracks are appended first and the old entries dropped afterwards: clearing
+    up front left an empty queue whenever MPD's database lacked every path (e.g. it
+    wasn't rescanned after files were renamed).
+    """
+    old_len = int(client.status().get("playlistlength", 0))
+    added = _add_mpd_paths(client, paths)
+    if added and old_len:
+        client.delete((0, old_len))
+    return added
+
+
+def _sync_update_db() -> str:
+    """Start an MPD database rescan (runs in the background); returns the job id.
+
+    MPD's auto_update relies on inotify, which doesn't fire on network shares.
+    """
+    return str(_with_mpd(lambda c: c.update()))
 
 
 def _add_mpd_paths(client: musicpd.MPDClient, paths: list[str]) -> list[str]:
