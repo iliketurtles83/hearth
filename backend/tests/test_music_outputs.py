@@ -205,13 +205,95 @@ def test_api_music_timing_logs_client_marks(caplog):
                 "mode": "fresh",
                 "output": "phone",
                 "marks": {"stream_playing": 6900, "reply_done": 1200, "Bad Key\n": 5},
-                "stream_lag_s": 4.25,
+                "drift_s": 0.25,
             },
         )
     assert resp.status_code == 200
     line = next(r.getMessage() for r in caplog.records if "music.client_timing" in r.getMessage())
-    assert "mode=fresh output=phone stream_lag_s=4.25" in line
+    assert "mode=fresh output=phone drift_s=0.25" in line
     assert "marks_ms=[reply_done=1200 stream_playing=6900]" in line
 
     too_many = {f"k{chr(97 + i)}": i for i in range(20)}
     assert client.post("/music/timing", json={"mode": "x", "output": "y", "marks": too_many}).status_code == 422
+
+
+def _music_router_client():
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+    from fastapi.testclient import TestClient
+    from routes.memory_tool_routes import create_memory_tool_router
+
+    app = FastAPI()
+    app.include_router(
+        create_memory_tool_router(
+            get_memory_store=lambda: None,
+            memory_consolidation_batch_size=10,
+            error_response=lambda msg, code, ret, status_code: JSONResponse({"error": msg, "code": code}, status_code=status_code),
+            dispatch_tool=tools.dispatch,
+            run_weather=lambda p: None,
+            run_beets_update=lambda: {"ok": True},
+        )
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
+def music_root(tmp_path, monkeypatch):
+    root = tmp_path / "music"
+    (root / "rock" / "Band").mkdir(parents=True)
+    (root / "rock" / "Band" / "01 - Song.mp3").write_bytes(b"ID3" + bytes(range(256)) * 4)
+    (root / "rock" / "Band" / "cover.jpg").write_bytes(b"\xff\xd8")
+    (root / "rock" / "Band" / "old.wma").write_bytes(b"wma")
+    (tmp_path / "secret.mp3").write_bytes(b"outside")
+    monkeypatch.setattr(music_mpd, "MUSIC_ROOT", str(root))
+    return root
+
+
+def test_resolve_audio_file_only_serves_audio_inside_music_root(music_root):
+    full, media_type = music_mpd.resolve_audio_file("rock/Band/01 - Song.mp3")
+    assert full == str(music_root / "rock" / "Band" / "01 - Song.mp3")
+    assert media_type == "audio/mpeg"
+    for bad in (
+        "../secret.mp3",                # escapes the root
+        "rock/../../secret.mp3",
+        str(music_root / "rock" / "Band" / "01 - Song.mp3"),  # absolute
+        "rock/Band/cover.jpg",          # not audio
+        "rock/Band/old.wma",            # browsers can't play it
+        "rock/Band/missing.mp3",
+        "rock/Band",                    # directory
+        "rock/Band/01 - Song.mp3\x00.jpg",
+        "",
+    ):
+        assert music_mpd.resolve_audio_file(bad) is None, bad
+
+
+def test_api_music_file_serves_ranges_and_rejects_outside_paths(music_root):
+    client = _music_router_client()
+    resp = client.get("/music/file", params={"path": "rock/Band/01 - Song.mp3"})
+    assert resp.status_code == 200
+    assert resp.headers["content-type"] == "audio/mpeg"
+    assert resp.content.startswith(b"ID3")
+
+    # The browser seeks (and starts at MPD's position) with byte ranges.
+    ranged = client.get("/music/file", params={"path": "rock/Band/01 - Song.mp3"}, headers={"Range": "bytes=3-6"})
+    assert ranged.status_code == 206
+    assert ranged.content == bytes([0, 1, 2, 3])
+
+    assert client.get("/music/file", params={"path": "../secret.mp3"}).status_code == 404
+    assert client.get("/music/file", params={"path": "rock/Band/cover.jpg"}).status_code == 404
+
+
+def test_now_playing_reports_current_and_next_file():
+    client = MagicMock()
+    client.status.return_value = {"state": "play", "song": "0", "nextsong": "1", "elapsed": "12.5", "duration": "200.0", "volume": "70"}
+    client.currentsong.return_value = {"title": "A", "artist": "X", "album": "Y", "file": "rock/a.mp3"}
+    client.playlistinfo.return_value = [{"file": "rock/b.mp3"}]
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        data = music_mpd._sync_now_playing()
+    assert data["track"]["file"] == "rock/a.mp3"
+    assert data["next_file"] == "rock/b.mp3"
+    client.playlistinfo.assert_called_once_with(1)
+
+    client.status.return_value = {"state": "play", "song": "1", "elapsed": "1.0", "volume": "70"}
+    with patch.object(music_mpd, "_mpd_connect", return_value=client):
+        assert music_mpd._sync_now_playing()["next_file"] is None

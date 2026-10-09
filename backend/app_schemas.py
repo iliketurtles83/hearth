@@ -63,7 +63,7 @@ class MusicTimingReport(BaseModel):
     mode: str = Field(max_length=16)
     output: str = Field(max_length=16)
     marks: dict[str, int] = Field(max_length=16)
-    stream_lag_s: float = 0.0
+    drift_s: float = 0.0  # device player position minus MPD's, at report time
 
 
 

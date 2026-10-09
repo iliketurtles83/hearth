@@ -815,15 +815,16 @@
   let _mpdPolledAt = 0;
   let _currentTrack = null;
   let _currentTrackKey = null;
-  // Track MPD already left but whose buffered tail is still audible on the web stream.
-  let _prevTrack = null;
   let _shownTrackKey = null;
   let _shownTrack = null;
   let _lastEndRefreshAt = 0;
-  // performance.now() when the web stream (re)connected; 0 when not streaming.
-  let _streamConnectedAt = 0;
-  // Set when MPD stopped at end of queue while the web stream still had audio buffered.
-  let _stopTail = null;
+  // Last /music/now_playing payload, so an output switch can start playing inside the tap.
+  let _lastNowPlaying = null;
+  // Device output: MPD file loaded in the web player, the one after it, and the one that
+  // just ended locally (MPD may still report it for a moment).
+  let _deviceFile = null;
+  let _nextFile = null;
+  let _endedFile = null;
 
   function _formatTime(seconds) {
     if (!Number.isFinite(seconds) || seconds < 0) return '0:00';
@@ -844,18 +845,6 @@
       const pct = safeDuration > 0 ? Math.min(100, (safeElapsed / safeDuration) * 100) : 0;
       fill.style.width = `${pct}%`;
     }
-  }
-
-  // Seconds the web stream audio is behind MPD. The stream is live: audio position t was
-  // emitted by MPD t seconds after connecting, so wall time since connect minus currentTime
-  // is how much MPD has played that this device hasn't (startup buffering + network).
-  function _streamLag() {
-    if (!_streamConnectedAt) return 0;
-    if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return 0;
-    const webPlayer = document.getElementById('hearth-web-player');
-    if (!webPlayer || webPlayer.paused || !webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) return 0;
-    const lag = (performance.now() - _streamConnectedAt) / 1000 - webPlayer.currentTime;
-    return Math.max(0, Math.min(lag, 30));
   }
 
   // Play-latency probe: ms marks from sending a music request until this device's
@@ -880,7 +869,7 @@
       mode,
       output: _currentOutputTarget,
       marks: probe.marks,
-      stream_lag_s: Math.round(_streamLag() * 100) / 100,
+      drift_s: Math.round(_deviceDrift() * 100) / 100,
     };
     (window.apiFetch || fetch)('/music/timing', {
       method: 'POST',
@@ -912,38 +901,17 @@
       musicCollapsedNowPlayingEl.textContent = nowPlayingText;
       musicCollapsedNowPlayingEl.classList.remove('now-playing-idle');
     }
-    _updateMediaSession(track, _playbackState === 'play' || !!_stopTail);
+    _updateMediaSession(track, _playbackState === 'play');
   }
 
-  // Render what this device is hearing: MPD's position minus the stream lag. While the lag
-  // reaches back past the start of the current track, keep showing the previous one.
   function _renderPlayback() {
-    if (_stopTail) {
-      const remaining = (_stopTail.until - performance.now()) / 1000;
-      if (remaining <= 0) {
-        _stopTail = null;
-        refreshNowPlaying();
-        return;
-      }
-      _showTrack(_stopTail.track, _stopTail.key);
-      _updateProgressDisplay(_stopTail.endPos - remaining, _stopTail.duration);
-      return;
-    }
     if (!_currentTrack) return;
-    const raw = _mpdElapsedNow();
-    const heard = raw - _streamLag();
-    // Small negatives are just request timing around a skip/reconnect, not audible old audio.
-    if (heard < -1 && _prevTrack) {
-      _showTrack(_prevTrack.track, _prevTrack.key);
-      _updateProgressDisplay(_prevTrack.endPos + heard, _prevTrack.duration);
-    } else {
-      if (heard >= 0) _prevTrack = null;
-      _showTrack(_currentTrack, _currentTrackKey);
-      _updateProgressDisplay(Math.max(0, heard), _currentDuration);
-    }
+    const elapsed = _mpdElapsedNow();
+    _showTrack(_currentTrack, _currentTrackKey);
+    _updateProgressDisplay(elapsed, _currentDuration);
     // MPD has most likely moved to the next track; poll now rather than waiting for the interval.
     const now = performance.now();
-    if (_playbackState === 'play' && _currentDuration > 0 && raw > _currentDuration + 0.5 && now - _lastEndRefreshAt > 3000) {
+    if (_playbackState === 'play' && _currentDuration > 0 && elapsed > _currentDuration + 0.5 && now - _lastEndRefreshAt > 3000) {
       _lastEndRefreshAt = now;
       refreshNowPlaying();
     }
@@ -964,7 +932,6 @@
   function _resetTrackTiming() {
     _currentTrack = null;
     _currentTrackKey = null;
-    _prevTrack = null;
     _shownTrackKey = null;
     _shownTrack = null;
     _mpdElapsed = 0;
@@ -986,34 +953,16 @@
       const previousState = _playbackState;
       const isPlaying = data.track && data.state !== 'stop';
 
+      _lastNowPlaying = data;
+
       if (isPlaying) {
-        _stopTail = null;
         _playbackState = data.state || 'stop';
         const t = data.track;
-        const now = performance.now();
-        const elapsed = Number.isFinite(data.elapsed) ? data.elapsed : 0;
-        const key = [data.pos, t.title, t.artist].join('|');
-        if (_currentTrack && _currentTrackKey !== key && previousState === 'play') {
-          // MPD moved on. Remember where it left the old track (its end, or the skip point)
-          // so the still-buffered tail is shown under the right title.
-          const startedAt = now - elapsed * 1000;
-          let endPos = _mpdElapsed + (startedAt - _mpdPolledAt) / 1000;
-          if (_currentDuration > 0) endPos = Math.min(endPos, _currentDuration);
-          _prevTrack = {
-            track: _currentTrack,
-            key: _currentTrackKey,
-            endPos: Math.max(0, endPos),
-            duration: _currentDuration,
-          };
-        } else if (_currentTrackKey !== key) {
-          _prevTrack = null;
-        }
         _currentTrack = t;
-        _currentTrackKey = key;
-        _mpdElapsed = elapsed;
-        _mpdPolledAt = now;
+        _currentTrackKey = [data.pos, t.title, t.artist].join('|');
+        _mpdElapsed = Number.isFinite(data.elapsed) ? data.elapsed : 0;
+        _mpdPolledAt = performance.now();
         _currentDuration = Number.isFinite(data.duration) ? data.duration : 0;
-        if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
         _renderPlayback();
 
         // The 10 s poll can land mid-reply while older music plays; only probe after the reply.
@@ -1024,62 +973,38 @@
           if (autoExpand || previousState !== 'play') {
             expandMusicPanel();
           }
-          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-            const webPlayer = document.getElementById('hearth-web-player');
-            if (webPlayer && (!webPlayer.paused || autoExpand)) {
-              _ensureWebPlayerPlaying(false);
-            }
-            // A fresh stream reports on its 'playing' event; an already-running one
-            // carries the new track after its current lag.
-            if (probing && !('stream_src' in _playProbe.marks)) {
-              _probeReport(_streamConnectedAt ? 'live' : 'idle');
-            }
-          } else if (probing) {
-            _probeReport('host');
+          // Join playback this device is already part of, or one it just asked for; a
+          // background poll must not start audio on its own.
+          if (_deviceFile || autoExpand) _followMpd(data);
+          // A newly loaded track reports from its 'playing' event instead.
+          if (probing && !('device_src' in _playProbe.marks)) {
+            _probeReport(_deviceOutput() ? 'device_unchanged' : 'host');
           }
-          _updateMediaSession(_shownTrack || t, true);
+          _updateMediaSession(t, true);
         } else {
           _stopProgressTicker();
-          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-            _pauseWebPlayer();
-          }
+          _followMpd(data);
           _updateMediaSession(t, false);
         }
+        // With device output, "playing" means this device is playing: until it has joined,
+        // the button offers ▶, which resumes MPD (a no-op) and joins.
+        const audible = data.state === 'play' && (!_deviceOutput() || Boolean(_deviceFile));
+        if (btn) btn.textContent = audible ? '⏸' : '▶';
       } else {
-        // Queue ran out naturally: the web stream still holds the end of the last track.
-        // Let it play out (and keep the display on it) before tearing the stream down.
-        const tail = previousState === 'play' && !_stopTail ? _streamLag() : 0;
-        if (tail > 1 && _currentTrack) {
-          let endPos = _mpdElapsedNow();
-          if (_currentDuration > 0) endPos = Math.min(endPos, _currentDuration);
-          _stopTail = {
-            track: _currentTrack,
-            key: _currentTrackKey,
-            endPos,
-            duration: _currentDuration,
-            until: performance.now() + tail * 1000,
-          };
-          _playbackState = data.state || 'stop';
-          _startProgressTicker();
-          _renderPlayback();
-        } else if (!_stopTail) {
-          _playbackState = data.state || 'stop';
-          _stopProgressTicker();
-          _resetTrackTiming();
-          if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-            _pauseWebPlayer();
-          }
-          _updateMediaSession(null, false);
-          titleEl.textContent = 'Nothing playing';
-          titleEl.classList.add('now-playing-idle');
-          if (subtitleEl) subtitleEl.textContent = '';
-          if (musicCollapsedNowPlayingEl) {
-            musicCollapsedNowPlayingEl.textContent = 'Nothing playing';
-            musicCollapsedNowPlayingEl.classList.add('now-playing-idle');
-          }
-          if (btn) btn.textContent = '▶';
-          _updateProgressDisplay(0, 0);
+        _playbackState = data.state || 'stop';
+        _stopProgressTicker();
+        _resetTrackTiming();
+        _stopDevicePlayer();
+        _updateMediaSession(null, false);
+        titleEl.textContent = 'Nothing playing';
+        titleEl.classList.add('now-playing-idle');
+        if (subtitleEl) subtitleEl.textContent = '';
+        if (musicCollapsedNowPlayingEl) {
+          musicCollapsedNowPlayingEl.textContent = 'Nothing playing';
+          musicCollapsedNowPlayingEl.classList.add('now-playing-idle');
         }
+        if (btn) btn.textContent = '▶';
+        _updateProgressDisplay(0, 0);
       }
 
       if (volumeInput && Number.isFinite(data.volume)) {
@@ -1087,6 +1012,7 @@
         volumeInput.value = String(vol);
         if (volumeValue) volumeValue.textContent = `${vol}%`;
         if (vol > 0) _lastVolume = vol;
+        _applyDeviceVolume(vol);
       }
     } catch {
       // non-fatal — MPD may not be running
@@ -1134,21 +1060,83 @@
   let _currentOutputTarget = (_isHostDevice() && !localStorage.getItem('hearth:audio_sink_id'))
     ? 'host'
     : (localStorage.getItem('hearth:music_output') || 'host');
-  let _isAppPausing = false;
 
-  function _pauseWebPlayer() {
-    const webPlayer = document.getElementById('hearth-web-player');
-    _streamConnectedAt = 0;
-    _stopTail = null;
-    if (webPlayer) {
-      _isAppPausing = true;
-      webPlayer.pause();
-      webPlayer.removeAttribute('src');
-      webPlayer.load();
-      setTimeout(() => {
-        _isAppPausing = false;
-      }, 350);
+  // ── Device output ──────────────────────────────────────────────────────────
+  // MPD stays the queue and clock (on a silent output in "This Device" mode); this browser
+  // plays the same file from /music/file at MPD's position. Starting, skipping or pausing
+  // costs one file request instead of filling a live stream's buffer.
+  const DEVICE_DRIFT_TOLERANCE_S = 2;
+
+  function _deviceOutput() {
+    if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return false;
+    // On the host machine with default speakers, MPD's PulseAudio output already plays.
+    return !(_isHostDevice() && !localStorage.getItem('hearth:audio_sink_id'));
+  }
+
+  function _devicePlayer() {
+    return document.getElementById('hearth-web-player');
+  }
+
+  function _deviceDrift() {
+    const player = _devicePlayer();
+    if (!player || !_deviceFile || player.paused) return 0;
+    return player.currentTime - _mpdElapsedNow();
+  }
+
+  function _loadDeviceTrack(player, file, startAt) {
+    _deviceFile = file;
+    _applySavedSinkId(player);
+    // A #t= media fragment starts at MPD's position without a separate seek.
+    const fragment = startAt > 0.5 ? `#t=${startAt.toFixed(2)}` : '';
+    player.src = `/music/file?path=${encodeURIComponent(file)}${fragment}`;
+    _probeMark('device_src');
+    player.play().catch(() => {});
+  }
+
+  function _followMpd(data) {
+    const player = _devicePlayer();
+    if (!player) return;
+    const file = data.track && data.track.file;
+    if (!_deviceOutput() || !file || data.state === 'stop') {
+      _stopDevicePlayer();
+      return;
     }
+    _nextFile = data.next_file || null;
+    if (data.state === 'pause') {
+      if (!player.paused) player.pause();
+      return;
+    }
+    const target = _mpdElapsedNow();
+    if (file === _endedFile) {
+      // This device already finished the track and moved on; MPD is a moment behind.
+      if (_currentDuration > 0 && _currentDuration - target < 3) return;
+    } else {
+      _endedFile = null;
+    }
+    if (_deviceFile !== file) {
+      _loadDeviceTrack(player, file, target);
+      return;
+    }
+    if (player.readyState >= 1 && Math.abs(player.currentTime - target) > DEVICE_DRIFT_TOLERANCE_S) {
+      player.currentTime = target;
+    }
+    if (player.paused) player.play().catch(() => {});
+  }
+
+  function _stopDevicePlayer() {
+    const player = _devicePlayer();
+    _deviceFile = null;
+    _nextFile = null;
+    if (player && player.getAttribute('src')) {
+      player.pause();
+      player.removeAttribute('src');
+      player.load();
+    }
+  }
+
+  function _applyDeviceVolume(volumePercent) {
+    const player = _devicePlayer();
+    if (player && _deviceOutput()) player.volume = Math.max(0, Math.min(1, volumePercent / 100));
   }
 
   function _applySavedSinkId(player) {
@@ -1156,30 +1144,6 @@
     const savedSink = localStorage.getItem('hearth:audio_sink_id');
     if (savedSink && player.sinkId !== savedSink) {
       player.setSinkId(savedSink).catch(() => {});
-    }
-  }
-
-  function _ensureWebPlayerPlaying(forceReconnect = false) {
-    if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') return;
-    // On the host machine with default speakers, MPD Output 0 already plays directly via PulseAudio/PipeWire.
-    // Never double-stream over HTTP into default host speakers.
-    if (_isHostDevice() && !localStorage.getItem('hearth:audio_sink_id')) {
-      _pauseWebPlayer();
-      return;
-    }
-    const webPlayer = document.getElementById('hearth-web-player');
-    if (!webPlayer) return;
-    _applySavedSinkId(webPlayer);
-    if (_playbackState !== 'play' && !forceReconnect) return;
-    if (forceReconnect || !webPlayer.src || webPlayer.src.indexOf('/music/stream') === -1) {
-      webPlayer.src = '/music/stream?t=' + Date.now();
-      webPlayer.load();
-      _streamConnectedAt = performance.now();
-      _probeMark('stream_src');
-    }
-    const playPromise = webPlayer.play();
-    if (playPromise !== undefined) {
-      playPromise.catch(() => {});
     }
   }
 
@@ -1235,44 +1199,26 @@
     _updateOutputButtonUI(target);
 
     if (target === 'host') {
-      _pauseWebPlayer();
-    } else if (target === 'phone' || target === 'both') {
-      // Must start/resume webPlayer synchronously inside user interaction
-      // to satisfy mobile autoplay policies before making any network requests.
-      if (_playbackState === 'play') {
-        _ensureWebPlayerPlaying(true);
-      }
+      _stopDevicePlayer();
+    } else if (_lastNowPlaying && _lastNowPlaying.state === 'play') {
+      // Start inside the tap so mobile autoplay rules allow it; the refresh below corrects
+      // the position once MPD has switched outputs.
+      _followMpd(_lastNowPlaying);
     }
 
     try {
-      if (target === 'phone') {
-        // Output 1 = Web Stream (exclusive - disables Host Speakers)
-        await (window.apiFetch || fetch)('/music/outputs/select', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ output_id: '1', mode: 'exclusive' }),
-        });
-      } else if (target === 'both') {
-        // Both Host Speakers and Web Stream enabled in a single request
-        await (window.apiFetch || fetch)('/music/outputs/select', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ output_id: 'all', mode: 'both' }),
-        });
-      } else {
-        // Output 0 = Host (enable Host Speakers, keep Web Stream running)
-        await (window.apiFetch || fetch)('/music/outputs/select', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          credentials: 'same-origin',
-          body: JSON.stringify({ output_id: '0', mode: 'enable' }),
-        });
-      }
+      // MPD outputs, in mpd/mpd.conf order: 0 host speakers, 1 web stream (unused),
+      // 2 silent device clock. This device plays files itself, so "both" needs only 0.
+      await (window.apiFetch || fetch)('/music/outputs/select', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify({ output_id: target === 'phone' ? '2' : '0', mode: 'exclusive' }),
+      });
     } catch {
       // non-fatal
     }
+    if (target !== 'host') refreshNowPlaying(true);
   }
 
   function _bindMusicOutputs() {
@@ -1287,19 +1233,34 @@
 
     _updateOutputButtonUI(_currentOutputTarget);
 
-    const webPlayer = document.getElementById('hearth-web-player');
+    const webPlayer = _devicePlayer();
     if (webPlayer) {
       webPlayer.addEventListener('playing', () => {
-        if (!_playProbe || !('stream_src' in _playProbe.marks)) return;
-        _probeMark('stream_playing');
-        // Sample the steady-state lag once the player has settled.
-        setTimeout(() => _probeReport('fresh'), 5000);
+        if (!_playProbe || !('device_src' in _playProbe.marks)) return;
+        _probeMark('device_playing');
+        // Sample drift once the player has settled.
+        setTimeout(() => _probeReport('device'), 3000);
+      });
+      // Move on locally: MPD reaches the next track at about the same moment, and waiting
+      // for a poll leaves a gap (timers are throttled with the screen off).
+      webPlayer.addEventListener('ended', () => {
+        if (!_deviceFile) return;
+        _endedFile = _deviceFile;
+        if (_nextFile) {
+          _loadDeviceTrack(webPlayer, _nextFile, 0);
+          _nextFile = null;
+        } else {
+          _deviceFile = null;
+        }
+        setTimeout(() => { refreshNowPlaying(); refreshQueue(); }, 1000);
       });
       webPlayer.addEventListener('error', () => {
-        if (_playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') && !_isHostDevice()) {
-          setTimeout(() => {
-            _ensureWebPlayerPlaying(true);
-          }, 1000);
+        if (!_deviceFile || !webPlayer.error) return;
+        // A format the browser can't decode (e.g. .wma) or a file the server won't serve:
+        // skip it when this device is the only output; otherwise the host keeps playing it.
+        if (_currentOutputTarget === 'phone' && _playbackState === 'play') {
+          _deviceFile = null;
+          musicControl('next');
         }
       });
     }
@@ -1438,7 +1399,7 @@
             if (_currentOutputTarget !== 'phone' && _currentOutputTarget !== 'both') {
               await _switchOutputTarget('phone');
             } else {
-              _ensureWebPlayerPlaying(true);
+              refreshNowPlaying(true);
             }
           } catch {
             // User cancelled prompt or permission denied
@@ -1449,10 +1410,7 @@
 
     if ('mediaSession' in navigator) {
       try {
-        navigator.mediaSession.setActionHandler('play', () => {
-          _ensureWebPlayerPlaying(true);
-          musicControl('resume');
-        });
+        navigator.mediaSession.setActionHandler('play', () => musicControl('resume'));
         navigator.mediaSession.setActionHandler('pause', () => musicControl('pause'));
         navigator.mediaSession.setActionHandler('previoustrack', () => musicControl('previous'));
         navigator.mediaSession.setActionHandler('nexttrack', () => musicControl('next'));
@@ -1464,12 +1422,14 @@
   }
 
   async function musicControl(action, extra = {}) {
-    if (action === 'pause' || action === 'stop') {
-      _pauseWebPlayer();
-    } else if (action === 'resume') {
-      if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-        _ensureWebPlayerPlaying(true);
-      }
+    // Act on this device's player right away; MPD follows through the request below.
+    const player = _devicePlayer();
+    if (action === 'pause' && player && _deviceFile) {
+      player.pause();
+    } else if (action === 'stop') {
+      _stopDevicePlayer();
+    } else if (action === 'resume' && player && _deviceFile && _deviceOutput()) {
+      player.play().catch(() => {});
     }
     try {
       await (window.apiFetch || fetch)('/music/control', {
@@ -1478,16 +1438,11 @@
         credentials: 'same-origin',
         body: JSON.stringify({ action, ...extra }),
       });
-      // Reconnect the web stream only after MPD has switched tracks: connecting
-      // first (or keeping the old connection) plays the old track's buffered tail.
-      if (action === 'next' || action === 'previous' || action === 'play_pos') {
-        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-          _ensureWebPlayerPlaying(true);
-        }
-      }
-      // Brief delay so MPD state settles before polling.
+      // MPD has switched by now, so a track change can be followed immediately; other
+      // actions get a brief delay so MPD state settles before polling.
+      const changesTrack = action === 'next' || action === 'previous' || action === 'play_pos';
       const shouldAutoExpand = action === 'resume' || action === 'play_pos';
-      setTimeout(() => { refreshNowPlaying(shouldAutoExpand); refreshQueue(); }, 400);
+      setTimeout(() => { refreshNowPlaying(shouldAutoExpand); refreshQueue(); }, changesTrack ? 0 : 400);
     } catch {
       // non-fatal
     }
@@ -1510,13 +1465,6 @@
     if (pp) pp.addEventListener('click', async () => {
       // Toggle based on current label (▶ = resume, ⏸ = pause).
       const action = pp.textContent.trim() === '⏸' ? 'pause' : 'resume';
-      if (action === 'resume') {
-        if (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') {
-          _ensureWebPlayerPlaying(true);
-        }
-      } else {
-        _pauseWebPlayer();
-      }
       await musicControl(action);
     });
     if (prev) prev.addEventListener('click', () => musicControl('previous'));
@@ -2044,13 +1992,13 @@
       cursor.remove();
       setLocked(false);
       input.focus();
-      await refreshSessions();
-      await refreshMemory();
-      _probeMark('sidebar_refreshed');
+      // Music first: the device player starts from this refresh.
       const isMusicMsg = /play|queue|music|song|track|artist|jazz|rock|classical/i.test(text || '') ||
                          /playing|added|resumed/i.test(accumulated || '');
       refreshNowPlaying(isMusicMsg);
       refreshQueue();
+      await refreshSessions();
+      await refreshMemory();
     }
   }
   async function startNewChat(event) {

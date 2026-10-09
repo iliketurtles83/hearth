@@ -6,7 +6,7 @@ import re
 from typing import Awaitable, Callable
 
 from fastapi import APIRouter, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from app_schemas import (
     MusicControlRequest,
@@ -17,6 +17,7 @@ from app_schemas import (
     MusicTimingReport,
     WeatherRequest,
 )
+from music.players import mpd as music_mpd
 
 log = logging.getLogger("assistant.music")
 
@@ -168,6 +169,16 @@ def create_memory_tool_router(
             }
         )
 
+    @router.get("/music/file")
+    async def music_file(path: str = Query(min_length=1, max_length=1024)):
+        # Device output: the browser plays the file MPD is on. Path comes from
+        # /music/now_playing and must resolve to an audio file under MUSIC_ROOT.
+        resolved = music_mpd.resolve_audio_file(path)
+        if resolved is None:
+            return error_response("Track not found.", "MUSIC_FILE_NOT_FOUND", False, status_code=404)
+        full_path, media_type = resolved
+        return FileResponse(full_path, media_type=media_type, headers={"Cache-Control": "private, max-age=3600"})
+
     @router.post("/music/timing")
     async def music_timing(report: MusicTimingReport):
         # Client-reported, so only well-formed keys reach the log.
@@ -175,10 +186,10 @@ def create_memory_tool_router(
             f"{k}={v}" for k, v in sorted(report.marks.items(), key=lambda kv: kv[1]) if _TIMING_KEY_RE.match(k)
         )
         log.info(
-            "music.client_timing | mode=%s output=%s stream_lag_s=%.2f marks_ms=[%s]",
+            "music.client_timing | mode=%s output=%s drift_s=%.2f marks_ms=[%s]",
             re.sub(r"[^a-z]", "", report.mode),
             re.sub(r"[^a-z]", "", report.output),
-            report.stream_lag_s,
+            report.drift_s,
             marks,
         )
         return JSONResponse({"ok": True})

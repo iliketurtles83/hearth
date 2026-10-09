@@ -168,6 +168,7 @@ def _sync_now_playing() -> dict[str, Any]:
         except Exception:
             volume = 0
         track = None
+        next_file = None
         if state in ("play", "pause"):
             try:
                 current = c.currentsong()
@@ -175,7 +176,16 @@ def _sync_now_playing() -> dict[str, Any]:
                     "title": current.get("title", ""),
                     "artist": current.get("artist", ""),
                     "album": current.get("album", ""),
+                    # MPD-relative path: device output plays this file via /music/file.
+                    "file": current.get("file", ""),
                 }
+            except Exception:
+                pass
+            try:
+                if "nextsong" in status:
+                    upcoming = c.playlistinfo(int(status["nextsong"]))
+                    if upcoming:
+                        next_file = upcoming[0].get("file") or None
             except Exception:
                 pass
         return {
@@ -186,8 +196,39 @@ def _sync_now_playing() -> dict[str, Any]:
             "duration": float(status["duration"]) if "duration" in status else None,
             "pos": current_pos,
             "volume": volume,
+            "next_file": next_file,
         }
     return _with_mpd(_fn)
+
+
+# Browser-playable formats served to device output, by extension.
+AUDIO_MEDIA_TYPES: dict[str, str] = {
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/ogg",
+    ".flac": "audio/flac",
+    ".wav": "audio/wav",
+}
+
+
+def resolve_audio_file(rel_path: str) -> tuple[str, str] | None:
+    """Map an MPD-relative path to (absolute path, media type) under MUSIC_ROOT.
+
+    Returns None for anything outside MUSIC_ROOT, missing, or not a playable audio
+    type, so the file route can't be used to read arbitrary files.
+    """
+    if not rel_path or "\x00" in rel_path or os.path.isabs(rel_path):
+        return None
+    root = os.path.realpath(MUSIC_ROOT)
+    full = os.path.realpath(os.path.join(root, rel_path))
+    if os.path.commonpath([root, full]) != root or not os.path.isfile(full):
+        return None
+    media_type = AUDIO_MEDIA_TYPES.get(os.path.splitext(full)[1].lower())
+    if media_type is None:
+        return None
+    return full, media_type
 
 
 def _sync_queue_view() -> dict[str, Any]:
