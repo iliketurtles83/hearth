@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import re
 from typing import Awaitable, Callable
 
 from fastapi import APIRouter, Query, Request
@@ -12,8 +14,13 @@ from app_schemas import (
     MusicPlayRequest,
     MusicQueueRequest,
     MusicSearchRequest,
+    MusicTimingReport,
     WeatherRequest,
 )
+
+log = logging.getLogger("assistant.music")
+
+_TIMING_KEY_RE = re.compile(r"^[a-z_]{1,32}$")
 
 
 def create_memory_tool_router(
@@ -160,6 +167,21 @@ def create_memory_tool_router(
                 "prompt": "",
             }
         )
+
+    @router.post("/music/timing")
+    async def music_timing(report: MusicTimingReport):
+        # Client-reported, so only well-formed keys reach the log.
+        marks = " ".join(
+            f"{k}={v}" for k, v in sorted(report.marks.items(), key=lambda kv: kv[1]) if _TIMING_KEY_RE.match(k)
+        )
+        log.info(
+            "music.client_timing | mode=%s output=%s stream_lag_s=%.2f marks_ms=[%s]",
+            re.sub(r"[^a-z]", "", report.mode),
+            re.sub(r"[^a-z]", "", report.output),
+            report.stream_lag_s,
+            marks,
+        )
+        return JSONResponse({"ok": True})
 
     @router.post("/music/beets/update")
     async def music_beets_update():

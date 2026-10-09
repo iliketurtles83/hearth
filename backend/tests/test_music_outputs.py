@@ -177,3 +177,40 @@ def test_api_music_outputs_and_select():
         assert data3["outputs"][0]["enabled"] is True
         assert data3["outputs"][1]["enabled"] is True
 
+
+
+def test_api_music_timing_logs_client_marks(caplog):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from routes.memory_tool_routes import create_memory_tool_router
+
+    app = FastAPI()
+    app.include_router(
+        create_memory_tool_router(
+            get_memory_store=lambda: None,
+            memory_consolidation_batch_size=10,
+            error_response=lambda msg, code, ret, status_code: None,
+            dispatch_tool=tools.dispatch,
+            run_weather=lambda p: None,
+            run_beets_update=lambda: {"ok": True},
+        )
+    )
+    client = TestClient(app)
+
+    with caplog.at_level("INFO", logger="assistant.music"):
+        resp = client.post(
+            "/music/timing",
+            json={
+                "mode": "fresh",
+                "output": "phone",
+                "marks": {"stream_playing": 6900, "reply_done": 1200, "Bad Key\n": 5},
+                "stream_lag_s": 4.25,
+            },
+        )
+    assert resp.status_code == 200
+    line = next(r.getMessage() for r in caplog.records if "music.client_timing" in r.getMessage())
+    assert "mode=fresh output=phone stream_lag_s=4.25" in line
+    assert "marks_ms=[reply_done=1200 stream_playing=6900]" in line
+
+    too_many = {f"k{chr(97 + i)}": i for i in range(20)}
+    assert client.post("/music/timing", json={"mode": "x", "output": "y", "marks": too_many}).status_code == 422

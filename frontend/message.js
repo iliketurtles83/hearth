@@ -858,6 +858,38 @@
     return Math.max(0, Math.min(lag, 30));
   }
 
+  // Play-latency probe: ms marks from sending a music request until this device's
+  // player starts, posted to /music/timing so the backend log shows where time goes.
+  let _playProbe = null;
+
+  function _probeStart() {
+    _playProbe = { t0: performance.now(), marks: {} };
+  }
+
+  function _probeMark(name) {
+    if (_playProbe && !(name in _playProbe.marks)) {
+      _playProbe.marks[name] = Math.round(performance.now() - _playProbe.t0);
+    }
+  }
+
+  function _probeReport(mode) {
+    const probe = _playProbe;
+    _playProbe = null;
+    if (!probe) return;
+    const body = {
+      mode,
+      output: _currentOutputTarget,
+      marks: probe.marks,
+      stream_lag_s: Math.round(_streamLag() * 100) / 100,
+    };
+    (window.apiFetch || fetch)('/music/timing', {
+      method: 'POST',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).catch(() => {});
+  }
+
   function _mpdElapsedNow() {
     if (_playbackState !== 'play') return _mpdElapsed;
     return _mpdElapsed + (performance.now() - _mpdPolledAt) / 1000;
@@ -984,7 +1016,10 @@
         if (btn) btn.textContent = data.state === 'play' ? '⏸' : '▶';
         _renderPlayback();
 
+        // The 10 s poll can land mid-reply while older music plays; only probe after the reply.
+        const probing = Boolean(_playProbe && 'reply_done' in _playProbe.marks);
         if (data.state === 'play') {
+          if (probing) _probeMark('now_playing');
           _startProgressTicker();
           if (autoExpand || previousState !== 'play') {
             expandMusicPanel();
@@ -994,6 +1029,13 @@
             if (webPlayer && (!webPlayer.paused || autoExpand)) {
               _ensureWebPlayerPlaying(false);
             }
+            // A fresh stream reports on its 'playing' event; an already-running one
+            // carries the new track after its current lag.
+            if (probing && !('stream_src' in _playProbe.marks)) {
+              _probeReport(_streamConnectedAt ? 'live' : 'idle');
+            }
+          } else if (probing) {
+            _probeReport('host');
           }
           _updateMediaSession(_shownTrack || t, true);
         } else {
@@ -1133,6 +1175,7 @@
       webPlayer.src = '/music/stream?t=' + Date.now();
       webPlayer.load();
       _streamConnectedAt = performance.now();
+      _probeMark('stream_src');
     }
     const playPromise = webPlayer.play();
     if (playPromise !== undefined) {
@@ -1246,6 +1289,12 @@
 
     const webPlayer = document.getElementById('hearth-web-player');
     if (webPlayer) {
+      webPlayer.addEventListener('playing', () => {
+        if (!_playProbe || !('stream_src' in _playProbe.marks)) return;
+        _probeMark('stream_playing');
+        // Sample the steady-state lag once the player has settled.
+        setTimeout(() => _probeReport('fresh'), 5000);
+      });
       webPlayer.addEventListener('error', () => {
         if (_playbackState === 'play' && (_currentOutputTarget === 'phone' || _currentOutputTarget === 'both') && !_isHostDevice()) {
           setTimeout(() => {
@@ -1833,6 +1882,7 @@
     const text = input.value.trim();
     if (!text && !pendingImage) return;
     closeSidebar();
+    if (/^\s*(please\s+)?(play|queue)\b/i.test(text)) _probeStart();
 
     // Capture image before clearing
     const imageSnapshot = pendingImage ? { ...pendingImage } : null;
@@ -1990,11 +2040,13 @@
       }
     } finally {
       _currentAbortController = null;
+      _probeMark('reply_done');
       cursor.remove();
       setLocked(false);
       input.focus();
       await refreshSessions();
       await refreshMemory();
+      _probeMark('sidebar_refreshed');
       const isMusicMsg = /play|queue|music|song|track|artist|jazz|rock|classical/i.test(text || '') ||
                          /playing|added|resumed/i.test(accumulated || '');
       refreshNowPlaying(isMusicMsg);
