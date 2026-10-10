@@ -53,7 +53,7 @@ from tools.timer import format_timer_response
 from tools.calculator import format_calculator_response
 from tools.datetime_tool import format_datetime_response
 from tools.schemas import HEARTH_TOOLS
-from music_fastpath import format_music_response, is_direct_play_request, normalize_music_action
+from music.commands import format_music_response, is_direct_play_request, normalize_music_action
 
 CHAT_TOKEN_BUDGET = ROUTING_CONFIG.chat_token_budget
 CHAT_MAX_TURNS = ROUTING_CONFIG.chat_max_turns

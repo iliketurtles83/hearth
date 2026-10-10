@@ -121,7 +121,7 @@ All traffic is served securely on your local network via an integrated Caddy rev
 │   ├── intents.py              # Heuristic intent classifier & shared model constants
 │   ├── embedding_router.py     # Embedding-based exemplar classifier (tool + dialogue)
 │   ├── routing_config.py       # Intent router dataclass & threshold settings
-│   ├── music_fastpath.py       # Deterministic music parsing & response formatter
+│   ├── music/                  # Music package: Beets search, request parsing, MPD playback
 │   ├── memory.py               # SQLite + ChromaDB hybrid storage & consolidation
 │   ├── memory_scheduler.py     # Background sleep-consolidation daemon
 │   ├── auth.py                 # Scrypt token authentication & SQLite store

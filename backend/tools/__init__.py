@@ -12,6 +12,7 @@ Usage in main.py:
 """
 import importlib
 import logging
+import time
 from types import ModuleType
 from tools.base import ToolResult
 
@@ -45,11 +46,12 @@ async def dispatch(name: str, params: dict) -> ToolResult:
     if module is None:
         log.warning("tools.dispatch | unknown tool=%s registered=%s", name, list(_REGISTRY))
         return ToolResult.failure(f"Tool '{name}' is not available.", retryable=False)
+    started = time.perf_counter()
     try:
         result: ToolResult = await module.run(params)
         log.info(
-            "tools.dispatch | tool=%s ok=%s retryable=%s",
-            name, result.ok, result.retryable,
+            "tools.dispatch | tool=%s ok=%s retryable=%s ms=%d",
+            name, result.ok, result.retryable, (time.perf_counter() - started) * 1000,
         )
         return result
     except Exception as exc:

@@ -136,8 +136,11 @@ while IFS= read -r file; do
     backend/tools/weather.py|backend/tests/test_weather.py)
       add_test "backend/tests/test_weather.py"
       ;;
-    backend/tools/music.py|backend/tests/test_music.py)
+    backend/music/*|backend/tools/music.py|backend/tests/test_music*.py)
       add_test "backend/tests/test_music.py"
+      add_test "backend/tests/test_music_collections.py"
+      add_test "backend/tests/test_music_outputs.py"
+      add_test "backend/tests/test_music_fastpath.py"
       ;;
     backend/tools/code*.py)
       add_test "backend/tests/test_graph.py"

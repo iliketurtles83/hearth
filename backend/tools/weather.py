@@ -206,7 +206,7 @@ def format_weather_response(data: dict) -> str:
     """Format a weather ToolResult.data dict into a short human-readable string.
 
     Deterministic — no LLM call needed for plain weather lookups.
-    Mirrors the music fastpath pattern (format_music_response in music_fastpath.py).
+    Mirrors the music fastpath pattern (format_music_response in music/commands.py).
     """
     location = data.get("location", "your location")
     temp = data.get("temperature")

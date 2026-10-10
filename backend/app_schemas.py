@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
@@ -56,6 +56,14 @@ class MusicControlRequest(BaseModel):
 class MusicOutputSelectRequest(BaseModel):
     output_id: str
     mode: str = "exclusive"
+
+
+class MusicTimingReport(BaseModel):
+    """Client-side play-latency probe: ms marks since the music request was sent."""
+    mode: str = Field(max_length=16)
+    output: str = Field(max_length=16)
+    marks: dict[str, int] = Field(max_length=16)
+    drift_s: float = 0.0  # device player position minus MPD's, at report time
 
 
 

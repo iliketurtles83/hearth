@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from music_fastpath import format_music_response, is_direct_play_request, parse_music_command
+from music.commands import format_music_response, is_direct_play_request, parse_music_command
 from tools.base import ToolResult
 
 

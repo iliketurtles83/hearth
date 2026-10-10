@@ -93,6 +93,7 @@ def _load_helpers():
         "import os, sqlite3, shutil, subprocess, logging, threading",
         "log = logging.getLogger('beets_startup_test')",
         "_BEETS_UPDATE_LOCK = threading.Lock()",
+        "music_mpd = None  # replaced per test; main.py imports music.players.mpd",
     ]
     targets = {"_beets_db_has_items", "_beet_base_cmd", "_bootstrap_beets_library_if_empty", "run_beets_update", "_run_beets_update", "_stamp_beets_mtimes"}
     i = 0
@@ -293,6 +294,9 @@ def test_beets_update_runs_update_then_import_no_autotag(tmp_path, monkeypatch):
     fake_result.returncode = 0
     fake_result.stdout = "15 items updated\n"
     fake_result.stderr = ""
+    fake_mpd = MagicMock()
+    fake_mpd._sync_update_db.return_value = "7"
+    monkeypatch.setitem(_load_helpers.ns, "music_mpd", fake_mpd)
 
     with (
         patch("shutil.which", return_value="/usr/bin/beet"),
@@ -301,6 +305,8 @@ def test_beets_update_runs_update_then_import_no_autotag(tmp_path, monkeypatch):
         result = run_beets_update()
 
     assert result["ok"] is True
+    # MPD indexes the same files by path, so it must rescan after Beets does.
+    fake_mpd._sync_update_db.assert_called_once_with()
     assert mock_run.call_count == 2
     first_cmd = mock_run.call_args_list[0][0][0]
     second_cmd = mock_run.call_args_list[1][0][0]

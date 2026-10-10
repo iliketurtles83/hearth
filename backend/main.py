@@ -51,7 +51,8 @@ from graph import (
     default_checkpoint_path,
 )
 from auth import AuthService
-from music_fastpath import parse_music_command, format_music_response
+from music.commands import parse_music_command, format_music_response
+from music.players import mpd as music_mpd
 from routes.auth_routes import create_auth_router
 from routes.memory_tool_routes import create_memory_tool_router
 from routes.chat_routes import create_chat_router
@@ -437,6 +438,12 @@ def _run_beets_update() -> dict:
 
     _stamp_beets_mtimes(beets_db, music_root)
     log.info("beets.update_done | db=%s", beets_db)
+    # MPD keeps its own index of the same files and plays by path, so renames that
+    # Beets just picked up stay unplayable until MPD rescans too.
+    try:
+        log.info("mpd.update_started | job=%s", music_mpd._sync_update_db())
+    except Exception as exc:
+        log.warning("mpd.update_failed | error=%s", exc)
     return {"ok": True, "summary": last_line}
 
 

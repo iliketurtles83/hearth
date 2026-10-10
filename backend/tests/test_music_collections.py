@@ -14,8 +14,13 @@ from unittest.mock import patch
 
 import pytest
 
-import tools.music as music
-from music_fastpath import format_music_response, normalize_music_action
+import tools.music  # noqa: F401  (registers the tool)
+from music import library as music_library
+from music import radio as music_radio
+from music import resolve as music_resolve
+from music import tool as music_tool
+from music.commands import format_music_response, normalize_music_action
+from music.players import mpd as music_mpd
 
 
 _ITEMS = [
@@ -76,19 +81,19 @@ def beets_db(tmp_path, monkeypatch):
         conn.execute(
             "INSERT INTO items VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (i, title, artist, aa, album, aid, disc, track, genre, comp,
-             f"{music.MUSIC_ROOT}/{artist}/{title}.mp3".encode(), 0.0),
+             f"{music_mpd.MUSIC_ROOT}/{artist}/{title}.mp3".encode(), 0.0),
         )
     conn.commit()
     conn.close()
-    monkeypatch.setattr(music, "BEETS_DB_PATH", str(db))
-    music._beets_columns.cache_clear()
+    monkeypatch.setattr(music_library, "BEETS_DB_PATH", str(db))
+    music_library._beets_columns.cache_clear()
     yield db
-    music._beets_columns.cache_clear()
+    music_library._beets_columns.cache_clear()
 
 
 def _run(params: dict[str, Any], mpd: _FakeMPD):
-    with patch.object(music, "_mpd_connect", return_value=mpd):
-        return asyncio.run(music.run(params))
+    with patch.object(music_mpd, "_mpd_connect", return_value=mpd):
+        return asyncio.run(music_tool.run(params))
 
 
 def _added_titles(mpd: _FakeMPD) -> list[str]:
@@ -114,11 +119,11 @@ def _added_titles(mpd: _FakeMPD) -> list[str]:
     ],
 )
 def test_parse_collection_request(prompt, expected):
-    assert music._parse_collection_request(music._extract_search_query(prompt)) == expected
+    assert music_resolve._parse_collection_request(music_resolve._extract_search_query(prompt)) == expected
 
 
 def test_parse_album_splits_trailing_artist():
-    assert music._parse_collection_request("the record Blue by Joni Mitchell") == {
+    assert music_resolve._parse_collection_request("the record Blue by Joni Mitchell") == {
         "kind": "album", "name": "Blue", "artist": "Joni Mitchell", "full": False,
     }
 
@@ -131,7 +136,9 @@ def test_explicit_album_plays_whole_album_in_track_order(beets_db):
 
     assert result.ok
     assert _added_titles(mpd) == ["So What", "Freddie Freeloader", "Blue in Green"]
-    assert mpd.names()[0] == "clear"
+    # The album replaces the 3-entry queue: appended first, old entries dropped after.
+    assert mpd.names() == ["add", "add", "add", "delete", "play"]
+    assert ("delete", (0, 3)) in mpd.calls and ("play", 0) in mpd.calls
     assert result.data["album"] == "Kind of Blue"
     assert format_music_response(result, {"action": "play"}) == (
         'Now playing the album "Kind of Blue" by Miles Davis (3 tracks).'
@@ -179,30 +186,30 @@ def test_compilation_plays_in_order_without_single_artist(beets_db):
 
 @pytest.mark.parametrize(("name", "album", "count"), [("The Hits", "The Hits", 2), ("Hits", "Hits", 1)])
 def test_album_lookup_prefers_literal_name_over_the_variant(beets_db, name, album, count):
-    resolved, tracks = music._sync_album_tracks(name)
+    resolved, tracks = music_library._sync_album_tracks(name)
 
     assert (resolved, len(tracks)) == (album, count)
 
 
 def test_sample_large_compilation_caps_and_keeps_album_order(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MAX_N", 24)
     tracks = [{"title": f"t{i:03}", "artist": f"a{i}"} for i in range(500)]
 
-    sample = music._sample_large_compilation(tracks, random.Random(7))
+    sample = music_radio._sample_large_compilation(tracks, random.Random(7))
 
     assert len(sample) == 24
     assert sample == sorted(sample, key=lambda t: t["title"])
 
 
 def test_sample_large_compilation_never_trims_single_artist_album(monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 24)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MAX_N", 24)
     tracks = [{"title": f"t{i}", "artist": "The Beatles"} for i in range(30)]
 
-    assert music._sample_large_compilation(tracks, random.Random(7)) == tracks
+    assert music_radio._sample_large_compilation(tracks, random.Random(7)) == tracks
 
 
 def test_huge_compilation_is_sampled_unless_whole_requested(beets_db, monkeypatch):
-    monkeypatch.setattr(music, "MUSIC_PLAYLIST_MAX_N", 1)
+    monkeypatch.setattr(music_radio, "MUSIC_PLAYLIST_MAX_N", 1)
 
     sampled = _run({"prompt": "play the Pitchfork 500"}, _FakeMPD())
     assert sampled.ok
